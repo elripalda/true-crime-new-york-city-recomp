@@ -85,7 +85,11 @@ MSAA is off by default because it is the most demanding option; depth of field w
 | Upscaler | Bilinear or AMD FSR 1 below 100% render scale. FSR 3.1 on Windows and Linux, FSR 4.1 on Windows, and optional experimental DLSS use 50% (Performance), 58% (Balanced), 67% (Quality) and 100% (Native AA). Windows FSR uses the AMD SDK loader and upscaler DLLs. DLSS requires an NVIDIA RTX adapter and the platform's NVIDIA runtime. |
 | Sharpening | Off to 100%: AMD FidelityFX RCAS sharpening of the 3D frame, at any render scale. The HUD is not sharpened. Off by default. |
 | Field of view | 80% to 150% of the game's view, gameplay camera only; aiming still zooms. |
-| Object detail | Original, High, Very high or Maximum: how far buildings and props keep their detailed models. Vehicles keep the game's own detail level. Maximum is much slower. |
+| Object detail | Original, High, Very high or Maximum: how far buildings, props and moving cars keep their detailed models. Parked cars keep the game's own detail level. Maximum is much slower. |
+| Pedestrian detail | Original, High, Very high or Maximum: how far away low-detail stand-in pedestrians become full models, and (Very high and Maximum) how far away spawn points fill the street. Maximum also loads characters from their single full-detail files. |
+| Pedestrian limit | 15 (Original) to 75: how many full-detail pedestrians at once, and (20 and up) how many pedestrian types load at once, up to 9. Experimental above 30. |
+| Crowd density | Original, 1.5x, 2x or 3x (Experimental): how many pedestrians each spawn point keeps. 3x also raises the crowd budget from 250 to 350. |
+| Traffic density | Original, 1.5x, 2x, 3x, 4x or 5x (4x and 5x Experimental): the ambient car budget and each road spawn point's cap. |
 | Anisotropic filtering | Game default, 2x, 4x, 8x or 16x. |
 | MSAA | Off, 2x, 4x or 8x. Off by default: it is the most demanding option. |
 | SMAA | SMAA 1x anti-aliasing on the finished frame. On by default. |

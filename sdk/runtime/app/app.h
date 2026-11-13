@@ -38,6 +38,10 @@ struct Settings {
     uint32_t shadow_softness = 0;     // shadow edges: 0 the game's single compare, 1 soft, 2 softer
     bool building_seam_fix = true;   // experimental priority for detailed city geometry
     uint32_t object_detail = 0;      // mesh LOD distance: 0 original, 1 high (2x), 2 very high (4x), 3 maximum
+    uint32_t ped_limit = 0;          // full pedestrians at once: 0 the game's 15, then 20, 25, 30, 40, 50, 75
+    uint32_t traffic_density = 0;    // ambient cars: 0 the game's, 1 1.5x, 2 2x, 3 3x, 4 4x, 5 5x
+    uint32_t ped_density = 0;        // crowd density: 0 the game's, 1 1.5x, 2 2x, 3 3x (experimental)
+    uint32_t ped_detail = 0;         // stand-in -> full pedestrian swap distance: 0 original, 1 2x, 2 4x, 3 maximum
     bool pc_contrast = true;         // PC contrast curve on the finished frame
     bool custom_textures = true;     // images in textures\replacement\ beside the exe replace the game's
     bool dump_textures = false;      // each texture once into textures\dumps\ beside the exe

@@ -63,6 +63,41 @@ inline const char *ObjectDetailName(uint32_t level) {
     static const char *const names[] = {"Original", "High", "Very high", "Maximum"};
     return names[level < 4 ? level : 0];
 }
+// Pedestrian detail (app::Settings::ped_detail): how close a distant stand-in pedestrian must be before the
+// game swaps in the full model. 0 is the game's own, then 2x, 4x and the stand-ins' whole range.
+inline constexpr uint32_t kPedDetails[] = {0, 1, 2, 3};
+inline const char *PedDetailName(uint32_t level) {
+    static const char *const names[] = {"Original", "High", "Very high", "Maximum"};
+    return names[level < 4 ? level : 0];
+}
+// Pedestrian limit (app::Settings::ped_limit): full pedestrians at once. 0 is the game's 15. Experimental.
+inline constexpr uint32_t kPedLimits[] = {0, 1, 2, 3, 4, 5, 6};
+inline const char *PedLimitName(uint32_t level) {
+    static const char *const names[] = {"15 (Original)", "20", "25", "30", "40", "50", "75"};
+    return names[level < 7 ? level : 0];
+}
+// Crowd density (app::Settings::ped_density): how many pedestrians each spawn point keeps. 0 is the game's own.
+inline constexpr uint32_t kPedDensities[] = {0, 1, 2, 3};
+inline const char *PedDensityName(uint32_t level) {
+    static const char *const names[] = {"Original", "1.5x", "2x", "3x (Experimental)"};
+    return names[level < 4 ? level : 0];
+}
+// Traffic density (app::Settings::traffic_density): multiplier on the ambient car budget.
+inline constexpr uint32_t kTrafficDensities[] = {0, 1, 2, 3, 4, 5};
+inline const char *TrafficDensityName(uint32_t level) {
+    static const char *const names[] = {"Original", "1.5x", "2x", "3x", "4x (Experimental)", "5x (Experimental)"};
+    return names[level < 6 ? level : 0];
+}
+inline int32_t TrafficScale(int32_t value, uint32_t level) {
+    switch (level) {
+    case 1: return value * 3 / 2;
+    case 2: return value * 2;
+    case 3: return value * 3;
+    case 4: return value * 4;
+    case 5: return value * 5;
+    default: return value;
+    }
+}
 // HDR output: SDR white in nits, the highlight peak (0: the display's reported peak), and the
 // inverse tone map strength in percent.
 inline constexpr uint32_t kHdrPaperWhiteNits[] = {

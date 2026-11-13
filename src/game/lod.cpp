@@ -21,10 +21,12 @@
 // seven a frame) until the game swaps in a real pedestrian close by.
 
 #include <atomic>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 
 #include "app/app.h"
+#include "core/log.h"
 #include "kernel/kernel.h"
 #include "xdk/hle.h"
 
@@ -39,6 +41,34 @@ float Scale() {
 
 // set while a vehicle draw routine runs on this (the game's) thread
 thread_local uint32_t t_vehicle = 0;
+// Object types (vtables) that keep the setting inside the dynamic-object draw 0x13F4C0. That routine draws
+// every moving object (cars, characters, spawners), so it is scoped as a whole above; 0x2D5A7C is the active
+// car and paints its detailed mesh at any distance. Parked cars that have not been woken (touched) carry only
+// their low-detail textures and drew bare with the detailed mesh, so other types keep the game's own depth.
+// XBE_VEHICLE_LOD (comma-separated hex vtables) replaces the list, for testing other types.
+thread_local bool t_allowed = false;
+bool AllowedType(uint32_t vtable) {
+    static uint32_t list[16];
+    static int n = -1;
+    if (n < 0) {
+        n = 0;
+        if (const char *env = std::getenv("XBE_VEHICLE_LOD"); !env) {
+            list[n++] = 0x2D5A7C;
+        } else {
+            const char *p = env;
+            while (*p && n < 16) {
+                char *end;
+                const unsigned long v = std::strtoul(p, &end, 16);
+                if (end == p) break;
+                list[n++] = uint32_t(v);
+                p = *end ? end + 1 : end;
+            }
+        }
+    }
+    for (int i = 0; i < n; ++i)
+        if (list[i] == vtable) return true;
+    return false;
+}
 
 // scales the float argument at esp + offset unless the call comes from inside a walker
 void ScaleDepth(X86Context &ctx, uint8_t *base, uint32_t offset) {
@@ -48,7 +78,7 @@ void ScaleDepth(X86Context &ctx, uint8_t *base, uint32_t offset) {
     // recursion from inside a walker (0x21CF50..0x21D0E0, 0x21DC00..0x21E1A0) passes an already scaled depth
     if ((ret >= 0x21CF50 && ret < 0x21D0E0) || (ret >= 0x21DC00 && ret < 0x21E1A0)) return;
     // the standalone selector call from 0x61A11 kept the setting under a vehicle in a49f21d too
-    if (t_vehicle && ret != 0x61A16) return;
+    if (t_vehicle && ret != 0x61A16 && !t_allowed) return;
     float depth;
     std::memcpy(&depth, base + ctx.esp + offset, 4);
     depth *= scale;
@@ -87,4 +117,14 @@ X86_EXTERN_FUNC(__imp__sub_0021DC00);
 X86_FUNC(sub_0021DC00) {
     ScaleDepth(ctx, base, 0x14);
     __imp__sub_0021DC00(ctx, base);
+}
+
+// sets which object the selectors below 0x21E1A0 belong to while the dynamic-object draw runs
+X86_EXTERN_FUNC(__imp__sub_0021E1A0);
+X86_FUNC(sub_0021E1A0) {
+    const uint32_t ret0 = X86_MEM32(ctx.esp);
+    const bool was = t_allowed;
+    if (ret0 == 0x13F5CA || ret0 == 0x13F7C2) t_allowed = AllowedType(X86_MEM32(X86_MEM32(ctx.esp + 8)));
+    __imp__sub_0021E1A0(ctx, base);
+    t_allowed = was;
 }

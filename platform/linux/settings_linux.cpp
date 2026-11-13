@@ -108,6 +108,19 @@ void Load() {
     std::atomic_ref(s.object_detail)
         .store(uint32_t(std::clamp<int64_t>(t["object_detail"].value_or(int64_t(s.object_detail)), 0, 3)),
                std::memory_order_relaxed);
+    std::atomic_ref(s.traffic_density)
+        .store(uint32_t(std::clamp<int64_t>(t["traffic_density"].value_or(int64_t(s.traffic_density)), 0, 5)),
+               std::memory_order_relaxed);
+    std::atomic_ref(s.ped_density)
+        .store(uint32_t(std::clamp<int64_t>(t["ped_density"].value_or(int64_t(s.ped_density)), 0, 3)),
+               std::memory_order_relaxed);
+    std::atomic_ref(s.ped_limit)
+        .store(uint32_t(std::clamp<int64_t>(t["ped_limit"].value_or(int64_t(s.ped_limit)), 0, 6)),
+               std::memory_order_relaxed);
+    // read on the game thread (ped_detail.cpp)
+    std::atomic_ref(s.ped_detail)
+        .store(uint32_t(std::clamp<int64_t>(t["ped_detail"].value_or(int64_t(s.ped_detail)), 0, 3)),
+               std::memory_order_relaxed);
     s.pc_contrast = t["pc_contrast"].value_or(s.pc_contrast);
     s.custom_textures = t["custom_textures"].value_or(s.custom_textures);
     s.dump_textures = t["dump_textures"].value_or(s.dump_textures);
@@ -155,6 +168,10 @@ toml::table Table() {
                   {"ao", int64_t(s.ao)},
                   {"building_seam_fix", s.building_seam_fix},
                   {"object_detail", int64_t(s.object_detail)},
+                  {"ped_detail", int64_t(s.ped_detail)},
+                  {"ped_limit", int64_t(s.ped_limit)},
+                  {"ped_density", int64_t(s.ped_density)},
+                  {"traffic_density", int64_t(s.traffic_density)},
                   {"pc_contrast", s.pc_contrast},
                   {"custom_textures", s.custom_textures},
                   {"dump_textures", s.dump_textures},

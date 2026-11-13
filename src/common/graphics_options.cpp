@@ -80,6 +80,10 @@ enum class Row {
     Sharpening,
     FieldOfView,
     ObjectDetail,
+    PedDetail,
+    PedLimit,
+    PedDensity,
+    TrafficDensity,
     Anisotropic,
     Msaa,
     Smaa,
@@ -115,6 +119,10 @@ constexpr Row kRows[] = {Row::DisplayMode,
                          Row::Sharpening,
                          Row::FieldOfView,
                          Row::ObjectDetail,
+                         Row::PedDetail,
+                         Row::PedLimit,
+                         Row::PedDensity,
+                         Row::TrafficDensity,
                          Row::Anisotropic,
                          Row::Msaa,
                          Row::Smaa,
@@ -303,6 +311,10 @@ void RestoreDefaults() {
     s.ao = d.ao;
     s.building_seam_fix = d.building_seam_fix;
     std::atomic_ref(s.object_detail).store(d.object_detail, std::memory_order_relaxed);  // read by lod.cpp
+    std::atomic_ref(s.ped_detail).store(d.ped_detail, std::memory_order_relaxed);  // read by ped_detail.cpp
+    std::atomic_ref(s.ped_limit).store(d.ped_limit, std::memory_order_relaxed);
+    std::atomic_ref(s.ped_density).store(d.ped_density, std::memory_order_relaxed);
+    std::atomic_ref(s.traffic_density).store(d.traffic_density, std::memory_order_relaxed);
     s.pc_contrast = d.pc_contrast;
     s.custom_textures = d.custom_textures;
     s.dump_textures = d.dump_textures;
@@ -331,6 +343,10 @@ Kind KindOf(Row row) {
     case Row::Sharpening:
     case Row::FieldOfView:
     case Row::ObjectDetail:
+    case Row::PedDetail:
+    case Row::PedLimit:
+    case Row::PedDensity:
+    case Row::TrafficDensity:
     case Row::Anisotropic:
     case Row::FrameCap:
     case Row::DumpFormat:
@@ -390,6 +406,14 @@ const char *Label(Row row) {
         return "Field of view";
     case Row::ObjectDetail:
         return "Object detail";
+    case Row::PedDetail:
+        return "Pedestrian detail";
+    case Row::PedLimit:
+        return "Pedestrian limit";
+    case Row::PedDensity:
+        return "Crowd density";
+    case Row::TrafficDensity:
+        return "Traffic density";
     case Row::Anisotropic:
         return "Anisotropic filtering";
     case Row::Msaa:
@@ -485,11 +509,28 @@ const char *Help(Row row) {
     case Row::FieldOfView:
         return "Widens or narrows the gameplay camera. 100% is the game's own view; aiming still zooms "
                "relative to it. Menus and cutscene previews are unchanged.";
+    case Row::PedDetail:
+        return "How close a distant low-detail pedestrian must get before the game swaps in its full "
+               "model. Original is the game's own; higher levels swap them in farther away; Maximum also "
+               "loads characters from their single full-detail files, so they no longer step through a middle "
+               "level. Applies to characters loaded after the change. The game still "
+               "keeps at most Pedestrian limit full pedestrians at once.";
+    case Row::TrafficDensity:
+        return "How many cars drive around. Original is the game's own; higher levels allow more ambient "
+               "traffic in each area. Experimental: busier roads cost performance.";
+    case Row::PedDensity:
+        return "How many pedestrians fill the streets. Original is the game's own; higher levels spawn more "
+               "people at each spawn point. 3x also raises the game's crowd budget and is experimental. Busier "
+               "streets cost performance, and Pedestrian limit decides how many of them get full detail.";
+    case Row::PedLimit:
+        return "Experimental. How many full-detail pedestrians the game may keep at once. 15 is the game's "
+               "own; more lets Pedestrian detail upgrade more of a crowd but may stutter or fail in busy streets.";
     case Row::ObjectDetail:
         return "How far buildings and props keep their detailed models before switching to "
                "simpler ones. Original is the game's own; higher levels look better at a distance but cost "
                "performance. Maximum draws every object at full detail at any distance and is much slower "
-               "in busy streets. Vehicles and distant pedestrians keep the game's own detail.";
+               "in busy streets. Moving cars follow it too; parked cars keep the game's own detail, and distant pedestrians "
+               "follow Pedestrian detail.";
     case Row::Anisotropic:
         return "Keeps textures sharp at glancing angles, such as roads into the distance. Game default uses "
                "the filtering the game asks for.";
@@ -616,6 +657,14 @@ std::string Value(Row row) {
     }
     case Row::ObjectDetail:
         return choices::ObjectDetailName(s.object_detail);
+    case Row::PedDetail:
+        return choices::PedDetailName(s.ped_detail);
+    case Row::PedLimit:
+        return choices::PedLimitName(s.ped_limit);
+    case Row::PedDensity:
+        return choices::PedDensityName(s.ped_density);
+    case Row::TrafficDensity:
+        return choices::TrafficDensityName(s.traffic_density);
     case Row::Anisotropic:
         if (!s.aniso) return "Game default";
         std::snprintf(text, sizeof(text), "%ux", s.aniso);
@@ -774,6 +823,21 @@ bool Change(Row row, int direction) {
     case Row::ObjectDetail:
         // read by the LOD hooks on the game thread: a single aligned 32-bit store
         changed = set(s.object_detail, choices::Step(choices::kObjectDetails, s.object_detail, direction));
+        break;
+    case Row::PedDetail:
+        // read by the pedestrian hook on the game thread: a single aligned 32-bit store
+        changed = set(s.ped_detail, choices::Step(choices::kPedDetails, s.ped_detail, direction));
+        break;
+    case Row::PedLimit:
+        changed = set(s.ped_limit, choices::Step(choices::kPedLimits, s.ped_limit, direction));
+        break;
+    case Row::PedDensity:
+        // read by the spawner hooks on the game thread: a single aligned 32-bit store
+        changed = set(s.ped_density, choices::Step(choices::kPedDensities, s.ped_density, direction));
+        break;
+    case Row::TrafficDensity:
+        // read by the traffic hook on the game thread: a single aligned 32-bit store
+        changed = set(s.traffic_density, choices::Step(choices::kTrafficDensities, s.traffic_density, direction));
         break;
     case Row::ShadowQuality:
         changed = set(s.shadow_resolution, choices::Step(choices::kShadowLevels, s.shadow_resolution, direction));

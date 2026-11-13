@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### World
+- Pedestrian detail (F10): distant pedestrians become full models up to 2x, 4x or the whole stand-in range
+  (~47 units) away instead of ~8, with nearer stand-ins served first. Very high and Maximum also let spawn
+  points fill the street 2x or 3x farther out. Maximum loads characters from their single full-detail files.
+  Full pedestrians made far away no longer delete themselves within a second (the per-character despawn
+  check now matches the setting), which removed the stand-in/full flicker.
+- Pedestrian limit (F10, experimental above 30): 15 to 75 full pedestrians at once. The per-frame character
+  cache moved from the game's fixed 32 slots to 128. From 20 up, more pedestrian types load at once (up to 9,
+  capped by the game's asset table) without the type loader rotating them out, and type quotas are evened so
+  one type no longer fills the street.
+- Crowd density (F10): 1.5x, 2x or 3x pedestrians per spawn point; 3x raises the crowd budget to 350.
+- Traffic density (F10): 1.5x to 5x the ambient car budget and each road spawn point's cap.
+- Object detail now applies to moving cars as well; parked cars that have not been touched keep the game's
+  own detail (they only carry low-detail textures until woken).
+
 ## 0.9.2.0 — Beta 3 (2026-11-12)
 
 ### Graphics
