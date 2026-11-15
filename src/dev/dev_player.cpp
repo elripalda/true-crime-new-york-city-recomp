@@ -23,6 +23,7 @@
 #include <mutex>
 #include <vector>
 
+#include "game/game_addresses.h"
 #include "common/guest_values.h"
 #include "core/log.h"
 #include "dev/dev.h"
@@ -31,23 +32,23 @@
 
 namespace {
 
-constexpr uint32_t kPlayer = 0x37D284;
-constexpr uint32_t kGame = 0x360E00;
+constexpr uint32_t kPlayer = TC_ADDR(0x37D284);
+constexpr uint32_t kGame = TC_ADDR(0x360E00);
 constexpr uint32_t kWallet = 0xB4;
 constexpr uint32_t kHealth = 0xBC;
 constexpr uint32_t kHealthMax = 0x08, kHealthNow = 0x10, kHealthFlags = 0x18;
 constexpr uint32_t kIgnoreDamage = 0x04;
 constexpr uint32_t kAddMoneySlot = 0x8C;
-constexpr uint32_t kSetAmmo = 0x16FCC0;
-constexpr uint32_t kGiveGoodCop = 0x854A0;
+constexpr uint32_t kSetAmmo = TC_ADDR(0x16FCC0);
+constexpr uint32_t kGiveGoodCop = TC_ADDR(0x854A0);
 constexpr uint32_t kCopPoints = 0x1D0;
 constexpr uint32_t kGoodCop = 0x1F8, kBadCop = 0x1FC;
-constexpr uint32_t kGiveCareer = 0x802E0;
-constexpr uint32_t kInventoryAdd = 0x191650;   // thiscall on the inventory (character, item)
-constexpr uint32_t kGetPosition = 0x21EC70;    // thiscall on an object (out vec4*) -> vec4*
-constexpr uint32_t kSpawnItem = 0x9F460;       // cdecl (item name hash, vec4* position) -> item object
-constexpr uint32_t kItemInHand = 0x191800;     // thiscall on the inventory (hand: 1 right, 0 left) -> item
-constexpr uint32_t kRemoveNickWeapons = 0x110AD0; // cdecl (character): removes every weapon (RemoveNickWeapon)
+constexpr uint32_t kGiveCareer = TC_ADDR(0x802E0);
+constexpr uint32_t kInventoryAdd = TC_ADDR(0x191650);   // thiscall on the inventory (character, item)
+constexpr uint32_t kGetPosition = TC_ADDR(0x21EC70);    // thiscall on an object (out vec4*) -> vec4*
+constexpr uint32_t kSpawnItem = TC_ADDR(0x9F460);       // cdecl (item name hash, vec4* position) -> item object
+constexpr uint32_t kItemInHand = TC_ADDR(0x191800);     // thiscall on the inventory (hand: 1 right, 0 left) -> item
+constexpr uint32_t kRemoveNickWeapons = TC_ADDR(0x110AD0); // cdecl (character): removes every weapon (RemoveNickWeapon)
 
 std::atomic<int> g_bad{0}, g_career{0};
 std::mutex g_items_lock;

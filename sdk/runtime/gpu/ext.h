@@ -45,6 +45,8 @@ struct Target {
     Microsoft::WRL::ComPtr<ID3D12Resource> fb;  // copy read by draws that sample the target they render to
     D3D12_RESOURCE_STATES fb_state = D3D12_RESOURCE_STATE_COPY_DEST;
     DXGI_FORMAT fmt = DXGI_FORMAT_B8G8R8A8_UNORM;
+    uint32_t samples = 1;    // the resource's actual sample count (the requested one may have fallen back to 1)
+    bool has_depth = false;  // ever bound with a depth buffer: never a shadow image (NoteShadowImage)
     float range = 1;         // colour held divided by it until the extension resolves the target
     uint64_t tag = ~0ull;    // the extension's
     uint32_t guest_format = ~0u;  // guest surface format it was made for (~0: unknown)

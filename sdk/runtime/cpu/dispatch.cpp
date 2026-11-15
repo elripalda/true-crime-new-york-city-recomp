@@ -139,10 +139,23 @@ uint32_t KernelThunkAddress(uint32_t ordinal) { return kKernelThunkBase + ordina
 
 }  // namespace dispatch
 
+#if TCNYC_DEV_TOOLS
+namespace game {
+bool TraceAudioRefillCall(X86Func* fn, X86Context& ctx, uint8_t* base);
+}
+#endif
+
 void x86_icall(X86Context& ctx, uint8_t* base, uint32_t target) {
     ctx.last_icall = target;
     if (target >= g_lo && target < g_hi && g_continuation[target - g_lo]) throw X86Resume{target, ctx.esp};
     if (X86Func* f = dispatch::Find(target)) {
+#if TCNYC_DEV_TOOLS
+        static const bool trace_audio = [] {
+            const char* flag = std::getenv("TCNYC_TEST_AUDIO_TRACE");
+            return flag && std::strcmp(flag, "1") == 0;
+        }();
+        if (trace_audio && game::TraceAudioRefillCall(f, ctx, base)) return;
+#endif
         f(ctx, base);
         return;
     }

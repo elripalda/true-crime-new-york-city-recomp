@@ -427,6 +427,10 @@ void DrawMenu() {
                 WorldTab();
                 ImGui::EndTabItem();
             }
+            if (ImGui::BeginTabItem("Vehicles")) {
+                VehiclesWeatherUi();
+                ImGui::EndTabItem();
+            }
             if (ImGui::BeginTabItem("Info")) {
                 InfoTab();
                 ImGui::EndTabItem();

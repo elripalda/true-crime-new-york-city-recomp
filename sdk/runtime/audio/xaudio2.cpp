@@ -8,6 +8,7 @@
 #include <windows.h>
 #include <xaudio2.h>
 
+#include <atomic>
 #include <thread>
 #include <vector>
 
@@ -15,13 +16,36 @@
 #include "core/log.h"
 
 namespace audio {
+namespace {
+
+struct Output : IXAudio2EngineCallback {
+    IXAudio2* engine = nullptr;
+    IXAudio2MasteringVoice* master = nullptr;
+    IXAudio2SourceVoice* voice = nullptr;
+    std::atomic<HRESULT> error{S_OK};
+    bool registered = false;
+
+    void STDMETHODCALLTYPE OnProcessingPassStart() noexcept override {}
+    void STDMETHODCALLTYPE OnProcessingPassEnd() noexcept override {}
+    void STDMETHODCALLTYPE OnCriticalError(HRESULT hr) noexcept override { error.store(hr); }
+
+    ~Output() {
+        if (registered) engine->UnregisterForCallbacks(this);
+        if (voice) voice->DestroyVoice();
+        if (master) master->DestroyVoice();
+        if (engine) engine->Release();
+    }
+};
+
+}  // namespace
 
 void StartOutput(std::function<void(float*, uint32_t)> render) {
     std::thread([render] {
-        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        IXAudio2* xa = nullptr;
-        IXAudio2MasteringVoice* master = nullptr;
-        IXAudio2SourceVoice* voice = nullptr;
+        const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        if (FAILED(com)) {
+            LOGE("audio: COM initialization failed (0x%08X)", unsigned(com));
+            return;
+        }
         WAVEFORMATEX wf{};
         wf.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
         wf.nChannels = 2;
@@ -40,17 +64,10 @@ void StartOutput(std::function<void(float*, uint32_t)> render) {
         if (!create && dll)
             create_version = reinterpret_cast<CreateVersionFn>(
                 reinterpret_cast<void*>(GetProcAddress(dll, "XAudio2CreateWithVersionInfo")));
-        HRESULT hr = create ? create(&xa, 0, XAUDIO2_DEFAULT_PROCESSOR)
-                            : create_version ? create_version(&xa, 0, XAUDIO2_DEFAULT_PROCESSOR, 0x0A000000)
-                                             : E_FAIL;
-        if (SUCCEEDED(hr)) hr = xa->CreateMasteringVoice(&master);
-        if (SUCCEEDED(hr)) hr = xa->CreateSourceVoice(&voice, &wf);
-        if (FAILED(hr)) {
-            LOGE("audio: XAudio2 unavailable (%08X), no sound", unsigned(hr));
-            return;
-        }
-        if (FAILED(voice->Start())) {
-            LOGE("audio: XAudio2 source voice could not start");
+        if (!create && !create_version) {
+            LOGE("audio: XAudio2 could not be loaded");
+            if (dll) FreeLibrary(dll);
+            CoUninitialize();
             return;
         }
         constexpr uint32_t kFrames = kRate / 100;
@@ -59,36 +76,88 @@ void StartOutput(std::function<void(float*, uint32_t)> render) {
         // one slot more than can be queued, so the one rendered is never one XAudio2 still reads
         constexpr uint32_t kSlots = kMaxQueued + 1;
         std::vector<float> bufs(kSlots * kFrames * 2);
-        uint32_t depth = kMinQueued;
-        DWORD stable_since = GetTickCount();
-        for (uint32_t n = 0;;) {
-            XAUDIO2_VOICE_STATE st;
-            voice->GetState(&st, XAUDIO2_VOICE_NOSAMPLESPLAYED);
-            // a starved voice crackles: queue one buffer more each time, up to kMaxQueued
-            if (n && !st.BuffersQueued && depth < kMaxQueued) {
-                depth++;
-                stable_since = GetTickCount();
-                LOGI("audio: output starved, queueing %u ms", depth * 10);
-            } else if (depth > kMinQueued && GetTickCount() - stable_since > 5000) {
-                // after five stable seconds, give the latency back one buffer at a time
-                depth--;
-                stable_since = GetTickCount();
-                LOGI("audio: output stable, queueing %u ms", depth * 10);
+        bool recovering = false;
+        DWORD retry_delay = 250;
+        for (;;) {
+            {
+                Output output;
+                const char* operation = "create engine";
+                HRESULT hr = create ? create(&output.engine, 0, XAUDIO2_DEFAULT_PROCESSOR)
+                                    : create_version(&output.engine, 0, XAUDIO2_DEFAULT_PROCESSOR, 0x0A000000);
+                if (SUCCEEDED(hr)) {
+                    operation = "register engine callback";
+                    hr = output.engine->RegisterForCallbacks(&output);
+                    output.registered = SUCCEEDED(hr);
+                }
+                if (SUCCEEDED(hr)) {
+                    operation = "open default output";
+                    hr = output.engine->CreateMasteringVoice(&output.master);
+                }
+                if (SUCCEEDED(hr)) {
+                    operation = "create source voice";
+                    hr = output.engine->CreateSourceVoice(&output.voice, &wf);
+                }
+                auto submit = [&](uint64_t slot) {
+                    float* b = &bufs[(slot % kSlots) * kFrames * 2];
+                    render(b, kFrames);
+                    XAUDIO2_BUFFER xb{};
+                    xb.AudioBytes = kFrames * 8;
+                    xb.pAudioData = reinterpret_cast<const BYTE*>(b);
+                    return output.voice->SubmitSourceBuffer(&xb);
+                };
+                uint64_t submitted = 0;
+                if (SUCCEEDED(hr)) {
+                    operation = "prime source voice";
+                    for (; submitted < kMinQueued && SUCCEEDED(hr); submitted++) hr = submit(submitted);
+                }
+                if (SUCCEEDED(hr)) {
+                    operation = "start source voice";
+                    hr = output.voice->Start();
+                }
+                if (SUCCEEDED(hr)) {
+                    if (recovering) LOGR("audio: XAudio2 output resumed");
+                    recovering = false;
+                    retry_delay = 250;
+                }
+                uint32_t depth = kMinQueued;
+                DWORD stable_since = GetTickCount();
+                DWORD last_report = stable_since - 1000;
+                while (SUCCEEDED(hr)) {
+                    operation = "engine callback";
+                    hr = output.error.load();
+                    if (FAILED(hr)) break;
+                    XAUDIO2_VOICE_STATE state{};
+                    output.voice->GetState(&state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
+                    const DWORD now = GetTickCount();
+                    if (!state.BuffersQueued) {
+                        if (depth < kMaxQueued) depth++;
+                        stable_since = now;
+                        if (now - last_report >= 1000) {
+                            LOGR("audio: XAudio2 output underrun, queue target %u ms", depth * 10);
+                            last_report = now;
+                        }
+                    } else if (depth > kMinQueued && now - stable_since > 5000) {
+                        depth--;
+                        stable_since = now;
+                    }
+                    if (state.BuffersQueued >= depth) {
+                        Sleep(2);
+                        continue;
+                    }
+                    operation = "submit source buffer";
+                    hr = submit(submitted++);
+                }
+                const HRESULT critical = output.error.load();
+                if (FAILED(critical)) {
+                    operation = "engine callback";
+                    hr = critical;
+                }
+                if (!recovering || retry_delay == 250)
+                    LOGE("audio: XAudio2 %s failed (0x%08X), reopening output", operation, unsigned(hr));
             }
-            if (st.BuffersQueued >= depth) {
-                Sleep(2);
-                continue;
-            }
-            float* b = &bufs[(n % kSlots) * kFrames * 2];
-            render(b, kFrames);
-            XAUDIO2_BUFFER xb{};
-            xb.AudioBytes = kFrames * 8;
-            xb.pAudioData = reinterpret_cast<const BYTE*>(b);
-            if (FAILED(voice->SubmitSourceBuffer(&xb))) {
-                LOGE("audio: XAudio2 could not queue a buffer, stopping output");
-                return;
-            }
-            n++;  // only a submitted buffer takes a slot, XAudio2 still reads the queued ones
+            recovering = true;
+            Sleep(retry_delay);
+            if (retry_delay < 2000) retry_delay *= 2;
         }
     }).detach();
 }

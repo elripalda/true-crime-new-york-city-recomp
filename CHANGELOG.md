@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Performance
+- Windows (D3D12) and Linux (Vulkan): a draw's vertex streams and its index list now go into the upload
+  ring as one block instead of one allocation per stream.
+- Vulkan: vertex and draw constants are uploaded only when they change, saving about 5 KB of host writes
+  per draw; blend factor and stencil reference are set only when they differ.
+- Vulkan: targets are found through an address index instead of walking every target up to three times
+  per sampled texture; sampler lookups and scene deferral bookkeeping are cheaper per draw.
+- Vulkan: CPU-written surfaces upload with a straight row copy when the sizes match (no per-texel
+  division, no full-size intermediate), and a read-back takes one submission instead of two.
+- Vulkan: scene deferral now runs only with Ambient occlusion on, or when `TCNYC_DEFER_SCENE=1` asks for
+  it; with AO off it was pure record/replay overhead.
+- Vulkan: creating or reading the pipeline cache is serialised, as the API requires now that the
+  ambient-occlusion variant workers also build pipelines.
+- Windows (D3D12): each target remembers its sample count and whether it was ever drawn with depth, so a
+  draw no longer queries the resource for both or hashes a target address; `Clear` keeps its rect storage
+  between calls, and the scene-depth map is written once per target rather than once per draw.
+- Both: ambient-occlusion variant readiness is read from a per-frame snapshot instead of taking a worker
+  mutex on every scene draw, and scheduling a variant no longer copies its shader source.
+- Both: the background shader/module handoff caches are capped, so an AO-heavy session cannot grow them
+  without bound.
+
 ### World
 - Pedestrian detail (F10): distant pedestrians become full models up to 2x, 4x or the whole stand-in range
   (~47 units) away instead of ~8, with nearer stand-ins served first. Very high and Maximum also let spawn

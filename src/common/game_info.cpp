@@ -1,3 +1,4 @@
+#include "game/game_addresses.h"
 #include "app/app.h"
 #include "core/input.h"
 #include "core/log.h"
@@ -7,6 +8,9 @@
 #include "kernel/memory.h"
 #if TCNYC_DEV_TOOLS
 #include "dev/dev.h"
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #endif
 
 #include <chrono>
@@ -15,13 +19,18 @@
 
 namespace game {
 uint32_t MainLoopSwapInterval(uint32_t interval);
+#if TCNYC_DEV_TOOLS
+uint32_t MainLoopSwapCapOverride();
+bool RequestStraightDrive();
+void ApplyStraightDrivePad(int port, input::Pad &pad);
+#endif
 }
 
 namespace {
 
 bool KeyboardDriving() {
-    if (!mem::Base() || !mem::IsCommitted(0x360E00)) return false;
-    const uint32_t game = kernel::R32(0x360E00);
+    if (!mem::Base() || !mem::IsCommitted(TC_ADDR(0x360E00))) return false;
+    const uint32_t game = kernel::R32(TC_ADDR(0x360E00));
     if (!game || !mem::IsCommitted(game + 0xAC)) return false;
     const uint32_t camera = kernel::R32(game + 0xAC);
     if (!camera || !mem::IsCommitted(camera + 0x18C)) return false;
@@ -63,15 +72,18 @@ void InitVibrationProfile() {
 // scripted or replayed input first, so the Graphics menu sees what the game would
 void FilterPad(int port, input::Pad &pad) {
     game::ApplyPadTools(port, pad);
+#if TCNYC_DEV_TOOLS
+    game::ApplyStraightDrivePad(port, pad);
+#endif
     game::FilterMenuPad(port, pad);
     // A new profile can apply an off default after the game object exists;
     // force it on once, inside the short window before the menu is usable.
     if (port == 0 && g_new_profile && !g_vibration_defaulted && NowMs() <= g_vibration_deadline &&
-        mem::Base() && mem::IsCommitted(0x360E00) && mem::IsCommitted(0x2ECDB0)) {
-        const uint32_t game = kernel::R32(0x360E00);
+        mem::Base() && mem::IsCommitted(TC_ADDR(0x360E00)) && mem::IsCommitted(TC_ADDR(0x2ECDB0))) {
+        const uint32_t game = kernel::R32(TC_ADDR(0x360E00));
         if (game && mem::IsCommitted(game + 0xFED) && kernel::G<uint8_t>(game + 0xFED) == 0) {
             kernel::G<uint8_t>(game + 0xFED) = 1;
-            kernel::G<uint8_t>(0x2ECDB0) = 1;
+            kernel::G<uint8_t>(TC_ADDR(0x2ECDB0)) = 1;
             g_vibration_defaulted = true;
         }
     }
@@ -83,8 +95,8 @@ void FilterPad(int port, input::Pad &pad) {
 // cutscenes do not. Used to keep the deferred AO path out of the front end.
 namespace game {
 bool GameplayCameraActive() {
-    if (!mem::Base() || !mem::IsCommitted(0x360E00)) return false;
-    const uint32_t game = kernel::R32(0x360E00);
+    if (!mem::Base() || !mem::IsCommitted(TC_ADDR(0x360E00))) return false;
+    const uint32_t game = kernel::R32(TC_ADDR(0x360E00));
     if (!game || !mem::IsCommitted(game + 0xAC)) return false;
     const uint32_t camera = kernel::R32(game + 0xAC);
     if (!camera || !mem::IsCommitted(camera + 0x17C) || !mem::IsCommitted(camera + 0x18C)) return false;
@@ -103,6 +115,16 @@ bool GameplayCameraActive() {
 } // namespace game
 
 namespace {
+bool GameMessage(void *window, uint32_t msg, uintptr_t wp, intptr_t lp, intptr_t *result) {
+#if TCNYC_DEV_TOOLS && defined(_WIN32)
+    if (msg == WM_KEYDOWN && wp == VK_F7 && !(lp & (1 << 30)) && game::RequestStraightDrive()) {
+        *result = 0;
+        return true;
+    }
+#endif
+    return game::GraphicsMenuMessage(window, msg, wp, lp, result);
+}
+
 // ImGui each frame: the Graphics menu (F10), and in dev builds the debug menu (F9)
 void DrawUi(double fps) {
     game::DrawGraphicsMenu(fps);
@@ -135,10 +157,13 @@ const app::GameInfo app::kGame = {
     .init = InitVibrationProfile,         // after the settings load, before the window and boot
     .loaded = nullptr,                    // image in memory, before its entry point runs
     .window = nullptr,                    // the game window is up
-    .message = game::GraphicsMenuMessage, // window messages first; true takes one
+    .message = GameMessage,               // window messages first; true takes one
     .ui = DrawUi,                         // ImGui drawing each frame: the Graphics menu (F10)
     .pad = FilterPad,                     // changes a polled pad
     .rumble = nullptr,                    // changes a rumble before it is set
     .swap_interval = game::MainLoopSwapInterval,
     .keyboard_driving = KeyboardDriving,
+#if TCNYC_DEV_TOOLS
+    .swap_cap_override = game::MainLoopSwapCapOverride,
+#endif
 };

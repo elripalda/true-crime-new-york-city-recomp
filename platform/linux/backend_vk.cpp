@@ -15,9 +15,12 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <bit>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -29,6 +32,8 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <shared_mutex>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -44,6 +49,7 @@
 #include <signal.h>
 #include <time.h>
 #include <ucontext.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <link.h>
 #include <vulkan/vulkan.h>
@@ -363,6 +369,7 @@ struct Target {
     bool cpu = false;
     uint64_t scene_frame = ~0ull;
     uint64_t last_use = 0;  // frame this target was last bound or sampled
+    bool has_depth = false;  // ever bound with a depth buffer: never a shadow image (NoteShadowImage)
     // a copy to sample while the target itself is bound (D3D12 Feedback)
     VkImage fb_image = VK_NULL_HANDLE;
     VkDeviceMemory fb_memory = VK_NULL_HANDLE;
@@ -490,7 +497,7 @@ struct PsoKey {
     uint32_t zen = 0, zwrite = 0, zfunc = 0;
     uint32_t sten = 0, sfunc = 0, smask = 0, swmask = 0, sfail = 0, szfail = 0, spass = 0;
     uint32_t cull = 0, ccw = 0, fill = 0;
-    float zslope = 0.0f;  // solid polygon offset, as the D3D12 backend applies it
+    uint32_t zslope_bits = 0;  // solid polygon offset, encoded as IEEE float bits
     uint32_t rtfmt = 0, dsfmt = 0;
     uint32_t samples = 1;
     uint32_t sprite = 0;  // a program's point list drawn as point sprites
@@ -498,6 +505,7 @@ struct PsoKey {
     uint32_t motion = 0;  // TAA: 1 the pass has the motion attachment, 2 the pixel shader also writes it
     bool operator==(const PsoKey&) const = default;
 };
+static_assert(std::has_unique_object_representations_v<PsoKey>);
 
 struct PsoKeyHash {
     size_t operator()(const PsoKey& k) const { return size_t(Hash(&k, sizeof(k))); }
@@ -855,6 +863,8 @@ private:
     // targets and textures
     Target* EnsureTarget(const Surface& s, bool depth);
     Target* TargetAt(uint32_t data, bool depth, bool newest);
+    // the newest target at an address, from a generation-keyed index instead of a scan of targets_
+    Target* NewestTarget(uint32_t data, bool depth);
     bool ReadTarget(Target* t);
     void DumpTexture(const Tex* t);
     bool UploadTarget(Target* t);
@@ -925,8 +935,8 @@ private:
         t->h = std::max(1u, uint32_t(std::lround(double(gh) * t->scale)));
     }
     float shadow_soft_ = 0.0f;  // console texels between the shadow image's softening taps, 0 off
-    // colour targets ever drawn with a depth buffer (reflections and the frame), which are never shadow images
-    std::unordered_set<uint32_t> depth_drawn_;
+    // colour targets drawn with a depth buffer (reflections and the frame), which are never shadow images:
+    // Target::depth_frame marks them, so no per-draw set lookup is needed
     std::unordered_set<uint32_t> blurred_;  // offscreen images the game blurs into each other (the shadows)
     bool NoteShadowImage(const State& s, int stage, const Target& t);
     float WantScale(uint32_t data, bool depth) const {
@@ -949,6 +959,8 @@ private:
     // Pipelines kept on disk between runs ($XDG_CACHE_HOME/TrueCrimeNYC/pipelines.bin), so a pipeline the game
     // needed before does not stall a frame the first time again. Every pipeline is made through it.
     VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
+    // Pipeline creation may run concurrently. Snapshot both size and data under an exclusive lock.
+    std::shared_mutex pipeline_cache_mutex_;
     std::atomic<uint32_t> pipeline_cache_new_{0};  // pipelines made since the last save (warm threads too)
     uint64_t pipeline_cache_quiet_since_ = 0;  // frames_ at the last one
     void OpenPipelineCache();
@@ -978,6 +990,16 @@ private:
     std::vector<std::thread> warm_threads_;
     std::mutex warm_mutex_;
     std::unordered_map<PsoKey, VkPipeline, PsoKeyHash> warm_pipelines_;  // built, not yet drawn with
+    // Compiled modules the warm threads decoded from the SPIR-V cache, keyed by CompileShader's
+    // cache key. The render thread takes one instead of reading the file and creating the module
+    // again; an entry left here is destroyed when the device shuts down.
+    std::unordered_map<uint64_t, VkShaderModule> warm_modules_;
+    // Pipelines the render thread built while warming: the warm threads skip them instead of
+    // building the same state a second time.
+    std::unordered_set<PsoKey, PsoKeyHash> warm_skip_;
+    VkShaderModule TakeWarmModule(uint64_t key);
+    VkShaderModule PeekWarmModule(uint64_t key);
+    VkShaderModule PublishWarmModule(uint64_t key, VkShaderModule module);
     void LoadSavedPipelines();
     void SaveSavedPipelines(bool force);
     void RecordPipeline(const PsoKey& k, VkShaderModule vs, VkShaderModule ps);
@@ -1047,6 +1069,20 @@ private:
     bool viewport_valid_ = false;
     VkViewport bound_vp_{};
     VkRect2D bound_sc_{};
+    // blend factor and stencil reference: the pipeline holds them dynamic, so a draw only sets what changed
+    float bound_blend_[4] = {};
+    uint32_t bound_stencil_ = 0;
+
+    // The last vertex/draw constants written this frame: a draw whose block did not change reuses its
+    // offset in the upload ring instead of copying the same 5 KB again. Both clear when the ring resets.
+    bool vsc_valid_ = false;
+    uint64_t vsc_serial_ = 0;        // State::vsc_serial the cached offset holds
+    VkDeviceSize vsc_off_ = 0;
+    bool dc_valid_ = false;
+    DrawConstants last_dc_{};        // the block last written
+    VkDeviceSize dc_off_ = 0;
+    // scratch for UploadTarget's CPU rows, kept between uploads so a full-size surface does not allocate
+    std::vector<uint8_t> upload_scratch_;
     
     VkBuffer upload_ = VK_NULL_HANDLE;
     VkDeviceMemory upload_memory_ = VK_NULL_HANDLE;
@@ -1125,6 +1161,48 @@ private:
     bool ao_pipe_depth_ms_ = false;
     uint32_t ao_pipe_mode_ = 0;
 
+    // Progressive AO variants (as d3d12.cpp): the receiver (t4) and depth-prepass variants of the
+    // draws the game is already making are compiled and their pipelines built on worker threads.
+    // A draw applies AO only once its variant is ready; until then it uses the game's shader and
+    // schedules the variant. Switching AO on therefore does not compile hundreds of shaders in
+    // one frame.
+    struct AoWarmJob {
+        uint64_t color_id = 0, depth_id = 0;
+        VkShaderModule vs = VK_NULL_HANDLE;
+        VkRenderPass color_pass = VK_NULL_HANDLE, depth_pass = VK_NULL_HANDLE;
+        bool has_color = false, has_depth = false;
+        PsoKey color_key{}, depth_key{};
+        std::string color_src, depth_src;
+        uint64_t color_spv = 0, depth_spv = 0;  // CompileShader cache keys, for the module handoff
+    };
+    struct AoVariantSource {
+        std::string color_src, depth_src;
+        uint64_t color_spv = 0, depth_spv = 0;  // CompileShader cache keys
+        uint64_t color_ps = 0, depth_ps = 0;    // PixelKey hashes, which PsoKey::ps holds on Vulkan
+    };
+    std::unordered_map<uint64_t, AoVariantSource> ao_sources_;  // render thread only, by base hash
+    std::mutex ao_mutex_;
+    std::condition_variable ao_cv_;
+    std::deque<AoWarmJob> ao_jobs_;
+    std::vector<std::thread> ao_threads_;
+    bool ao_stop_ = false;
+    std::unordered_set<uint64_t> ao_scheduled_color_, ao_scheduled_depth_;  // job ids queued/running
+    std::unordered_set<uint64_t> ao_color_ready_, ao_depth_ready_;          // AO pipeline identities
+    // A copy of the ready sets taken once a frame: a draw tests it without touching ao_mutex_, which the
+    // workers hold job by job. A variant that becomes ready applies from the next frame.
+    std::unordered_set<uint64_t> ao_color_ready_view_, ao_depth_ready_view_;
+    std::atomic<uint32_t> ao_built_{0};
+    std::atomic<bool> ao_started_{false};  // the worker threads exist (checked before taking ao_mutex_)
+    void ScheduleAoVariants(const PixelKey& base, const PsoKey& k, VkShaderModule vs, bool color, bool depth);
+    bool AoColorReady(uint64_t base);
+    bool AoDepthReady(uint64_t base);
+    void RefreshAoReadyView();
+    void StartAoWarm();
+    void StopAoWarm();
+    void AoWarmWorker();
+    VkShaderModule AcquireSpvModule(const std::string& source, uint64_t spv_key);
+    PsoKey AoDepthPsoKey(const PsoKey& k, uint64_t ps, uint32_t ao_samples);
+
     std::unordered_map<uint64_t, VkShaderModule> vs_cache_, ps_cache_;
     VkShaderModule geo_point_ = VK_NULL_HANDLE, geo_line_ = VK_NULL_HANDLE, geo_sprite_ = VK_NULL_HANDLE;
     std::unordered_map<PsoKey, VkPipeline, PsoKeyHash> pipelines_;
@@ -1137,6 +1215,9 @@ private:
     // every draw
     uint64_t targets_gen_ = 1, target_index_gen_ = 0;
     std::unordered_map<uint64_t, Target*> target_index_;
+    // NewestTarget's index by guest address (colour/depth), rebuilt with targets_gen_ like target_index_
+    std::unordered_map<uint32_t, Target*> newest_colour_, newest_depth_;
+    uint64_t newest_index_gen_ = 0, newest_index_frame_ = ~0ull;
     // textures already found and change-checked this frame (not targets, not paletted), by their description:
     // a later draw binding the same texture skips the commit checks, the target and palette lookups and the key
     std::unordered_map<uint64_t, Tex*> tex_this_frame_;
@@ -1174,6 +1255,10 @@ private:
     std::unordered_map<uint64_t, Tex*> pack_textures_;  // pack images by key, kept for the run
     std::vector<Tex*> pack_textures_retired_;           // released after the frame's GPU work
     std::unordered_map<SamplerKey, VkSampler, SamplerKeyHash> samplers_;
+    // the last sampler each stage asked for: consecutive draws mostly repeat it, so compare before hashing
+    SamplerKey sampler_memo_key_[4] = {};
+    VkSampler sampler_memo_[4] = {};
+    uint32_t sampler_memo_valid_ = 0;  // bit per stage
     VkImage white_image_ = VK_NULL_HANDLE;
     VkDeviceMemory white_memory_ = VK_NULL_HANDLE;
     VkImageView white_view_ = VK_NULL_HANDLE;
@@ -1699,19 +1784,134 @@ constexpr uint64_t kPipelineCacheMaxBytes = 512ull << 20;
 struct PipelineFileHeader {
     uint64_t magic, size, checksum;
 };
+
+// Compiled SPIR-V persisted between runs: $XDG_CACHE_HOME/TrueCrimeNYC/shaders/<key>.spv
+std::filesystem::path SpvCacheDirectory() {
+    static const std::filesystem::path directory = [] {
+        if (const char* xdg = std::getenv("XDG_CACHE_HOME"); xdg && *xdg)
+            return std::filesystem::path(xdg) / "TrueCrimeNYC" / "shaders";
+        if (const char* home = std::getenv("HOME"); home && *home)
+            return std::filesystem::path(home) / ".cache" / "TrueCrimeNYC" / "shaders";
+        return std::filesystem::path();
+    }();
+    return directory;
+}
+
+std::filesystem::path SpvCachePath(uint64_t key) {
+    const std::filesystem::path directory = SpvCacheDirectory();
+    if (directory.empty()) return {};
+    char name[32];
+    std::snprintf(name, sizeof(name), "%016llx.spv", static_cast<unsigned long long>(key));
+    return directory / name;
+}
+
+void WriteSpvCache(const std::filesystem::path& file, const std::vector<uint8_t>& bytes) {
+    if (bytes.size() < 4 || bytes.size() % 4) return;
+    std::error_code ec;
+    std::filesystem::create_directories(file.parent_path(), ec);
+    if (ec) return;
+    static std::atomic<uint64_t> next{0};
+    auto temporary = file;
+    temporary += ".tmp." + std::to_string(::getpid()) + "." + std::to_string(next.fetch_add(1));
+    FILE* f = std::fopen(temporary.string().c_str(), "wb");
+    if (!f) return;
+    const bool ok = std::fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size();
+    if (std::fclose(f) == 0 && ok && std::rename(temporary.c_str(), file.c_str()) == 0) return;
+    std::remove(temporary.c_str());
+}
+
+// Shader cache writes run on their own thread, like d3d12.cpp's: a frame that compiles a burst of
+// new variants should spend its time in shaderc, not in create-directories/open/rename per shader.
+// A tail lost to a hard kill is harmless; the exit save flushes.
+class SpvCacheWriter {
+public:
+    static SpvCacheWriter& Get() {
+        static SpvCacheWriter writer;
+        return writer;
+    }
+    void Enqueue(std::filesystem::path file, std::vector<uint8_t> bytes) {
+        if (bytes.size() < 4 || bytes.size() % 4) return;
+        {
+            std::lock_guard lock(mutex_);
+            if (!stopping_) {
+                queue_.push_back({std::move(file), std::move(bytes)});
+                cv_.notify_one();
+                return;
+            }
+        }
+        WriteSpvCache(file, bytes);
+    }
+    void Flush() {
+        std::unique_lock lock(mutex_);
+        idle_.wait(lock, [this] { return queue_.empty() && !writing_; });
+    }
+private:
+    struct Job {
+        std::filesystem::path file;
+        std::vector<uint8_t> bytes;
+    };
+    SpvCacheWriter() : thread_([this] { Run(); }) {}
+    ~SpvCacheWriter() {
+        {
+            std::lock_guard lock(mutex_);
+            stopping_ = true;
+            cv_.notify_one();
+        }
+        if (thread_.joinable()) thread_.join();
+    }
+    void Run() {
+        for (;;) {
+            Job job;
+            {
+                std::unique_lock lock(mutex_);
+                cv_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
+                if (queue_.empty()) {
+                    if (stopping_) return;
+                    continue;
+                }
+                job = std::move(queue_.front());
+                queue_.pop_front();
+                writing_ = true;
+            }
+            WriteSpvCache(job.file, job.bytes);
+            {
+                std::lock_guard lock(mutex_);
+                writing_ = false;
+                if (queue_.empty()) idle_.notify_all();
+            }
+        }
+    }
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::condition_variable idle_;
+    std::deque<Job> queue_;
+    bool writing_ = false;
+    bool stopping_ = false;
+    std::thread thread_;
+};
 }  // namespace
+
+void FlushSpvCacheWrites() { SpvCacheWriter::Get().Flush(); }
 
 std::atomic<VulkanBackend*> g_exit_backend{nullptr};  // for kernel::SetExitSave
 thread_local bool t_warm_thread = false;  // a pipeline warm thread, which leaves the render thread's state alone
 
 VkResult VulkanBackend::CreatePipelines(uint32_t count, const VkGraphicsPipelineCreateInfo* info,
                                         const VkAllocationCallbacks* alloc, VkPipeline* out) {
-    // the pipeline cache synchronises itself, so the warm threads share it with the render thread
-    const VkResult r = vkCreateGraphicsPipelines(device_, pipeline_cache_, count, info, alloc, out);
+    const bool measure = !t_warm_thread && perf_;
+    const auto start = measure ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    VkResult r;
+    {
+        std::shared_lock lock(pipeline_cache_mutex_);
+        r = vkCreateGraphicsPipelines(device_, pipeline_cache_, count, info, alloc, out);
+        if (r == VK_SUCCESS && pipeline_cache_) ++pipeline_cache_new_;
+    }
     if (r == VK_SUCCESS && pipeline_cache_) {
-        // Vulkan does not say whether the cache already had it; a save with nothing new is only a rewrite
-        ++pipeline_cache_new_;
         if (!t_warm_thread) pipeline_cache_quiet_since_ = frames_;
+    }
+    if (measure) {
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        if (ms >= 8.0) LOGI("vulkan: frame %llu pipeline creation took %.2f ms (result %d)", frames_, ms, int(r));
     }
     return r;
 }
@@ -1778,14 +1978,19 @@ void VulkanBackend::SavePipelineCache(bool force) {
     if (!force && warm_running_.load()) return;  // the warm threads are still adding; save once they finish
     const std::filesystem::path root = CacheRoot();
     if (root.empty()) return;
-    size_t size = 0;
-    if (vkGetPipelineCacheData(device_, pipeline_cache_, &size, nullptr) != VK_SUCCESS || !size ||
-        size > kPipelineCacheMaxBytes)
-        return;
-    std::vector<uint8_t> bytes(size);
-    if (vkGetPipelineCacheData(device_, pipeline_cache_, &size, bytes.data()) != VK_SUCCESS) return;
-    bytes.resize(size);
-    pipeline_cache_new_ = 0;
+    std::vector<uint8_t> bytes;
+    uint32_t saved;
+    {
+        std::lock_guard lock(pipeline_cache_mutex_);
+        size_t size = 0;
+        if (vkGetPipelineCacheData(device_, pipeline_cache_, &size, nullptr) != VK_SUCCESS || !size ||
+            size > kPipelineCacheMaxBytes)
+            return;
+        bytes.resize(size);
+        if (vkGetPipelineCacheData(device_, pipeline_cache_, &size, bytes.data()) != VK_SUCCESS) return;
+        bytes.resize(size);
+        saved = pipeline_cache_new_.load();
+    }
     std::error_code ec;
     std::filesystem::create_directories(root, ec);
     const std::string file = (root / "pipelines.bin").string();
@@ -1796,6 +2001,7 @@ void VulkanBackend::SavePipelineCache(bool force) {
     const bool ok = std::fwrite(&header, sizeof(header), 1, f) == 1 &&
                     std::fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size();
     if (std::fclose(f) == 0 && ok && std::rename(temp.c_str(), file.c_str()) == 0) {
+        pipeline_cache_new_.fetch_sub(saved);
         LOGI("vulkan: saved %zu KB of pipelines", bytes.size() / 1024);
         return;
     }
@@ -1847,24 +2053,26 @@ void VulkanBackend::SaveSavedPipelines(bool force) {
     if (!force && (frames_ - pipeline_cache_quiet_since_ < 300 || warm_running_.load())) return;
     const std::filesystem::path root = CacheRoot();
     if (root.empty()) return;
-    if (saved_pipelines_.size() > kMaxSavedPipelines) {
-        const size_t drop = saved_pipelines_.size() - kMaxSavedPipelines;
-        for (size_t i = 0; i < drop; i++) saved_pipeline_set_.erase(saved_pipelines_[i].key);
-        saved_pipelines_.erase(saved_pipelines_.begin(), saved_pipelines_.begin() + ptrdiff_t(drop));
-    }
-    saved_pipelines_written_ = saved_pipelines_.size();
     std::error_code ec;
     std::filesystem::create_directories(root, ec);
     const std::string file = (root / "pipelines.keys").string();
     const std::string temp = file + ".tmp." + std::to_string(::getpid());
-    const size_t bytes = saved_pipelines_.size() * sizeof(SavedPipeline);
+    const size_t count = std::min(saved_pipelines_.size(), kMaxSavedPipelines);
+    const size_t drop = saved_pipelines_.size() - count;
+    const auto* records = saved_pipelines_.data() + drop;
+    const size_t bytes = count * sizeof(SavedPipeline);
     const PipelineKeysHeader header{kPipelineKeysMagic, sizeof(SavedPipeline), bytes,
-                                    Hash(saved_pipelines_.data(), bytes)};
+                                    Hash(records, bytes)};
     FILE* f = std::fopen(temp.c_str(), "wb");
     if (!f) return;
     const bool ok = std::fwrite(&header, sizeof(header), 1, f) == 1 &&
-                    std::fwrite(saved_pipelines_.data(), 1, bytes, f) == bytes;
-    if (std::fclose(f) == 0 && ok && std::rename(temp.c_str(), file.c_str()) == 0) return;
+                    std::fwrite(records, 1, bytes, f) == bytes;
+    if (std::fclose(f) == 0 && ok && std::rename(temp.c_str(), file.c_str()) == 0) {
+        for (size_t i = 0; i < drop; i++) saved_pipeline_set_.erase(saved_pipelines_[i].key);
+        saved_pipelines_.erase(saved_pipelines_.begin(), saved_pipelines_.begin() + ptrdiff_t(drop));
+        saved_pipelines_written_ = saved_pipelines_.size();
+        return;
+    }
     std::remove(temp.c_str());
 }
 
@@ -1903,40 +2111,63 @@ void VulkanBackend::StopPipelineWarm() {
     warm_threads_.clear();
 }
 
+// shuffle the background warm out of the render thread's way (unprivileged: only raise niceness)
+static void LowerThreadPriority() {
+    setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), 10);
+}
+
 namespace {
-VkShaderModule LoadSpirv(VkDevice device, const std::filesystem::path& root, uint64_t key) {
-    char name[32];
-    std::snprintf(name, sizeof(name), "%016llx.spv", static_cast<unsigned long long>(key));
-    std::ifstream in(root / "shaders" / name, std::ios::binary);
-    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), {});
-    if (bytes.size() < 4 || bytes.size() % 4) return VK_NULL_HANDLE;
+VkShaderModule LoadSpirv(VkDevice device, const std::filesystem::path& file) {
+    if (file.empty()) return VK_NULL_HANDLE;
+    std::ifstream in(file, std::ios::binary | std::ios::ate);
+    if (!in) return VK_NULL_HANDLE;
+    const std::streamoff size = in.tellg();
+    constexpr std::streamoff kMaxSpirvBytes = 16 << 20;
+    constexpr std::streamoff kWordBytes = sizeof(uint32_t);
+    if (size < 5 * kWordBytes || size > kMaxSpirvBytes || size % kWordBytes) return VK_NULL_HANDLE;
+    std::vector<uint32_t> words(static_cast<size_t>(size) / sizeof(uint32_t));
+    in.seekg(0);
+    if (!in.read(reinterpret_cast<char*>(words.data()), size) || words[0] != 0x07230203)
+        return VK_NULL_HANDLE;
     VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    info.codeSize = bytes.size();
-    info.pCode = reinterpret_cast<const uint32_t*>(bytes.data());
+    info.codeSize = static_cast<size_t>(size);
+    info.pCode = words.data();
     VkShaderModule module = VK_NULL_HANDLE;
     return vkCreateShaderModule(device, &info, nullptr, &module) == VK_SUCCESS ? module : VK_NULL_HANDLE;
 }
 }  // namespace
 
-// One warm thread: the shaders come from the SPIR-V cache into modules of its own, freed once the pipeline is made
+// One warm thread: the shaders come from the SPIR-V cache, and the decoded modules are handed to
+// the render thread's CompileShader instead of being read from the file again.
 void VulkanBackend::WarmPipelines() {
     t_warm_thread = true;
-    const std::filesystem::path root = CacheRoot();
+    LowerThreadPriority();
     const auto started = std::chrono::steady_clock::now();
+    auto load_module = [&](uint64_t key) -> VkShaderModule {
+        if (VkShaderModule m = PeekWarmModule(key)) return m;
+        VkShaderModule m = LoadSpirv(device_, SpvCachePath(key));
+        return m ? PublishWarmModule(key, m) : VK_NULL_HANDLE;
+    };
     while (!warm_stop_.load(std::memory_order_relaxed)) {
         const size_t i = warm_next_.fetch_add(1);
         if (i >= warm_jobs_.size()) break;
         const WarmJob& job = warm_jobs_[i];
-        VkShaderModule vs = LoadSpirv(device_, root, job.p.vs_spv);
-        VkShaderModule ps = vs ? LoadSpirv(device_, root, job.p.ps_spv) : VK_NULL_HANDLE;
+        {
+            std::lock_guard lock(warm_mutex_);
+            // already built here, or the render thread built it while the warm threads ran
+            if (warm_pipelines_.count(job.p.key) || warm_skip_.count(job.p.key)) continue;
+        }
+        VkShaderModule vs = load_module(job.p.vs_spv);
+        VkShaderModule ps = vs ? load_module(job.p.ps_spv) : VK_NULL_HANDLE;
         VkPipeline pipe = VK_NULL_HANDLE;
         if (vs && ps && CreatePipeline(job.p.key, vs, ps, pipe, job.pass)) {
             ++warm_built_;
             std::lock_guard lock(warm_mutex_);
-            if (!warm_pipelines_.emplace(job.p.key, pipe).second) vkDestroyPipeline(device_, pipe, nullptr);
+            // the render thread may have built it after our check above; do not hold a second copy
+            if (warm_skip_.count(job.p.key) || !warm_pipelines_.emplace(job.p.key, pipe).second)
+                vkDestroyPipeline(device_, pipe, nullptr);
         }
-        if (vs) vkDestroyShaderModule(device_, vs, nullptr);
-        if (ps) vkDestroyShaderModule(device_, ps, nullptr);
+        // vs/ps stay in warm_modules_ for the render thread (or the next warm thread); no destroy
     }
     if (warm_running_.fetch_sub(1) == 1 && !warm_stop_) {
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started);
@@ -1946,13 +2177,53 @@ void VulkanBackend::WarmPipelines() {
 }
 
 VkPipeline VulkanBackend::TakeWarmPipeline(const PsoKey& k) {
-    if (warm_jobs_.empty()) return VK_NULL_HANDLE;
+    // (warm_jobs_ may be empty: the AO variant worker below adds pipelines of its own)
     std::lock_guard lock(warm_mutex_);
     const auto it = warm_pipelines_.find(k);
     if (it == warm_pipelines_.end()) return VK_NULL_HANDLE;
     const VkPipeline pipe = it->second;
     warm_pipelines_.erase(it);
     return pipe;
+}
+
+// A compiled module the warm threads decoded from the SPIR-V cache, handed to CompileShader so
+// the render thread does not open the file and create the module again.
+VkShaderModule VulkanBackend::TakeWarmModule(uint64_t key) {
+    std::lock_guard lock(warm_mutex_);
+    const auto it = warm_modules_.find(key);
+    if (it == warm_modules_.end()) return VK_NULL_HANDLE;
+    const VkShaderModule module = it->second;
+    warm_modules_.erase(it);
+    return module;
+}
+
+// A warm thread's non-consuming lookup: the module is owned by warm_modules_ (or already taken,
+// in which case the render thread's caches own it) and is never destroyed while the device lives.
+VkShaderModule VulkanBackend::PeekWarmModule(uint64_t key) {
+    std::lock_guard lock(warm_mutex_);
+    const auto it = warm_modules_.find(key);
+    return it == warm_modules_.end() ? VK_NULL_HANDLE : it->second;
+}
+
+// Publish a module for the render thread. If another thread published the same key first, the
+// duplicate is destroyed (safe after pipeline creation) and the canonical module returned.
+VkShaderModule VulkanBackend::PublishWarmModule(uint64_t key, VkShaderModule module) {
+    if (!module) return VK_NULL_HANDLE;
+    // Modules kept for the render thread are bounded: an AO-heavy session must not hold every variant's
+    // SPIR-V for the whole run. Past the cap the newcomer is dropped and the caller compiles as usual.
+    static constexpr size_t kMaxWarmModules = 4096;
+    std::lock_guard lock(warm_mutex_);
+    const auto [it, inserted] = warm_modules_.emplace(key, module);
+    if (inserted) {
+        if (warm_modules_.size() > kMaxWarmModules) {
+            warm_modules_.erase(it);
+            vkDestroyShaderModule(device_, module, nullptr);
+            return VK_NULL_HANDLE;
+        }
+        return module;
+    }
+    if (it->second != module) vkDestroyShaderModule(device_, module, nullptr);
+    return it->second;
 }
 
 bool VulkanBackend::Init(uint32_t width, uint32_t height) {
@@ -2080,7 +2351,10 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
         LOGR("vulkan: FP16 scene colour %s", scene_fp16_samples_ ? "enabled" : "unavailable");
     }
     const char* defer_override = std::getenv("TCNYC_DEFER_SCENE");
-    defer_forced_ = defer_override ? std::atoi(defer_override) != 0 : draw_worker_.joinable();
+    // Deferral exists for the AO prepass, which needs the display list. With AO off it is pure record/replay
+    // overhead (round 2 measured the equivalent D3D12 path as slower per draw), so it is now opt-in with
+    // TCNYC_DEFER_SCENE=1; the recording worker still splits the replay whenever deferral is on.
+    defer_forced_ = defer_override ? std::atoi(defer_override) != 0 : false;
     defer_scene_ = defer_forced_ || ao_mode_ != 0;
     msaa_store_ = defer_scene_;
     if (defer_scene_)
@@ -2225,14 +2499,22 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
 
     // the AO pools are made on first AO use (EnsureAoPools): with AO off they are never needed
     if (!CreatePresent()) return false;
+    if (ao_mode_) {
+        LOGR("vulkan: preparing ambient occlusion shaders");
+        const bool ready = EnsureAoPipelines(PickSampleCount(msaa_, ao_color_samples_) > 1);
+        LOGR("vulkan: ambient occlusion shader preparation %s", ready ? "complete" : "incomplete");
+    }
     StartPipelineWarm();  // needs the pipeline layout and the depth format
     // the game ends through kernel::Shutdown, which skips Shutdown() here: save the caches there
     g_exit_backend = this;
     kernel::SetExitSave([] {
         if (VulkanBackend* b = g_exit_backend.load()) {
+            b->StopAoWarm();       // no worker may build a pipeline while the caches are serialized
+            b->StopPipelineWarm();  // and the pipeline cache must not be read while it is changed
             b->SavePipelineCache(true);
             b->SaveSavedPipelines(true);
         }
+        FlushSpvCacheWrites();  // the last shaders compiled this run are still queued
     });
 
     LOGR("vulkan: %s, %ux%u swapchain, GPU draws", device_name_.c_str(), extent_.width, extent_.height);
@@ -3544,7 +3826,14 @@ float4 psmain(O i) : SV_Target {
 
 void VulkanBackend::Shutdown() {
     g_exit_backend = nullptr;
+    StopAoWarm();
     StopPipelineWarm();
+    FlushSpvCacheWrites();
+    // modules the warm threads left for the render thread were never taken: safe to destroy now,
+    // after every pipeline that used them has been created
+    for (auto& [key, module] : warm_modules_)
+        if (module) vkDestroyShaderModule(device_, module, nullptr);
+    warm_modules_.clear();
     if (draw_worker_.joinable()) {
         draw_job_ = {};
         draw_job_ready_.release();
@@ -3699,6 +3988,9 @@ void VulkanBackend::ResetFrame() {
     upload_used_ = 0;
     draw_set_next_ = 0;
     draw_set_cache_.clear();
+    // the upload ring starts over: cached constant offsets and dynamic-state memos are stale
+    vsc_valid_ = dc_valid_ = false;
+    RefreshAoReadyView();  // the AO workers' progress, for this frame's draws to read without locking
     const app::Settings settings = app::Snapshot();  // one copy for the whole reset
     // TAA: this frame's matched draws are the next frame's previous ones; a frame without TAA drops the history
     if (!taa_applied_) {
@@ -3922,6 +4214,7 @@ VulkanBackend::UploadAlloc VulkanBackend::AllocUpload(uint64_t size, uint64_t al
         upload_ptr_ = ptr;
         upload_size_ = next;
         upload_used_ = 0;
+        vsc_valid_ = dc_valid_ = false;  // a new ring: the cached constant offsets are meaningless
         return AllocUpload(size, align, cpu);
     }
     const uint64_t off = (upload_used_ + align - 1) & ~(align - 1);
@@ -3938,6 +4231,7 @@ VulkanBackend::UploadAlloc VulkanBackend::AllocUpload(uint64_t size, uint64_t al
         upload_ptr_ = ptr;
         upload_size_ = next;
         upload_used_ = 0;
+        vsc_valid_ = dc_valid_ = false;
         return AllocUpload(size, align, cpu);
     }
     upload_used_ = off + size;
@@ -4811,10 +5105,8 @@ bool VulkanBackend::EnsureAoPipelines(bool depth_ms) {
         return true;
     const VkRenderPass pass = AoColorPass();
     if (!pass) return false;
-    const std::string ms = depth_ms ? "1\n" : "0\n";
-    std::string gtao = std::string("#define DEPTH_MS ") + ms + "#define GTAO_SLICES 3\n#define GTAO_STEPS " +
-                       (ao_mode_ == 1 ? "6\n" : "8\n") + kAoHlsl;
-    const std::string occ = std::string("#define DEPTH_MS ") + ms + kAoOcclusionHlsl;
+    const std::string gtao = AoHorizonSource(ao_mode_, depth_ms);
+    const std::string occ = AoResolveSource(depth_ms);
     VkShaderModule gvs = CompileShader(gtao, shaderc_vertex_shader, "vs");
     VkShaderModule gps = CompileShader(gtao, shaderc_fragment_shader, "psmain");
     VkShaderModule ovs = CompileShader(occ, shaderc_vertex_shader, "vs");
@@ -5301,7 +5593,8 @@ void VulkanBackend::FlushDeferredScene(std::source_location where) {
     if (ao_ran) {
         static std::atomic<bool> logged_ao{false};
         if (!logged_ao.exchange(true, std::memory_order_relaxed))
-            LOGR("vulkan: receiver GTAO active (%s)", ao_mode_ == 1 ? "Half" : "Full");
+            LOGR("vulkan: receiver GTAO active (%s, %u variants warmed)", ao_mode_ == 1 ? "Half" : "Full",
+                 ao_built_.load());
     }
     static std::atomic<int> logged_flushes{0};
     if (logged_flushes.fetch_add(1, std::memory_order_relaxed) < 8)
@@ -5371,23 +5664,40 @@ std::string InjectBindings(std::string src) {
     }
     return out;
 }
-} // namespace
 
-VkShaderModule VulkanBackend::CompileShader(const std::string& src, shaderc_shader_kind kind, const char* entry) {
-    static shaderc_compiler_t compiler = shaderc_compiler_initialize();    static shaderc_compile_options_t options = [] {
-        shaderc_compile_options_t o = shaderc_compile_options_initialize();
-        shaderc_compile_options_set_source_language(o, shaderc_source_language_hlsl);
-        shaderc_compile_options_set_target_env(o, shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_1);
-        shaderc_compile_options_set_auto_map_locations(o, true);
-        return o;
-    }();
+struct ShaderCompiler {
+    shaderc_compiler_t compiler = shaderc_compiler_initialize();
+    shaderc_compile_options_t options = shaderc_compile_options_initialize();
+
+    ShaderCompiler() {
+        if (!options) return;
+        shaderc_compile_options_set_source_language(options, shaderc_source_language_hlsl);
+        shaderc_compile_options_set_target_env(options, shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_1);
+        shaderc_compile_options_set_auto_map_locations(options, true);
+    }
+    ~ShaderCompiler() {
+        if (options) shaderc_compile_options_release(options);
+        if (compiler) shaderc_compiler_release(compiler);
+    }
+};
+
+ShaderCompiler& ThreadShaderCompiler() {
+    thread_local ShaderCompiler compiler;
+    return compiler;
+}
+
+// The source CompileShader compiles and its SPIR-V cache key, after the HLSL-to-Vulkan fixes
+// (bindings, the shared TCNYC_VULKAN define, the NDC y flip and the motion v direction). The AO
+// variant warm below builds the same source on a worker thread, so both have to agree exactly.
+std::string VulkanShaderSource(const std::string& src, shaderc_shader_kind kind, const char* entry,
+                               uint64_t& cache_key) {
     std::string injected0 = InjectBindings(src);
     // The shared HLSL uses this to pick Vulkan bindings/push constants and the full-screen
     // NDC direction. D3D12 leaves it undefined.
     injected0 = "#define TCNYC_VULKAN 1\n" + injected0;
     // D3D's viewport maps NDC +y to the top; Vulkan maps it to the bottom. The
     // generated vertex epilogue flips for D3D, so undo that flip for Vulkan.
-    std::string injected = injected0;
+    std::string injected = std::move(injected0);
     const std::string yflip = "q.y = 1 - p.y * 2 / surf.y;";
     const size_t at = injected.find(yflip);
     if (at != std::string::npos) injected.replace(at, yflip.size(), "q.y = p.y * 2 / surf.y - 1;");
@@ -5398,40 +5708,37 @@ VkShaderModule VulkanBackend::CompileShader(const std::string& src, shaderc_shad
     const std::string motion_uv = "(was - now) * float2(0.5, -0.5)";
     if (const size_t mat = injected.find(motion_uv); mat != std::string::npos)
         injected.replace(mat, motion_uv.size(), "(was - now) * float2(0.5, 0.5)");
-    const shaderc_shader_kind shader_kind = kind;
+    // one source can hold several entry points: the bloom chain's bright, down and up
+    cache_key = Hash(entry, std::strlen(entry), Hash(injected.data(), injected.size())) ^
+                (uint64_t(kind) << 56);
+    return injected;
+}
+} // namespace
 
-    // compiled SPIR-V persisted between runs, keyed by the final source, stage and entry point (one source can
-    // hold several: the bloom chain's bright, down and up)
-    const uint64_t cache_key = Hash(entry, std::strlen(entry), Hash(injected.data(), injected.size())) ^
-                               (uint64_t(kind) << 56);
-    static const std::filesystem::path cache_dir = [] {
-        if (const char* xdg = std::getenv("XDG_CACHE_HOME"); xdg && *xdg)
-            return std::filesystem::path(xdg) / "TrueCrimeNYC" / "shaders";
-        if (const char* home = std::getenv("HOME"); home && *home)
-            return std::filesystem::path(home) / ".cache" / "TrueCrimeNYC" / "shaders";
-        return std::filesystem::path();
-    }();
-    char cache_name[32];
-    std::snprintf(cache_name, sizeof(cache_name), "%016llx.spv", static_cast<unsigned long long>(cache_key));
-    const std::filesystem::path cache_path =
-        cache_dir.empty() ? std::filesystem::path() : cache_dir / cache_name;
-    if (!cache_path.empty()) {
-        std::ifstream in(cache_path, std::ios::binary);
-        std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), {});
-        if (bytes.size() >= 4 && bytes.size() % 4 == 0) {
-            VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-            info.codeSize = bytes.size();
-            info.pCode = reinterpret_cast<const uint32_t*>(bytes.data());
-            VkShaderModule module = VK_NULL_HANDLE;
-            if (vkCreateShaderModule(device_, &info, nullptr, &module) == VK_SUCCESS) {
-                spv_keys_[module] = cache_key;
-                return module;
-            }
-        }
+VkShaderModule VulkanBackend::CompileShader(const std::string& src, shaderc_shader_kind kind, const char* entry) {
+    uint64_t cache_key = 0;
+    const std::string injected = VulkanShaderSource(src, kind, entry, cache_key);
+    const std::filesystem::path cache_path = SpvCachePath(cache_key);
+    // The startup warm (or the AO variant worker) may already have compiled this shader and
+    // published the module; take it instead of opening the cache file again.
+    if (VkShaderModule warm = TakeWarmModule(cache_key)) {
+        spv_keys_[warm] = cache_key;
+        return warm;
+    }
+    if (VkShaderModule module = LoadSpirv(device_, cache_path)) {
+        spv_keys_[module] = cache_key;
+        return module;
     }
 
+    const auto compile_started = std::chrono::steady_clock::now();
+    auto& compiler = ThreadShaderCompiler();
+    if (!compiler.compiler || !compiler.options) return VK_NULL_HANDLE;
+    ++shader_compiles_;
     shaderc_compilation_result_t result = shaderc_compile_into_spv(
-        compiler, injected.data(), injected.size(), shader_kind, "tcnyc", entry, options);
+        compiler.compiler, injected.data(), injected.size(), kind, "tcnyc", entry, compiler.options);
+    if (!result) return VK_NULL_HANDLE;
+    const double compile_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - compile_started).count();
     const shaderc_compilation_status status = shaderc_result_get_compilation_status(result);
     if (status != shaderc_compilation_status_success) {
         static int logged = 0;
@@ -5444,23 +5751,20 @@ VkShaderModule VulkanBackend::CompileShader(const std::string& src, shaderc_shad
         shaderc_result_release(result);
         return VK_NULL_HANDLE;
     }
+    // A compile this slow is a visible hitch; log it so a stutter report can be tied to a shader.
+    if (compile_ms >= 50.0)
+        LOGR("vulkan: %s %s compiled in %.1f ms (%zu bytes)", kind == shaderc_vertex_shader ? "vertex"
+              : kind == shaderc_geometry_shader ? "geometry" : "pixel", entry, compile_ms, injected.size());
     VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     info.codeSize = shaderc_result_get_length(result);
     info.pCode = reinterpret_cast<const uint32_t*>(shaderc_result_get_bytes(result));
     VkShaderModule module = VK_NULL_HANDLE;
     VkResult r = vkCreateShaderModule(device_, &info, nullptr, &module);
     if (r == VK_SUCCESS && !cache_path.empty()) {
-        std::error_code ec;
-        std::filesystem::create_directories(cache_dir, ec);
-        const std::string temp = cache_path.string() + ".tmp." + std::to_string(::getpid());
-        if (FILE* f = std::fopen(temp.c_str(), "wb")) {
-            const size_t bytes_written =
-                std::fwrite(shaderc_result_get_bytes(result), 1, shaderc_result_get_length(result), f);
-            const bool ok = bytes_written == shaderc_result_get_length(result);
-            std::fclose(f);
-            if (ok) std::rename(temp.c_str(), cache_path.c_str());
-            else std::remove(temp.c_str());
-        }
+        const char* first = shaderc_result_get_bytes(result);
+        std::vector<uint8_t> spv(reinterpret_cast<const uint8_t*>(first),
+                                 reinterpret_cast<const uint8_t*>(first) + shaderc_result_get_length(result));
+        SpvCacheWriter::Get().Enqueue(cache_path, std::move(spv));
     }
     shaderc_result_release(result);
     if (r != VK_SUCCESS) {
@@ -5469,6 +5773,257 @@ VkShaderModule VulkanBackend::CompileShader(const std::string& src, shaderc_shad
     }
     spv_keys_[module] = cache_key;
     return module;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Progressive ambient occlusion variants
+
+// The depth-prepass pipeline for an AO receiver: depth plus the R32F view distance, no blend, red
+// only, no stencil, at the sample count the AO targets actually use. Shared by the draw path and
+// the background warm so the two can never derive different keys.
+PsoKey VulkanBackend::AoDepthPsoKey(const PsoKey& k, uint64_t ps, uint32_t ao_samples) {
+    PsoKey dk = k;
+    dk.ps = ps;
+    dk.rtfmt = uint32_t(VK_FORMAT_R32_SFLOAT);
+    dk.dsfmt = uint32_t(depth_format_);
+    dk.samples = ao_samples;
+    dk.blend = dk.src = dk.dst = dk.op = 0;
+    dk.wmask = 1;  // red
+    dk.a2c = dk.samples > 1 ? k.a2c : 0;
+    dk.sten = dk.sfunc = dk.smask = dk.swmask = dk.sfail = dk.szfail = dk.spass = 0;
+    dk.motion = 0;
+    return dk;
+}
+
+// The pixel program and the remaining pipeline state jointly identify a warm variant.
+static uint64_t AoVariantId(PsoKey key, uint64_t pixel) {
+    key.ps = 0;
+    return Hash(&key, sizeof(key), pixel);
+}
+
+bool VulkanBackend::AoColorReady(uint64_t base) { return ao_color_ready_view_.count(base) != 0; }
+
+bool VulkanBackend::AoDepthReady(uint64_t base) { return ao_depth_ready_view_.count(base) != 0; }
+
+// Publish worker progress at a frame boundary.
+void VulkanBackend::RefreshAoReadyView() {
+    std::lock_guard lock(ao_mutex_);
+    if (ao_color_ready_view_ != ao_color_ready_) ao_color_ready_view_ = ao_color_ready_;
+    if (ao_depth_ready_view_ != ao_depth_ready_) ao_depth_ready_view_ = ao_depth_ready_;
+}
+
+// Queue the AO variants a draw needs. The HLSL, its cache key and the render pass are made here,
+// on the render thread (the shader generator and the render-pass caches are render-thread state);
+// the worker only compiles and builds. Sources are cached per base pixel key: a scene uses one
+// shader with many blend/depth states, so the same source is reused while each state gets its own
+// pipeline.
+void VulkanBackend::ScheduleAoVariants(const PixelKey& base, const PsoKey& k, VkShaderModule vs, bool color,
+                                       bool depth) {
+    if ((!color && !depth) || !vs) return;
+    if (k.topo == 0 || k.topo == 1) return;  // points and lines add the geometry shader path
+    const uint64_t base_hash = Hash(&base, sizeof(base));
+    AoWarmJob job;
+    const uint32_t ao_samples = PickSampleCount(k.samples, ao_color_samples_);
+    if (color) job.color_id = AoVariantId(k, base_hash);
+    if (depth) {
+        PixelKey depth_pixel = base;
+        depth_pixel.motion = 0;
+        job.depth_id = AoVariantId(AoDepthPsoKey(k, 0, ao_samples), Hash(&depth_pixel, sizeof(depth_pixel)));
+    }
+    {
+        std::lock_guard lock(ao_mutex_);
+        if (ao_jobs_.size() >= 256) return;
+        color = color && !ao_color_ready_.count(job.color_id) && ao_scheduled_color_.insert(job.color_id).second;
+        depth = depth && !ao_depth_ready_.count(job.depth_id) && ao_scheduled_depth_.insert(job.depth_id).second;
+    }
+    if (!color && !depth) return;
+    job.vs = vs;
+    AoVariantSource source;
+    auto it = ao_sources_.find(base_hash);
+    if (it != ao_sources_.end()) source = it->second;  // copied: the job may outlive the cache entry
+    // A base shader can first be needed only as a receiver (alpha colour pass) and later also as a
+    // depth writer (the depth-only pass). Fill in whichever variant the cached source lacks.
+    if (color && source.color_ps == 0) {
+        PixelKey p = base;
+        p.ao = 1;
+        source.color_src = VulkanShaderSource(PixelHlsl(p), shaderc_fragment_shader, "main", source.color_spv);
+        source.color_ps = Hash(&p, sizeof(p));  // Vulkan's PsoKey::ps is the PixelKey hash
+    }
+    if (depth && source.depth_ps == 0) {
+        PixelKey p = base;
+        p.ao = 3;
+        p.motion = 0;
+        source.depth_src = VulkanShaderSource(PixelHlsl(p), shaderc_fragment_shader, "main", source.depth_spv);
+        source.depth_ps = Hash(&p, sizeof(p));
+    }
+    if (ao_sources_.size() < 1024) ao_sources_[base_hash] = source;
+    if (color) {
+        // the scene pass the receiver's pipeline will be used with (CreatePipeline derives the
+        // same one; the warm threads must not touch the render-pass caches themselves)
+        const VkRenderPass pass = k.samples > 1
+                                      ? RenderPassForMs(VkFormat(k.rtfmt), VkFormat(k.dsfmt), k.samples,
+                                                        k.motion != 0)
+                                      : RenderPassFor(VkFormat(k.rtfmt), VkFormat(k.dsfmt), k.motion != 0);
+        if (pass) {
+            job.has_color = true;
+            job.color_pass = pass;
+            job.color_src = std::move(source.color_src);  // the cache kept a copy above
+            job.color_spv = source.color_spv;
+            job.color_key = k;
+            job.color_key.ps = source.color_ps;
+        }
+    }
+    if (depth) {
+        const VkRenderPass pass = AoPrepassPass(ao_samples);
+        if (pass) {
+            job.has_depth = true;
+            job.depth_pass = pass;
+            job.depth_src = std::move(source.depth_src);
+            job.depth_spv = source.depth_spv;
+            job.depth_key = AoDepthPsoKey(k, source.depth_ps, ao_samples);
+        }
+    }
+    {
+        std::lock_guard lock(ao_mutex_);
+        if (color && !job.has_color) ao_scheduled_color_.erase(job.color_id);
+        if (depth && !job.has_depth) ao_scheduled_depth_.erase(job.depth_id);
+        if (!job.has_color && !job.has_depth) return;
+        ao_jobs_.push_back(std::move(job));
+    }
+    ao_cv_.notify_all();
+    static std::atomic<bool> announced{false};
+    if (!announced.exchange(true))
+        LOGR("vulkan: warming ambient occlusion shader variants in the background");
+    if (!ao_started_.load(std::memory_order_acquire)) StartAoWarm();
+}
+
+void VulkanBackend::StartAoWarm() {
+    // called for every variant: an atomic first, so the common case does not take the queue's mutex
+    if (ao_started_.load(std::memory_order_acquire)) return;
+    std::lock_guard lock(ao_mutex_);
+    if (ao_threads_.empty() && !ao_stop_) {
+        const unsigned cores = std::max(1u, std::thread::hardware_concurrency());
+        const uint32_t threads = uint32_t(std::clamp<unsigned>(cores > 2 ? cores - 2 : 1, 1, 3));
+        for (uint32_t i = 0; i < threads; i++) ao_threads_.emplace_back([this] { AoWarmWorker(); });
+        LOGR("vulkan: AO variant worker started on %u threads", threads);
+    }
+    ao_started_.store(true, std::memory_order_release);
+}
+
+void VulkanBackend::StopAoWarm() {
+    {
+        std::lock_guard lock(ao_mutex_);
+        ao_stop_ = true;
+        ao_jobs_.clear();  // do not drain a long queue at exit; a lost warm entry is harmless
+    }
+    ao_cv_.notify_all();
+    for (auto& t : ao_threads_)
+        if (t.joinable()) t.join();
+    ao_threads_.clear();
+}
+
+// Worker-side module fetch for a scheduled AO variant: the shared warm cache, the disk cache, or
+// a compile with this thread's own shaderc state. The source and cache key were made on the
+// render thread, so this cannot derive a different variant than the draw path will ask for. The
+// module is published for the render thread's CompileShader (which otherwise re-reads the .spv).
+VkShaderModule VulkanBackend::AcquireSpvModule(const std::string& source, uint64_t spv_key) {
+    if (VkShaderModule module = PeekWarmModule(spv_key)) return module;
+    const std::filesystem::path cache_path = SpvCachePath(spv_key);
+    if (VkShaderModule module = LoadSpirv(device_, cache_path))
+        return PublishWarmModule(spv_key, module);
+    auto& compiler = ThreadShaderCompiler();
+    if (!compiler.compiler || !compiler.options) return VK_NULL_HANDLE;
+    const auto started = std::chrono::steady_clock::now();
+    shaderc_compilation_result_t result = shaderc_compile_into_spv(
+        compiler.compiler, source.data(), source.size(), shaderc_fragment_shader, "tcnyc", "main", compiler.options);
+    if (!result) return VK_NULL_HANDLE;
+    const double compile_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    if (shaderc_result_get_compilation_status(result) != shaderc_compilation_status_success) {
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+            LOGE("vulkan: AO pixel variant failed: %s", shaderc_result_get_error_message(result));
+        shaderc_result_release(result);
+        return VK_NULL_HANDLE;
+    }
+    if (compile_ms >= 50.0)
+        LOGR("vulkan: AO pixel variant compiled in %.1f ms (%zu bytes)", compile_ms, source.size());
+    VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    info.codeSize = shaderc_result_get_length(result);
+    info.pCode = reinterpret_cast<const uint32_t*>(shaderc_result_get_bytes(result));
+    VkShaderModule module = VK_NULL_HANDLE;
+    const VkResult r = vkCreateShaderModule(device_, &info, nullptr, &module);
+    if (r == VK_SUCCESS && !cache_path.empty()) {
+        const char* first = shaderc_result_get_bytes(result);
+        std::vector<uint8_t> spv(reinterpret_cast<const uint8_t*>(first),
+                                 reinterpret_cast<const uint8_t*>(first) + shaderc_result_get_length(result));
+        SpvCacheWriter::Get().Enqueue(cache_path, std::move(spv));
+    }
+    shaderc_result_release(result);
+    if (r != VK_SUCCESS) {
+        LOGE("vulkan: AO shader module creation failed: %s", VkError(r));
+        return VK_NULL_HANDLE;
+    }
+    return PublishWarmModule(spv_key, module);
+}
+
+void VulkanBackend::AoWarmWorker() {
+    t_warm_thread = true;
+    LowerThreadPriority();
+    for (;;) {
+        AoWarmJob job;
+        {
+            std::unique_lock lock(ao_mutex_);
+            ao_cv_.wait(lock, [this] { return ao_stop_ || !ao_jobs_.empty(); });
+            if (ao_jobs_.empty()) {
+                if (ao_stop_) return;
+                continue;
+            }
+            job = std::move(ao_jobs_.front());
+            ao_jobs_.pop_front();
+        }
+        bool color_ok = false, depth_ok = false;
+        if (job.has_color) {
+            VkShaderModule ps = AcquireSpvModule(job.color_src, job.color_spv);
+            VkPipeline pipe = VK_NULL_HANDLE;
+            if (ps && CreatePipeline(job.color_key, job.vs, ps, pipe, job.color_pass)) {
+                {
+                    std::lock_guard lock(warm_mutex_);
+                    if (!warm_pipelines_.emplace(job.color_key, pipe).second)
+                        vkDestroyPipeline(device_, pipe, nullptr);
+                }
+                color_ok = true;
+            } else if (ps) {
+                static std::atomic<int> logged{0};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+                    LOGE("vulkan: AO receiver pipeline failed; those draws stay without AO");
+            }
+        }
+        if (job.has_depth) {
+            VkShaderModule ps = AcquireSpvModule(job.depth_src, job.depth_spv);
+            VkPipeline pipe = VK_NULL_HANDLE;
+            if (ps && CreatePipeline(job.depth_key, job.vs, ps, pipe, job.depth_pass)) {
+                {
+                    std::lock_guard lock(warm_mutex_);
+                    if (!warm_pipelines_.emplace(job.depth_key, pipe).second)
+                        vkDestroyPipeline(device_, pipe, nullptr);
+                }
+                depth_ok = true;
+            } else if (ps) {
+                static std::atomic<int> logged{0};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+                    LOGE("vulkan: AO depth pipeline failed; those draws stay without AO");
+            }
+        }
+        // Ready only once the module and its pipeline are both in the handoff maps above, so the
+        // next draw that sees this variant takes both without compiling anything.
+        {
+            std::lock_guard lock(ao_mutex_);
+            if (color_ok) ao_color_ready_.insert(job.color_id);
+            if (depth_ok) ao_depth_ready_.insert(job.depth_id);
+        }
+        if (color_ok || depth_ok) ++ao_built_;
+    }
 }
 
 // The console draws a point as its whole pixel and a line as a one-pixel quad; the shared reference
@@ -5553,7 +6108,6 @@ VkShaderModule VulkanBackend::VertexShaderFor(const State& s, const Assembled& a
     VkShaderModule module = CompileShader(src, shaderc_vertex_shader, "main");
     if (module) {
         vs_cache_[key] = module;
-        shader_compiles_++;
     }
     return module;
 }
@@ -5565,7 +6119,6 @@ VkShaderModule VulkanBackend::PixelShaderFor(const PixelKey& pk, uint64_t& key) 
     VkShaderModule module = CompileShader(src, shaderc_fragment_shader, "main");
     if (module) {
         ps_cache_[key] = module;
-        shader_compiles_++;
     }
     return module;
 }
@@ -5623,9 +6176,10 @@ bool VulkanBackend::CreatePipeline(const PsoKey& k, VkShaderModule vs, VkShaderM
     rs.polygonMode = k.fill == kFillWireframe && fill_non_solid_ ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
     rs.cullMode = k.cull ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
     rs.frontFace = k.ccw ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
-    rs.depthBiasEnable = k.zslope != 0.0f;
+    const float slope = std::bit_cast<float>(k.zslope_bits);
+    rs.depthBiasEnable = std::isfinite(slope) && slope != 0.0f;
     rs.depthBiasConstantFactor = 0.0f;
-    rs.depthBiasSlopeFactor = k.zslope;
+    rs.depthBiasSlopeFactor = rs.depthBiasEnable ? slope : 0.0f;
     rs.depthBiasClamp = 0.0f;
     rs.lineWidth = 1.0f;
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
@@ -5636,7 +6190,8 @@ bool VulkanBackend::CreatePipeline(const PsoKey& k, VkShaderModule vs, VkShaderM
     ds.depthTestEnable = k.zen && k.dsfmt != 0;
     ds.depthWriteEnable = k.zwrite && ds.depthTestEnable;
     ds.depthCompareOp = CompareOp(k.zfunc);
-    ds.stencilTestEnable = k.sten && ds.depthTestEnable;
+    ds.stencilTestEnable = k.sten &&
+                           (k.dsfmt == VK_FORMAT_D24_UNORM_S8_UINT || k.dsfmt == VK_FORMAT_D32_SFLOAT_S8_UINT);
     ds.front = {StencilOp(k.sfail), StencilOp(k.spass), StencilOp(k.szfail), CompareOp(k.sfunc),
                 k.smask, k.swmask, 0};
     ds.back = ds.front;
@@ -5930,6 +6485,27 @@ Target* VulkanBackend::TargetAt(uint32_t data, bool depth, bool newest) {
         if (!best || (newest ? t->last_use > best->last_use : t->last_use < best->last_use)) best = t;
     }
     return best;
+}
+
+// The draw path's "newest target at this address", from an index instead of a walk of targets_. The index is
+// rebuilt when a target is created or dropped (targets_gen_) and at most once a frame, since a target's
+// last_use moves as it is bound and sampled.
+Target* VulkanBackend::NewestTarget(uint32_t data, bool depth) {
+    if (newest_index_gen_ != targets_gen_ || newest_index_frame_ != frames_) {
+        newest_colour_.clear();
+        newest_depth_.clear();
+        for (auto& [key, t] : targets_) {
+            if (!t) continue;
+            auto& by_data = t->depth ? newest_depth_ : newest_colour_;
+            auto it = by_data.find(t->data);
+            if (it == by_data.end() || t->last_use > it->second->last_use) by_data[t->data] = t;
+        }
+        newest_index_gen_ = targets_gen_;
+        newest_index_frame_ = frames_;
+    }
+    const auto& by_data = depth ? newest_depth_ : newest_colour_;
+    auto it = by_data.find(data);
+    return it == by_data.end() ? nullptr : it->second;
 }
 
 bool VulkanBackend::CreateTargetImages(Target& t) {
@@ -6258,21 +6834,31 @@ bool VulkanBackend::UploadTarget(Target* t) {
     if (t->w > 16384 || t->h > 16384) return false;
     if (t->samples > 1 && !RebuildTargetSingleSample(t)) return false;
     const uint32_t row = t->w * 4;
-    std::vector<uint8_t> px(size_t(row) * t->h, 0);
     const bool valid = t->data && t->size && mem::IsCommitted(t->data);
     const uint64_t span =
         valid && (t->swizzled ? uint64_t(t->gw) * t->gh * t->bytes : uint64_t(t->gh) * t->pitch);
     const bool in_range = valid && span <= uint64_t(t->size) + 4096;
     const uint8_t* guest = valid ? static_cast<const uint8_t*>(kernel::HostPtr(t->data)) : nullptr;
+    const size_t px_bytes = size_t(row) * t->h;
+    std::vector<uint8_t>& px = upload_scratch_;  // kept between uploads: a full-size surface does not allocate
+    // A decode writes all four bytes of every texel for 2- and 4-byte guest formats; other formats leave the
+    // untouched bytes zero, so only those need the clear.
+    const bool full_fill = t->bytes == 2 || t->bytes >= 4;
+    if (guest && in_range && full_fill) {
+        px.resize(px_bytes);
+    } else {
+        px.assign(px_bytes, 0);
+    }
     if (guest && in_range) {
-        std::vector<uint8_t> src(size_t(t->gw) * 4 * t->gh, 0);
-        for (uint32_t y = 0; y < t->gh; y++)
-            for (uint32_t x = 0; x < t->gw; x++) {
-                const uint32_t off = t->swizzled ? SwizzleOffset(x, y, t->gw, t->gh) * t->bytes
-                                                 : y * t->pitch + x * t->bytes;
-                uint8_t* o = &src[(size_t(y) * t->gw + x) * 4];
-                if (t->bytes >= 4) std::memcpy(o, guest + off, 4);
-                else if (t->bytes == 2) {
+        const uint32_t gw = t->gw, gh = t->gh;
+        const bool same_size = t->w == gw && t->h == gh;
+        auto decode = [&](uint32_t y, uint8_t* out) {
+            for (uint32_t x = 0; x < gw; x++) {
+                const uint32_t off = t->swizzled ? SwizzleOffset(x, y, gw, gh) * t->bytes : y * t->pitch + x * t->bytes;
+                uint8_t* o = out + size_t(x) * 4;
+                if (t->bytes >= 4) {
+                    std::memcpy(o, guest + off, 4);
+                } else if (t->bytes == 2) {
                     uint16_t c;
                     std::memcpy(&c, guest + off, 2);
                     o[0] = uint8_t((c & 31) * 255 / 31);
@@ -6281,11 +6867,24 @@ bool VulkanBackend::UploadTarget(Target* t) {
                     o[3] = 255;
                 }
             }
-        for (uint32_t y = 0; y < t->h; y++) {
-            const uint32_t sy = std::min(t->gh - 1, uint32_t(uint64_t(y) * t->gh / t->h));
-            for (uint32_t x = 0; x < t->w; x++) {
-                const uint32_t sx = std::min(t->gw - 1, uint32_t(uint64_t(x) * t->gw / t->w));
-                std::memcpy(&px[(size_t(y) * t->w + x) * 4], &src[(size_t(sy) * t->gw + sx) * 4], 4);
+        };
+        if (same_size && !t->swizzled && t->bytes >= 4 && t->pitch == row) {
+            // the guest's rows are exactly the target's rows: no per-texel work at all
+            for (uint32_t y = 0; y < gh; y++) std::memcpy(&px[size_t(y) * row], guest + size_t(y) * t->pitch, row);
+        } else if (same_size) {
+            // still one pass, but straight into the upload buffer
+            for (uint32_t y = 0; y < gh; y++) decode(y, &px[size_t(y) * row]);
+        } else {
+            std::vector<uint8_t> src(size_t(gw) * 4 * gh, 0);
+            for (uint32_t y = 0; y < gh; y++) decode(y, &src[size_t(y) * gw * 4]);
+            // nearest scale with a precomputed x tap per column: no division in the inner loop
+            std::vector<uint32_t> sx(t->w);
+            for (uint32_t x = 0; x < t->w; x++) sx[x] = std::min(gw - 1, uint32_t(uint64_t(x) * gw / t->w));
+            for (uint32_t y = 0; y < t->h; y++) {
+                const uint32_t sy = std::min(gh - 1, uint32_t(uint64_t(y) * gh / t->h));
+                const uint8_t* srow = &src[size_t(sy) * gw * 4];
+                uint8_t* drow = &px[size_t(y) * row];
+                for (uint32_t x = 0; x < t->w; x++) std::memcpy(drow + size_t(x) * 4, srow + size_t(sx[x]) * 4, 4);
             }
         }
     }
@@ -6337,8 +6936,11 @@ bool VulkanBackend::ReadTarget(Target* t) {
     void* map = nullptr;
     StagingBuffer(device_, mem_props_, size_t(t->w) * t->h * SwapBytesPerPixel(t->format), buffer, memory, &map, true);
     if (!map) return false;
-    EndRecord(true);
-    BeginRecord();
+    // The copy must run after the pending deferred scene it may read from (EndRecord would replay it after
+    // this copy), and it can share the frame's command buffer: one submit and one fence wait, not two.
+    if (!flushing_deferred_ && !skip_deferred_flush_ && DeferredPending()) FlushDeferredScene();
+    FlushPass();  // a transfer cannot be recorded inside an open render pass
+    if (!recording_) BeginRecord();
     VkImage read_image = t->samples > 1 ? t->resolved_image : t->image;
     VkImageLayout& read_layout = t->samples > 1 ? t->resolved_layout : t->layout;
     Transition(read_image, read_layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t->format);
@@ -7084,8 +7686,18 @@ VkSampler VulkanBackend::EnsureSampler(const State& s, int stage, const TexInfo&
     key.lodbias = lodbits;
     key.border = t[kTssBorderColor];
     key.shadow_func = s.rs[kRsShadowFunc];
+    // consecutive draws mostly ask for the same sampler: one memcmp beats the map's hash and probe
+    if (stage < 4 && (sampler_memo_valid_ & (1u << stage)) && std::memcmp(&sampler_memo_key_[stage], &key, sizeof(key)) == 0)
+        return sampler_memo_[stage];
     auto it = samplers_.find(key);
-    if (it != samplers_.end()) return it->second;
+    if (it != samplers_.end()) {
+        if (stage < 4) {
+            sampler_memo_key_[stage] = key;
+            sampler_memo_[stage] = it->second;
+            sampler_memo_valid_ |= 1u << stage;
+        }
+        return it->second;
+    }
     VkSamplerCreateInfo info_vk{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     info_vk.magFilter = an > 1 || lin(mag) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
     info_vk.minFilter = an > 1 || lin(min) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
@@ -7124,6 +7736,11 @@ VkSampler VulkanBackend::EnsureSampler(const State& s, int stage, const TexInfo&
     VkSampler sampler = VK_NULL_HANDLE;
     if (vkCreateSampler(device_, &info_vk, nullptr, &sampler) != VK_SUCCESS) return white_sampler_;
     samplers_[key] = sampler;
+    if (stage < 4) {
+        sampler_memo_key_[stage] = key;
+        sampler_memo_[stage] = sampler;
+        sampler_memo_valid_ |= 1u << stage;
+    }
     return sampler;
 }
 
@@ -7630,7 +8247,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         // one. A target read through a smaller texture view at 100% scale is not upscaled.
         if (Target* t = is_target ? sampled_target_ : nullptr; t && !t->depth && t->gw) {
             const float k = float(t->w) / float(t->gw);
-            const Target* cur = TargetAt(s.rt.data, false, true);
+            const Target* cur = NewestTarget(s.rt.data, false);
             if (k > 1.01f && cur && cur != t && (t->gw > cur->gw || t->gh > cur->gh)) {
                 info[size_t(i)].flags |= kTexWide;
                 wide[size_t(i)] = k;
@@ -7646,7 +8263,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     Target* rt = nullptr;
     Target* ds = nullptr;
     BindTargets(s, rt, ds);
-    if (rt && ds) depth_drawn_.insert(rt->data);
+    if (rt && ds) rt->has_depth = true;  // NoteShadowImage: this target was drawn with depth
     if (!pass_) return;
     splits.At("bind targets");
 
@@ -7672,7 +8289,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
                      ((scene_sized && !a.pretransformed && scene_view) || joins_scene);
     // Only a deferred receiver can get the t4 set at replay. Immediate frames (visibility tests,
     // fallback) must use the game's original pixel shader.
-    const bool ao_receiver = defer_now && (ao_roles & kAoColour) != 0;
+    bool ao_receiver = defer_now && (ao_roles & kAoColour) != 0;
     if (DeferredPending() &&
         ((rt && deferred_read_targets_.count(rt)) || (ds && deferred_read_targets_.count(ds)))) {
         // This draw writes a target the pending list samples.
@@ -7750,7 +8367,6 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     PixelKey pk = MakePixelKey(s, info.data());
     splits.At("pixel key");
     pk.quad = count <= 4 && !s.rs[kRsZEnable] && a.topology != Topology::Points;
-    pk.ao = ao_receiver ? 1 : 0;
     pk.motion = prev_consts ? 1 : 0;
     if (!pk.motion && (fsr_on_ || dlss_on_) && pass_motion_ && SimpleState(s, kMBlendEnable) &&
         SimpleState(s, kMSrcBlend) == 0x302 && !SimpleState(s, kMZWriteEnable) &&
@@ -7762,11 +8378,95 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         else if (fsr_on_ && !a.pretransformed && ds && s.rs[kRsZEnable] && (dst == 0x303 || dst == 1))
             pk.motion = 3;
     }
+    // Progressive AO: apply the variant only once its shader and pipeline are ready. Until then
+    // this draw uses the game's shader and is scheduled to the background worker below. Points
+    // and lines keep the direct path: their geometry shader is render-thread state.
+    const bool ao_progressive = a.topology != Topology::Points && a.topology != Topology::Lines;
+    PsoKey k;
+    std::memset(&k, 0, sizeof(k));
+    k.vs = vkey;
+    k.regs = a.regs;
+    for (int r = 0; r < 16; r++)
+        if ((a.regs >> r) & 1) {
+            const VertexElement& e = a.elements[size_t(r)];
+            k.elements[r] = e.format | uint32_t(e.buffer) << 8 | uint32_t(e.offset) << 16;
+            if (e.buffer < 16) k.strides[e.buffer] = a.buffers[e.buffer].stride;
+        }
+    k.topo = uint32_t(a.topology);
+    k.strip = a.strip ? 1 : 0;
+    k.sprite = sprite ? 1 : 0;
+    k.rtfmt = rt ? uint32_t(rt->format) : 0;
+    k.dsfmt = ds ? uint32_t(ds->format) : 0;
+    k.samples = rt ? rt->samples : ds ? ds->samples : 1;
+    k.blend = SimpleState(s, kMBlendEnable) != 0;
+    // as d3d12.cpp: alpha-tested cut-outs get coverage from their alpha under MSAA, the test moves to half its
+    // reference
+    {
+        const uint32_t func = SimpleState(s, kMAlphaFunc);
+        // only into the frame: an offscreen image (road markings, shadows) is read back, where the dither shows
+        k.a2c = k.samples > 1 && rt && rt->gw >= width_ && !k.blend && SimpleState(s, kMAlphaTestEnable) &&
+                (func == 0x204 || func == 0x206);
+    }
+    if (k.blend) {
+        k.src = SimpleState(s, kMSrcBlend);
+        k.dst = SimpleState(s, kMDestBlend);
+        k.op = SimpleState(s, kMBlendOp);
+    }
+    const uint32_t cw = SimpleState(s, kMColorWriteEnable);
+    k.wmask = ((cw >> 16) & 1) | ((cw >> 8) & 1) << 1 | (cw & 1) << 2 | ((cw >> 24) & 1) << 3;
+    k.zen = ds && s.rs[kRsZEnable] != 0;
+    if (k.zen) {
+        k.zwrite = SimpleState(s, kMZWriteEnable) != 0;
+        k.zfunc = SimpleState(s, kMZFunc);
+    }
+    k.sten = ds && depth_has_stencil_ && s.rs[kRsStencilEnable] != 0;
+    if (k.sten) {
+        k.sfunc = SimpleState(s, kMStencilFunc);
+        k.smask = SimpleState(s, kMStencilMask) & 0xFF;
+        k.swmask = SimpleState(s, kMStencilWriteMask) & 0xFF;
+        k.sfail = s.rs[kRsStencilFail];
+        k.szfail = SimpleState(s, kMStencilZFail);
+        k.spass = SimpleState(s, kMStencilPass);
+    }
+    const uint32_t cull = s.rs[kRsCullMode];
+    k.cull = cull != 0 && a.topology == Topology::Triangles;
+    k.ccw = cull == kCullCw;
+    k.fill = fill_non_solid_ && s.rs[kRsFillMode] == kFillWireframe ? kFillWireframe : 0;
+    if (a.topology == Topology::Triangles && SimpleState(s, kMSolidOffsetEnable)) {
+        const float slope = Bits(SimpleState(s, kMSlopeScale));
+        if (std::isfinite(slope) && slope != 0.0f) k.zslope_bits = std::bit_cast<uint32_t>(-slope);
+    }
+    k.motion = pass_motion_ ? (pk.motion == 3 ? 3u : pk.motion ? 2u : 1u) : 0u;
+
+    PixelKey pk_base;
+    bool ao_color_pending = false, ao_depth_pending = false;
+    if (defer_now && ao_progressive && ao_mode_ != 0 && (ao_receiver || (ao_roles & kAoDepth))) {
+        pk_base = pk;
+        pk_base.ao = 0;
+        const uint64_t ao_base = Hash(&pk_base, sizeof(pk_base));
+        if (ao_receiver && !AoColorReady(AoVariantId(k, ao_base))) {
+            ao_receiver = false;
+            ao_color_pending = true;
+        }
+        if (ao_roles & kAoDepth) {
+            PixelKey depth_pixel = pk_base;
+            depth_pixel.motion = 0;
+            const uint32_t ao_samples = PickSampleCount(k.samples, ao_color_samples_);
+            const uint64_t id = AoVariantId(AoDepthPsoKey(k, 0, ao_samples), Hash(&depth_pixel, sizeof(depth_pixel)));
+            ao_depth_pending = !AoDepthReady(id);
+        }
+    }
+    pk.ao = ao_receiver ? 1 : 0;
     uint64_t pkey = 0;
     VkShaderModule ps = PixelShaderFor(pk, pkey);
     if (!ps && pk.motion) {
         LOG_FIRST(4, "vulkan: TAA motion pixel shader failed, drawing without motion");
         pk.motion = 0;
+        if (ao_progressive && defer_now && pk.ao) {
+            pk.ao = 0;
+            ao_receiver = false;
+            ao_color_pending = true;
+        }
         prev_consts = nullptr;
         ps = PixelShaderFor(pk, pkey);
     }
@@ -7848,60 +8548,14 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
 
     laps.Lap(&perf_pipe_ms_);
     splits.At("draw log and skip list");
-    PsoKey k;
-    std::memset(&k, 0, sizeof(k));
-    k.vs = vkey;
     k.ps = pkey;
-    k.regs = a.regs;
-    for (int r = 0; r < 16; r++)
-        if ((a.regs >> r) & 1) {
-            const VertexElement& e = a.elements[size_t(r)];
-            k.elements[r] = e.format | uint32_t(e.buffer) << 8 | uint32_t(e.offset) << 16;
-            if (e.buffer < 16) k.strides[e.buffer] = a.buffers[e.buffer].stride;
-        }
-    k.topo = uint32_t(a.topology);
-    k.strip = a.strip ? 1 : 0;
-    k.sprite = sprite ? 1 : 0;
-    k.rtfmt = rt ? uint32_t(rt->format) : 0;
-    k.dsfmt = ds ? uint32_t(ds->format) : 0;
-    k.samples = rt ? rt->samples : ds ? ds->samples : 1;
-    k.blend = SimpleState(s, kMBlendEnable) != 0;
-    // as d3d12.cpp: alpha-tested cut-outs get coverage from their alpha under MSAA, the test moves to half its
-    // reference
-    {
-        const uint32_t func = SimpleState(s, kMAlphaFunc);
-        // only into the frame: an offscreen image (road markings, shadows) is read back, where the dither shows
-        k.a2c = k.samples > 1 && rt && rt->gw >= width_ && !k.blend && SimpleState(s, kMAlphaTestEnable) &&
-                (func == 0x204 || func == 0x206);
-    }
-    if (k.blend) {
-        k.src = SimpleState(s, kMSrcBlend);
-        k.dst = SimpleState(s, kMDestBlend);
-        k.op = SimpleState(s, kMBlendOp);
-    }
-    const uint32_t cw = SimpleState(s, kMColorWriteEnable);
-    k.wmask = ((cw >> 16) & 1) | ((cw >> 8) & 1) << 1 | (cw & 1) << 2 | ((cw >> 24) & 1) << 3;
-    k.zen = s.rs[kRsZEnable] != 0;
-    if (k.zen) {
-        k.zwrite = SimpleState(s, kMZWriteEnable) != 0;
-        k.zfunc = SimpleState(s, kMZFunc);
-    }
-    k.sten = s.rs[kRsStencilEnable] != 0;
-    if (k.sten) {
-        k.sfunc = SimpleState(s, kMStencilFunc);
-        k.smask = SimpleState(s, kMStencilMask) & 0xFF;
-        k.swmask = SimpleState(s, kMStencilWriteMask) & 0xFF;
-        k.sfail = s.rs[kRsStencilFail];
-        k.szfail = SimpleState(s, kMStencilZFail);
-        k.spass = SimpleState(s, kMStencilPass);
-    }
-    const uint32_t cull = s.rs[kRsCullMode];
-    k.cull = cull != 0 && a.topology == Topology::Triangles;
-    k.ccw = cull == kCullCw;
-    k.fill = s.rs[kRsFillMode];
-    if (a.topology == Topology::Triangles && SimpleState(s, kMSolidOffsetEnable))
-        k.zslope = SimpleState(s, kMSlopeScale) ? -Bits(SimpleState(s, kMSlopeScale)) : 0.0f;
     k.motion = pass_motion_ ? (pk.motion == 3 ? 3u : pk.motion ? 2u : 1u) : 0u;
+
+    if (ao_color_pending || ao_depth_pending) pk_base.motion = pk.motion;
+    // Queue whichever AO variants this draw still needs. Done after the pipeline key is final so
+    // the worker builds exactly the keys the next draw will look up.
+    if (defer_now && (ao_color_pending || ao_depth_pending))
+        ScheduleAoVariants(pk_base, k, vs, ao_color_pending, ao_depth_pending);
 
     VkPipeline pipe = VK_NULL_HANDLE;
     if (auto it = pipelines_.find(k); it != pipelines_.end()) {
@@ -7909,6 +8563,11 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     } else if ((pipe = TakeWarmPipeline(k))) {
         pipelines_[k] = pipe;
     } else {
+        // The startup warm may still be running: tell it not to build this state a second time.
+        if (warm_running_.load(std::memory_order_relaxed)) {
+            std::lock_guard lock(warm_mutex_);
+            warm_skip_.insert(k);
+        }
         if (!CreatePipeline(k, vs, ps, pipe)) return;
         pipelines_[k] = pipe;
         RecordPipeline(k, vs, ps);
@@ -7918,25 +8577,19 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     // The same draw for the AO depth prepass: depth plus the R32F view distance, with blending
     // off and only the red channel written. Alpha tests and discards still apply.
     VkPipeline depth_pipe = VK_NULL_HANDLE;
-    if (defer_now && (ao_roles & kAoDepth)) {
+    if (defer_now && (ao_roles & kAoDepth) && !ao_depth_pending) {
         PixelKey dpk = pk;
         dpk.ao = 3;
         dpk.motion = 0;  // the prepass writes only the view distance
         uint64_t dkey = 0;
         VkShaderModule dps = PixelShaderFor(dpk, dkey);
         if (dps) {
-            PsoKey dk = k;
-            dk.ps = dkey;
-            dk.rtfmt = uint32_t(VK_FORMAT_R32_SFLOAT);
-            dk.dsfmt = uint32_t(depth_format_);
             const uint32_t ao_samples = PickSampleCount(rt->samples, ao_color_samples_);
-            dk.samples = ao_samples;
-            dk.blend = dk.src = dk.dst = dk.op = 0;
-            dk.wmask = 1;  // red
-            dk.sten = dk.sfunc = dk.smask = dk.swmask = dk.sfail = dk.szfail = dk.spass = 0;
-            dk.motion = 0;  // the AO prepass has no motion attachment
+            const PsoKey dk = AoDepthPsoKey(k, dkey, ao_samples);
             if (auto it = pipelines_.find(dk); it != pipelines_.end()) {
                 depth_pipe = it->second;
+            } else if ((depth_pipe = TakeWarmPipeline(dk))) {
+                pipelines_[dk] = depth_pipe;
             } else {
                 const VkRenderPass pass = AoPrepassPass(ao_samples);
                 if (pass && CreatePipeline(dk, vs, dps, depth_pipe, pass)) pipelines_[dk] = depth_pipe;
@@ -7997,13 +8650,33 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
             c.texsize[i][1] = float(descs[size_t(i)].height);
         }
     splits.At("fill constants");
-    void* vc = nullptr;
-    void* dc = nullptr;
-    const UploadAlloc vc_alloc = AllocUpload(sizeof(s.vsc), 256, &vc);
-    const UploadAlloc dc_alloc = AllocUpload(sizeof(c), 256, &dc);
-    if (!vc || !dc) return;
-    std::memcpy(vc, s.vsc.data(), sizeof(s.vsc));
-    std::memcpy(dc, &c, sizeof(c));
+    // The vertex and draw constants are usually unchanged from the previous draw (vsc by the render thread's
+    // serial, the draw block by a memcmp): reuse the ring offset instead of copying 5 KB again. Both offsets
+    // are cleared whenever the ring resets or grows.
+    UploadAlloc vc_alloc{};
+    if (vsc_valid_ && s.vsc_serial && s.vsc_serial == vsc_serial_) {
+        vc_alloc = {upload_, vsc_off_};
+    } else {
+        void* vc = nullptr;
+        vc_alloc = AllocUpload(sizeof(s.vsc), 256, &vc);
+        if (!vc) return;
+        std::memcpy(vc, s.vsc.data(), sizeof(s.vsc));
+        vsc_valid_ = true;
+        vsc_serial_ = s.vsc_serial;
+        vsc_off_ = vc_alloc.offset;
+    }
+    UploadAlloc dc_alloc{};
+    if (dc_valid_ && std::memcmp(&last_dc_, &c, sizeof(c)) == 0) {
+        dc_alloc = {upload_, dc_off_};
+    } else {
+        void* dc = nullptr;
+        dc_alloc = AllocUpload(sizeof(c), 256, &dc);
+        if (!dc) return;
+        std::memcpy(dc, &c, sizeof(c));
+        last_dc_ = c;
+        dc_valid_ = true;
+        dc_off_ = dc_alloc.offset;
+    }
     // binding 10: the matched draw's previous constants, else this draw's own (the binding must be valid)
     UploadAlloc vcp_alloc = vc_alloc;
     if (prev_consts) {
@@ -8078,34 +8751,41 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     splits.At("vkUpdateDescriptorSets");
     laps.Lap(&perf_geom_ms_);
 
-    // geometry
+    // geometry: the streams and the index list as one ring block, one allocation per draw
     uint32_t bound[16];
     VkBuffer vbufs[16];
     VkDeviceSize offs[16];
     uint32_t nb = 0;
+    uint64_t stream_off[16] = {};
+    uint64_t total = 0;
     for (int b = 0; b < 16; b++) {
         if (!a.buffers[size_t(b)].src || !a.buffers[size_t(b)].bytes) continue;
-        void* dst = nullptr;
-        const UploadAlloc alloc = AllocUpload(a.buffers[size_t(b)].bytes, 4, &dst);
-        if (!dst) return;
-        std::memcpy(dst, a.buffers[size_t(b)].src, a.buffers[size_t(b)].bytes);
+        stream_off[b] = (total + 3) & ~uint64_t(3);
+        total = stream_off[b] + a.buffers[size_t(b)].bytes;
+    }
+    const uint32_t index_width = a.index16 ? 2u : 4u;
+    const uint64_t ibytes = a.index_count && a.index_src ? uint64_t(a.index_count) * index_width : 0;
+    const uint64_t ib_off = (total + 3) & ~uint64_t(3);
+    total = ib_off + ibytes;
+    void* geom = nullptr;
+    const UploadAlloc geom_alloc = AllocUpload(total, 4, &geom);
+    if (!geom) return;
+    for (int b = 0; b < 16; b++) {
+        if (!a.buffers[size_t(b)].src || !a.buffers[size_t(b)].bytes) continue;
+        std::memcpy(static_cast<uint8_t*>(geom) + stream_off[b], a.buffers[size_t(b)].src, a.buffers[size_t(b)].bytes);
         bound[nb] = uint32_t(b);
-        vbufs[nb] = alloc.buffer;
-        offs[nb] = alloc.offset;
+        vbufs[nb] = geom_alloc.buffer;
+        offs[nb] = geom_alloc.offset + stream_off[b];
         nb++;
     }
     VkBuffer idx_buffer = VK_NULL_HANDLE;
     VkDeviceSize idx_off = 0;
     VkIndexType idx_type = VK_INDEX_TYPE_UINT16;
     uint32_t index_count = 0;
-    if (a.index_count && a.index_src) {
-        const uint32_t width = a.index16 ? 2 : 4;
-        void* dst = nullptr;
-        const UploadAlloc alloc = AllocUpload(uint64_t(a.index_count) * width, 4, &dst);
-        if (!dst) return;
-        std::memcpy(dst, a.index_src, size_t(a.index_count) * width);
-        idx_buffer = alloc.buffer;
-        idx_off = alloc.offset;
+    if (ibytes) {
+        std::memcpy(static_cast<uint8_t*>(geom) + ib_off, a.index_src, size_t(ibytes));
+        idx_buffer = geom_alloc.buffer;
+        idx_off = geom_alloc.offset + ib_off;
         idx_type = a.index16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
         index_count = a.index_count;
     }
@@ -8188,6 +8868,18 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     for (uint32_t i = 0; i < nb; i++) vkCmdBindVertexBuffers(cmd_, bound[i], 1, &vbufs[i], &offs[i]);
     if (idx_buffer) vkCmdBindIndexBuffer(cmd_, idx_buffer, idx_off, idx_type);
     vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0, 1, &set, 3, dyn_offsets);
+    // blend factor and stencil reference: both are dynamic state, so only set what differs. viewport_valid_
+    // is the "the per-command-buffer dynamic state below still holds" flag: every place that changes it
+    // behind the draws' back clears it, so a stale memo can never be used. This test comes before the
+    // viewport block, which is the one that sets the flag again.
+    bool state_valid = viewport_valid_;
+    if (!state_valid || std::memcmp(blend_color, bound_blend_, sizeof(blend_color)) != 0 ||
+        stencil_ref != bound_stencil_) {
+        vkCmdSetBlendConstants(cmd_, blend_color);
+        vkCmdSetStencilReference(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, stencil_ref);
+        std::memcpy(bound_blend_, blend_color, sizeof(bound_blend_));
+        bound_stencil_ = stencil_ref;
+    }
     if (!viewport_valid_ || std::memcmp(&vp, &bound_vp_, sizeof(vp)) != 0 ||
         std::memcmp(&sc, &bound_sc_, sizeof(sc)) != 0) {
         vkCmdSetViewport(cmd_, 0, 1, &vp);
@@ -8196,8 +8888,6 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         bound_sc_ = sc;
         viewport_valid_ = true;
     }
-    vkCmdSetBlendConstants(cmd_, blend_color);
-    vkCmdSetStencilReference(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, stencil_ref);
     uint32_t query = kOcclusionQueries;
     if (SimpleState(s, kMCountEnable)) LOG_FIRST(1, "vulkan: visibility count enabled");
     if (query_pool_ && SimpleState(s, kMCountEnable) && query_next_ < kOcclusionQueries) {
@@ -8651,6 +9341,7 @@ void VulkanBackend::WritePostSet(VkDescriptorSet set, VkImageView t0, VkImageVie
 
 // a full-screen pass pipeline of the post layout, writing all of one colour attachment of this format
 VkPipeline VulkanBackend::MakePostPipeline(VkShaderModule vs, VkShaderModule ps, const char* entry, VkFormat format) {
+    if (!vs || !ps) return VK_NULL_HANDLE;  // a failed shader must not reach vkCreateGraphicsPipelines
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -8809,11 +9500,11 @@ VkImageView VulkanBackend::BuildBloom(VkImageView src, uint32_t w, uint32_t h) {
 // yet, so they are looked up.
 bool VulkanBackend::NoteShadowImage(const State& s, int stage, const Target& t) {
     // square and read with a projected lookup, as d3d12.cpp: not a HUD icon or the flat-read glow image
-    if (t.depth || t.gw != t.gh || t.gw < 64 || t.gw >= height_ || depth_drawn_.count(t.data)) return false;
+    if (t.depth || t.gw != t.gh || t.gw < 64 || t.gw >= height_ || t.has_depth) return false;
     const uint32_t mode = (s.rs[kRsPsTextureModes] >> (stage * 5)) & 0x1F;
     const bool projected = s.ps ? (mode == 1 || mode == 2) : (s.tss[size_t(stage)][kTssTextureTransformFlags] & 0x100) != 0;
-    const Target* rt = s.rt.data ? TargetAt(s.rt.data, false, true) : nullptr;
-    const Target* ds = s.rs[kRsZEnable] && s.zs.data ? TargetAt(s.zs.data, true, true) : nullptr;
+    const Target* rt = s.rt.data ? NewestTarget(s.rt.data, false) : nullptr;
+    const Target* ds = s.rs[kRsZEnable] && s.zs.data ? NewestTarget(s.zs.data, true) : nullptr;
     if (rt && ds && projected && rt->gw >= width_ && rt->gh >= height_) {
         if (shadow_maps_.insert(t.data).second) LOGR("vulkan: shadow image %ux%u at %08X", t.gw, t.gh, t.data);
         // softness only on images the game blurs (the shadows), not the road markings it projects the same way
@@ -9104,6 +9795,7 @@ VkRenderPass VulkanBackend::TaaMotionPass() {
 
 // a full-screen pass of the TAA layout into f0, or into f0 and f1 (the motion pass)
 VkPipeline VulkanBackend::MakeTaaPipeline(VkShaderModule ps, const char* entry, VkFormat f0, VkFormat f1) {
+    if (!ps || !taa_.vs) return VK_NULL_HANDLE;  // a failed shader must not reach vkCreateGraphicsPipelines
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;

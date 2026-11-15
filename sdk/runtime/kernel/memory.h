@@ -7,7 +7,12 @@ constexpr uint32_t kPage = 0x1000;
 constexpr uint32_t kUserLow = 0x00010000;
 constexpr uint32_t kUserHigh = 0x7FFE0000;
 constexpr uint32_t kContiguousBase = 0x80000000;  // guest VA = kContiguousBase | physical
-constexpr uint32_t kPhysicalSize = 64u << 20;
+// Dev-kit Xbox consoles had 128 MB (retail had 64 MB). The extra window is transparent to the game: it is
+// only reachable through the normal contiguous allocator and MmQueryStatistics total. A 128 MB window still
+// needs the host reservation to extend past 4 GB so the write-combine view does not touch its edge.
+// 192 MB: the largest size whose write-combine view (0xF0000000 + size) stays below the host thunks at
+// 0xFD000000. Not a power of two, so physical addresses are converted by range, never by mask.
+constexpr uint32_t kPhysicalSize = 192u << 20;
 constexpr uint32_t kWriteCombineBase = 0xF0000000;
 constexpr uint32_t kKernelDataBase = 0x80000000;   // first physical megabyte holds kernel variables
 constexpr uint32_t kKernelDataSize = 0x00100000;
@@ -24,6 +29,8 @@ bool Init();
 uint8_t* Base();
 bool Commit(uint32_t va, uint32_t size);
 void Decommit(uint32_t va, uint32_t size);
+void DescribeFree(uint32_t va);
+void DumpContigLedger();
 bool IsCommitted(uint32_t va);
 
 // user virtual space, NTSTATUS results

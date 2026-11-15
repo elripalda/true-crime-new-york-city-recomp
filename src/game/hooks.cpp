@@ -1,3 +1,4 @@
+#include "game_addresses.h"
 // Compatibility hooks for default.xbe (True Crime: New York City, XDK 5849).
 // A strong definition replaces the recompiled function at that address.
 // The cutscene clock and replay hooks are in timing.cpp.
@@ -40,7 +41,7 @@ X86_FUNC(sub_0029366D) {
 // (1.0, 1.0) at 0x241293; the host renders at 1.0 already, so keep the stored
 // values for the game to read back and skip the hardware part.
 X86_FUNC(sub_002BEDE0) {
-    constexpr uint32_t kDevice = 0x2C8F50, kScale = 0x96C;
+    constexpr uint32_t kDevice = TC_ADDR(0x2C8F50), kScale = 0x96C;
     uint32_t x, y;
     std::memcpy(&x, base + ctx.esp + 4, 4);
     std::memcpy(&y, base + ctx.esp + 8, 4);
@@ -86,9 +87,10 @@ X86_FUNC(sub_00293541) {
 // is made 1024 slots longer while it is empty.
 X86_EXTERN_FUNC(__imp__sub_0024C020);
 X86_FUNC(sub_0024C020) {
+    if (std::getenv("XBE_NO_STREAM_RING_FIX")) return __imp__sub_0024C020(ctx, base);
     auto rv = [&](uint32_t a) { return *reinterpret_cast<volatile uint32_t *>(base + a); };
     auto wv = [&](uint32_t a, uint32_t v) { *reinterpret_cast<volatile uint32_t *>(base + a) = v; };
-    constexpr uint32_t kProducer = 0x4D48A8, kConsumer = 0x4D48A4, kExtra = 1024, kNode = 12;
+    constexpr uint32_t kProducer = TC_ADDR(0x4D48A8), kConsumer = TC_ADDR(0x4D48A4), kExtra = 1024, kNode = 12;
     static std::atomic<bool> grown{false};
     uint32_t slot = rv(kProducer);
     // grow once, while the ring is empty: consumer on the producer's node and
@@ -108,7 +110,7 @@ X86_FUNC(sub_0024C020) {
         std::atomic_thread_fence(std::memory_order_seq_cst);
         wv(slot, nodes);
         grown = true;
-        LOGI("tcnyc: stream callback ring grown from %u to %u slots", size, size + kExtra);
+        LOGR("tcnyc: stream callback ring grown from %u to %u slots", size, size + kExtra);
     }
     uint32_t req = rv(ctx.esp + 4);
     if (rv(req + 0x44) && slot && rv(slot + 8)) {
@@ -123,7 +125,7 @@ X86_FUNC(sub_0024C020) {
 // one-pixel inset. Move only the hidden keyframe so its right edge lands at 0.
 X86_EXTERN_FUNC(__imp__sub_00258EB0);
 X86_FUNC(sub_00258EB0) {
-    constexpr uint32_t kHudMenu = 0x363D50;
+    constexpr uint32_t kHudMenu = TC_ADDR(0x363D50);
     const uint32_t menu = ctx.ecx;
     __imp__sub_00258EB0(ctx, base);
     if (menu != kHudMenu) return;
@@ -170,8 +172,8 @@ X86_FUNC(sub_0013C8F0) {
 namespace {
 void WatchEffectSlot8IfRequested() {
     if (!std::getenv("XBE_EFFECT_WATCH") || kernel::GuestWatchActive()) return;
-    if (!mem::IsCommitted(0x37F8FCu)) return;
-    const uint32_t renderer = kernel::R32(0x37F8FCu);
+    if (!mem::IsCommitted(TC_ADDR(0x37F8FCu))) return;
+    const uint32_t renderer = kernel::R32(TC_ADDR(0x37F8FCu));
     if (!renderer || !mem::IsCommitted(renderer + 0x55C0u)) return;
     const uint32_t slot = renderer + 0x55C0u + 8u * 0x80u;
     if (!mem::IsCommitted(slot + 0x7Cu)) return;

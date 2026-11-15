@@ -1,3 +1,4 @@
+#include "game_addresses.h"
 // Keep the named-object table and its child nodes consistent across rebuilds.
 //
 // The game keeps a heap table of 0xB4-byte named-object records (base
@@ -24,8 +25,8 @@
 
 namespace {
 
-constexpr uint32_t kTableBase = 0x351544;  // allocated by sub_000703D0
-constexpr uint32_t kTableCount = 0x351558; // records in the table
+constexpr uint32_t kTableBase = TC_ADDR(0x351544);  // allocated by sub_000703D0
+constexpr uint32_t kTableCount = TC_ADDR(0x351558); // records in the table
 constexpr uint32_t kRecordSize = 0xB4;
 constexpr uint32_t kRecordChild = 0xA8;   // record + 0xA8 -> child node
 constexpr uint32_t kChildParent = 0xC0;   // child node + 0xC0 -> record

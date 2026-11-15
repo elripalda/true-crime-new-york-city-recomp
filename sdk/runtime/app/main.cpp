@@ -154,6 +154,7 @@ LONG WINAPI WriteCrashDump(EXCEPTION_POINTERS* e) {
             uint64_t va = r->ExceptionInformation[1], g = uint64_t(reinterpret_cast<uintptr_t>(kernel::g_base));
             LOGE("  %s %llX, guest %08llX", r->ExceptionInformation[0] ? "write" : "read", (unsigned long long)va,
                  (unsigned long long)(va - g));
+            if (va >= g && va - g < 0x100000000ull) mem::DescribeFree(uint32_t(va - g));
         }
         kernel::LogGuestStack(*t->ctx, 256, t);
         WriteGuestCrashPages(*t, e);
@@ -512,12 +513,18 @@ uint32_t RefreshRate() {
 
 }  // namespace
 
-void Pace(uint32_t max_fps) {
+void Pace(uint32_t max_fps, uint32_t cap_override) {
     using clock = std::chrono::steady_clock;
     static clock::time_point next = clock::now();
     uint32_t cap = FrameCap();
     if (cap == kFpsCapRefresh) cap = RefreshRate();
     if (max_fps && (!cap || cap > max_fps)) cap = max_fps;
+    if (cap_override) cap = cap_override;
+    static uint32_t previous_override = 0;
+    if (cap_override != previous_override) {
+        LOGR("presentation: pacing override %u FPS", cap_override);
+        previous_override = cap_override;
+    }
     auto now = clock::now();
     if (!cap) {
         next = now;

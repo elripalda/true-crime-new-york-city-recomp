@@ -1,3 +1,4 @@
+#include "game_addresses.h"
 // The "sumo" grapple: the shoving match on the cargo container with Tommy in
 // Human Cargo (BC4_M5), animations Nick_Grappled_Sumo_* / NPC_Grapple_Sumo_*.
 //
@@ -26,7 +27,7 @@
 #endif
 
 namespace {
-constexpr uint32_t kFrameTime = 0x37F630;
+constexpr uint32_t kFrameTime = TC_ADDR(0x37F630);
 constexpr uint32_t kState = 0x0C, kBalance = 0x40, kEnd = 0x48;
 constexpr uint8_t kRecovering = 1;
 constexpr float kAtEdge = 0.999f;

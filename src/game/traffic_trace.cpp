@@ -1,3 +1,4 @@
+#include "game_addresses.h"
 // Read-only vehicle spawn diagnostics for investigating the Xbox Copland bug.
 #include <algorithm>
 #include <cstdint>
@@ -9,7 +10,7 @@
 
 namespace {
 
-constexpr uint32_t kWorld = 0x360E00;
+constexpr uint32_t kWorld = TC_ADDR(0x360E00);
 constexpr uint32_t kTrafficRefs = 0x2660;
 constexpr uint32_t kTrafficRefStride = 0x14;
 constexpr uint32_t kTrafficRefCount = 16;
@@ -39,7 +40,7 @@ SpawnRequest ReadResource(uint8_t *base, uint32_t resource) {
     if (!resource) return request;
     request.slot = int16_t(X86_MEM16(resource + 6));
     if (request.slot < 0 || request.slot >= 256) return request;
-    const uint32_t entry = 0x37493C + uint32_t(request.slot) * 0x74;
+    const uint32_t entry = TC_ADDR(0x37493C) + uint32_t(request.slot) * 0x74;
     request.model = int16_t(X86_MEM16(entry + 0x60));
     request.flags = X86_MEM16(entry + 0x62);
     request.weight = int16_t(X86_MEM16(resource + 8));
@@ -224,7 +225,7 @@ X86_FUNC(sub_0007DBD0) {
     // queue's own vehicle still spawns from its ref; give the record the
     // weight of that ref so normal traffic keeps using the model.
     int16_t weight = int16_t(X86_MEM16(entry + 0xC));
-    if (weight <= 0 && (caller == 0x1CC6Cu || caller == 0x1E492u)) {
+    if (weight <= 0 && (caller == TC_ADDR(0x1CC6Cu) || caller == TC_ADDR(0x1E492u))) {
         const int8_t slot = int8_t(X86_MEM8(entry + 2));
         for (uint32_t i = 0; i < kTrafficRefCount; i++) {
             const uint32_t ref = world + kTrafficRefs + i * kTrafficRefStride;

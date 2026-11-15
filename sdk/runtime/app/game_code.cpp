@@ -94,6 +94,10 @@ fs::path CompilerDir() { return ExeDir() / "compiler"; }
 
 // the config in compiler\config whose [xbe] path is this xbe; an included one has no path
 fs::path ConfigFor(const std::string& xbe) {
+#ifdef XBE_IMAGE_CONFIG
+    // Regional builds can ship configs for two XBEs named default.xbe.
+    if (xbe == IMAGE_XBE) return CompilerDir() / "config" / XBE_IMAGE_CONFIG;
+#endif
     std::error_code ec;
     for (auto& e : fs::directory_iterator(CompilerDir() / "config", ec)) {
         try {

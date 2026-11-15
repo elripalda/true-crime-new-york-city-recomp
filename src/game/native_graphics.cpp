@@ -1,3 +1,4 @@
+#include "game_addresses.h"
 // Graphics rows in the native Options > Display tab.
 //
 // The tab's rows come from a MenuDuplicator in PauseMenu.tag (0x42A44) that
@@ -310,7 +311,7 @@ ExitSelection g_exit;
 constexpr uint32_t kShellRow = 0x68, kShellState = 0x6C, kShellDemo = 0x70;
 constexpr uint32_t kShellChoiceState = 1, kShellExitRow = 3;
 constexpr uint32_t kShellCount = 0xFC9CB9A7, kShellText = 0x33384F13, kShellColour = 0xC5B0BD5B;
-constexpr uint32_t kShellInputReady = 0x003EE31A, kShellDialogOpen = 0x00373554;
+constexpr uint32_t kShellInputReady = TC_ADDR(0x003EE31A), kShellDialogOpen = TC_ADDR(0x00373554);
 constexpr uint32_t kShellAlternateBack = 0x800;
 uint32_t g_shell_exit_owner = 0;
 

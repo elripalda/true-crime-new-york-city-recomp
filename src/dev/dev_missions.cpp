@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <unordered_map>
 
+#include "game/game_addresses.h"
 #include "common/graphics_menu.h"
 #include "common/guest_values.h"
 #include "core/log.h"
@@ -31,24 +32,24 @@
 
 namespace {
 
-constexpr uint32_t kGame = 0x360E00;          // global game object pointer
+constexpr uint32_t kGame = TC_ADDR(0x360E00);          // global game object pointer
 constexpr uint32_t kGameScripts = 0x2A8C;     // script manager inside it
 constexpr uint32_t kGameScriptOwner = 0x1B4;  // checked before scripts run
 constexpr uint32_t kGameCase = 0x2A84;        // current case index
 constexpr uint32_t kGameMission = 0x2A88;     // current mission index in that case
-constexpr uint32_t kSetClock = 0x7EAC0;       // (hour, minute, ?), ret 0x0C
-constexpr uint32_t kClock = 0x37F940;         // (hour * 60 + minute) * 3600
+constexpr uint32_t kSetClock = TC_ADDR(0x7EAC0);       // (hour, minute, ?), ret 0x0C
+constexpr uint32_t kClock = TC_ADDR(0x37F940);         // (hour * 60 + minute) * 3600
 // story table from LevelInfo.tag (masterCaseInfoTable), built at 0x83CC0:
 // count, then 16-byte cases {name hash +0, mission count +8, missions +0xC},
 // 32-byte missions {name hash +0, .., scene handler +0x18}
-constexpr uint32_t kCaseCount = 0x35C30C;
-constexpr uint32_t kCases = 0x35C310;
+constexpr uint32_t kCaseCount = TC_ADDR(0x35C30C);
+constexpr uint32_t kCases = TC_ADDR(0x35C310);
 // leaving the pause menu (0xA56DE) sets the pending case/mission and calls
 // 0x7F510(4); 0x7F370 applies the pending mission at the next level load
 constexpr uint32_t kPendingCase = 0x2AA4;
 constexpr uint32_t kPendingMission = 0x2AA8;
 constexpr uint32_t kPendingFlag = 0x19D;
-constexpr uint32_t kStartTransition = 0x7F510; // thiscall int(int mode)
+constexpr uint32_t kStartTransition = TC_ADDR(0x7F510); // thiscall int(int mode)
 
 std::atomic<int> g_request_case{-1}, g_request_mission{-1}, g_request_clock{-1};
 
@@ -220,7 +221,10 @@ void OnFrame(X86Context &ctx) {
             LOGR("dev: mission jump ignored, not in gameplay yet");
     }
     EnvironmentActions(ctx, game);
-    if (InGameplay()) PlayerFrame(ctx);
+    if (InGameplay()) {
+        PlayerFrame(ctx);
+        WorldFrame(ctx);
+    }
 }
 
 } // namespace dev

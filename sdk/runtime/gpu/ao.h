@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <string>
 
 #include "gpu/state.h"
 
@@ -318,5 +319,14 @@ float4 psmain(O i) : SV_Target {
     return float4(occ, occ, occ, 1.0);
 }
 )";
+
+inline std::string AoHorizonSource(uint32_t mode, bool depth_ms) {
+    return std::string("#define DEPTH_MS ") + (depth_ms ? "1\n" : "0\n") +
+           "#define GTAO_SLICES 3\n#define GTAO_STEPS " + (mode == 1 ? "6\n" : "8\n") + kAoHlsl;
+}
+
+inline std::string AoResolveSource(bool depth_ms) {
+    return std::string("#define DEPTH_MS ") + (depth_ms ? "1\n" : "0\n") + kAoOcclusionHlsl;
+}
 
 }  // namespace gpu

@@ -151,10 +151,11 @@ struct GameInfo {
     void (*rumble)(int port, uint16_t& left, uint16_t& right);
     uint32_t (*swap_interval)(uint32_t interval) = nullptr;
     bool (*keyboard_driving)() = nullptr; // title camera context for keyboard pedals
+    uint32_t (*swap_cap_override)() = nullptr; // nonzero replaces both caps for this swap
 };
 extern const GameInfo kGame;
 
 // sleeps out the rest of the frame for the fps cap
-void Pace(uint32_t max_fps = 0);
+void Pace(uint32_t max_fps = 0, uint32_t cap_override = 0);
 
 }  // namespace app

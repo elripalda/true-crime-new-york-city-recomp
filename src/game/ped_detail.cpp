@@ -1,3 +1,4 @@
+#include "game_addresses.h"
 // Pedestrian detail and pedestrian limit: when, and how many, distant stand-in pedestrians become full ones.
 //
 // Far pedestrians are cheap LowPed.XB2 stand-ins kept in a list on the crowd manager ([0x3A8260] + 0x80, count
@@ -33,11 +34,11 @@
 
 namespace {
 
-constexpr uint32_t kSwapCallReturn = 0x1B50EC;
+constexpr uint32_t kSwapCallReturn = TC_ADDR(0x1B50EC);
 constexpr uint32_t kDistanceSlot = 0x60;     // caller esp + 0x60 once 0x1B1C60 has returned (ret 4)
 constexpr float kGameSwap = 7.8125f;
-constexpr uint32_t kGame = 0x360E00, kFullPedCount = 0xBC, kGameLimit = 15;
-constexpr uint32_t kSwapAllowed = 0x2F01B4;
+constexpr uint32_t kGame = TC_ADDR(0x360E00), kFullPedCount = 0xBC, kGameLimit = 15;
+constexpr uint32_t kSwapAllowed = TC_ADDR(0x2F01B4);
 
 float Radius() {
     const uint32_t level = std::atomic_ref(app::Get().ped_detail).load(std::memory_order_relaxed);
@@ -206,7 +207,7 @@ struct PathSwap {
     uint8_t original[20];
     bool saved;
 };
-PathSwap g_paths[] = {{0x2D4A58, 0x2D4A48, 19, {}, false}, {0x2D4A7C, 0x2D4A6C, 18, {}, false}};
+PathSwap g_paths[] = {{TC_ADDR(0x2D4A58), TC_ADDR(0x2D4A48), 19, {}, false}, {TC_ADDR(0x2D4A7C), TC_ADDR(0x2D4A6C), 18, {}, false}};
 
 void ApplyCharPaths(uint8_t *base) {
     const bool full = std::atomic_ref(app::Get().ped_detail).load(std::memory_order_relaxed) == 3;  // Maximum
@@ -254,7 +255,7 @@ X86_FUNC(sub_0007DA50) {
 // that fill, add() hands back one spare slot rather than writing past the end.
 namespace {
 
-constexpr uint32_t kCacheGame = 0x3F58E0, kSlotBytes = 0x1410, kCacheSlots = 128;
+constexpr uint32_t kCacheGame = TC_ADDR(0x3F58E0), kSlotBytes = 0x1410, kCacheSlots = 128;
 uint32_t g_cache = 0;        // guest address: kCacheSlots slots plus one spare
 int32_t g_cache_count = 0;   // game thread only
 bool g_cache_warned = false;
@@ -358,10 +359,10 @@ X86_FUNC(sub_000DB4F0) {
     const uint32_t ret = X86_MEM32(ctx.esp);
     const uint32_t first = X86_MEM32(ctx.esp + 4), span = X86_MEM32(ctx.esp + 8);
     __imp__sub_000DB4F0(ctx, base);
-    if (!g_variety_reduce || (ret != 0x8746A && ret != 0x8748D)) return;
+    if (!g_variety_reduce || (ret != TC_ADDR(0x8746A) && ret != TC_ADDR(0x8748D))) return;
     const int32_t used = int32_t(ctx.eax);
     const int32_t free_entries = int32_t(span) - used;
-    int32_t reduce = int32_t(g_variety_reduce) * (ret == 0x8748D ? 2 : 1);  // heads: 3/2 per type, rounded up
+    int32_t reduce = int32_t(g_variety_reduce) * (ret == TC_ADDR(0x8748D) ? 2 : 1);  // heads: 3/2 per type, rounded up
     reduce = std::min(reduce, std::max(0, free_entries - 2));  // keep two entries spare
     ctx.eax = uint32_t(std::max(0, used - reduce));
     (void)first;
@@ -417,7 +418,7 @@ X86_EXTERN_FUNC(__imp__sub_000F9C60);
 X86_FUNC(sub_000F9C60) {
     const float radius = Radius();
     if (radius <= kGameSwap) return __imp__sub_000F9C60(ctx, base);
-    constexpr uint32_t kFar = 0x37D33C, kFarOnFoot = 0x37D340;
+    constexpr uint32_t kFar = TC_ADDR(0x37D33C), kFarOnFoot = TC_ADDR(0x37D340);
     float far_, on_foot;
     std::memcpy(&far_, base + kFar, 4);
     std::memcpy(&on_foot, base + kFarOnFoot, 4);
@@ -425,7 +426,7 @@ X86_FUNC(sub_000F9C60) {
     if (!logged) {
         logged = true;
         float other;
-        std::memcpy(&other, base + 0x37D348, 4);
+        std::memcpy(&other, base + TC_ADDR(0x37D348), 4);
         LOGR("pedestrians: character despawn distances %g / %g on foot (and %g)", far_, on_foot, other);
     }
     const float want = radius + 8.0f;
@@ -447,7 +448,7 @@ X86_EXTERN_FUNC(__imp__sub_000168F0);
 X86_FUNC(sub_000168F0) {
     const uint32_t density = std::atomic_ref(app::Get().ped_density).load(std::memory_order_relaxed);
     if (density == 0 || density > 3) return __imp__sub_000168F0(ctx, base);
-    constexpr uint32_t kPointCap = 0x2F01B0;
+    constexpr uint32_t kPointCap = TC_ADDR(0x2F01B0);
     const int32_t cap = int32_t(X86_MEM32(kPointCap));
     X86_MEM32(kPointCap) = uint32_t(density == 3 ? cap * 3 : density == 2 ? cap * 2 : cap * 3 / 2);
     __imp__sub_000168F0(ctx, base);

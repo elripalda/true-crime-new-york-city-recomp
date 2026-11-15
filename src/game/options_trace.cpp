@@ -1,3 +1,4 @@
+#include "game_addresses.h"
 // Read-only tracing of the native Options tab renderer. Off unless
 // XBE_TRACE_OPTIONS_PAGE is set; the hook calls the original unchanged.
 
@@ -18,9 +19,9 @@ X86_FUNC(sub_00250170) {
     const uint32_t renderer = trace && X86_MEM32(ctx.esp + 12) == 0xEF15D709u ? ctx.ecx : 0;
     const uint32_t caller = renderer ? X86_MEM32(ctx.esp) : 0;
     // The forwarding wrapper pushes three arguments before calling this setter.
-    const uint32_t wrapper_caller = caller == 0x00251138u ? X86_MEM32(ctx.esp + 16) : 0;
+    const uint32_t wrapper_caller = caller == TC_ADDR(0x00251138u) ? X86_MEM32(ctx.esp + 16) : 0;
     // The dispatcher has four outgoing arguments, two saved registers, and 12 local bytes.
-    const uint32_t dispatch_caller = wrapper_caller == 0x00250E7Fu ? X86_MEM32(ctx.esp + 56) : 0;
+    const uint32_t dispatch_caller = wrapper_caller == TC_ADDR(0x00250E7Fu) ? X86_MEM32(ctx.esp + 56) : 0;
     __imp__sub_00250170(ctx, base);
 
     if (renderer && ctx.eax == 0) {

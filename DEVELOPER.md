@@ -25,6 +25,49 @@ cmake --preset dev
 cmake --build out\build\dev
 ```
 
+## Experimental 120 FPS render test
+
+Use the Windows developer build with the in-game frame limit set to 60 FPS. For a display running at 120 Hz or
+higher, start the game from PowerShell in the project folder.
+
+```powershell
+$env:XBE_EXPERIMENTAL_120FPS = '1'
+$env:XBE_TRACE_FRAME_TIMING = '1'
+$env:XBE_PERF = '1'
+$env:XBE_VERBOSE = '1'
+.\out\build\dev\TrueCrimeNYC.exe
+```
+
+The prototype tries a second guest render and swap after each eligible one-tick gameplay update. Both renders
+use the same simulation state. This test measures whether the render path can run twice per update before adding
+camera or object interpolation. Pause menus, movies, audio-clock cutscenes, and input recording or replay use the
+ordinary path. For a baseline run, clear `XBE_EXPERIMENTAL_120FPS` with `Remove-Item Env:XBE_EXPERIMENTAL_120FPS`
+and relaunch. Compare updates, ticks, renders and swaps in `out\build\dev\logs\tcnyc.log`, along with the
+renderer FPS from `XBE_PERF`.
+
+## Higher frame rate gameplay test
+
+Set `XBE_NATIVE_FPS` to a cap from 61 through 120 before launching the developer build. Keep the in-game frame
+limit at 60 FPS and turn V-Sync off for the VRR test. The test currently waits for a simulation tick before
+rendering because zero-tick renders can flash. This limits gameplay to about 60 FPS. Use `XBE_TRACE_FRAME_TIMING=1`
+to compare updates, ticks and swaps in the log. Clear the variable and relaunch for standard timing.
+The earlier `XBE_NATIVE_90FPS=1` switch still selects 90 when `XBE_NATIVE_FPS` is unset.
+
+## Vehicle timestep probe
+
+In a developer build with the 60 FPS limit, launch once with `XBE_VEHICLE_STEP_PROBE=full` and once with
+`XBE_VEHICLE_STEP_PROBE=split`. The probe picks the first eligible moving vehicle and logs up to 60 samples
+of displacement, horizontal speed and object flags. In `split` mode it runs the vehicle routine twice at half
+the world step. Use `XBE_VEHICLE_STEP_PROBE=motion` to run only the force and motion integrator twice with
+half-sized steps and the same force and torque inputs. The `motion` log field counts split integrator calls
+per vehicle update. The probe can run with the main-menu attract traffic. The runs may select different vehicles,
+so compare model and starting speed before drawing conclusions. Object flags are diagnostic data, not a contact trace.
+
+For the straight-line comparison, launch with `XBE_VEHICLE_STEP_PROBE=straight-full` or `straight-motion`.
+Park the player vehicle on a clear straight stretch and press F7 once. The probe applies 240 ticks of
+throttle and 240 ticks of brake/reverse with neutral steering, then releases control. Use the same save,
+car, position and heading for each run. The brake input can reverse the vehicle after it stops.
+
 ## Experimental DLSS
 
 DLSS is experimental. It has been checked through OptiScaler, but not yet on real NVIDIA RTX hardware, so expect
@@ -87,6 +130,30 @@ Set these before launching. They are for testing and may change.
 | `TCNYC_DLSS_FORCE=1` | Try DLSS even when NGX reports it unavailable, for example through OptiScaler (Windows). |
 | `TCNYC_DLSS_REACTIVE=1` | Pass the reactive mask to DLSS as its colour bias mask (Windows). |
 | `TCNYC_DLSS_JITTER_X`, `TCNYC_DLSS_JITTER_Y`, `TCNYC_DLSS_MV_X`, `TCNYC_DLSS_MV_Y` | `-1` flips that axis of the jitter or the motion vectors (Windows), for checking DLSS's conventions. |
+
+## PAL / European build
+
+The European `(Fr,Es,It)` image is a separate XBE with its own function and data
+layout. It has its own config (`config/game-pal.toml`), generated code
+(`generated/game-pal`) and build folder:
+
+```bat
+build-pal.bat
+build-pal.bat dev
+```
+
+Put the European `default.xbe` in `assets-pal/` first. The PAL build uses the same
+`src/game` hooks through `TC_ADDR` and aliases in `src/game/pal_addresses.h`.
+`scripts/test_pal_mappings.py` checks that every US hook has a PAL alias and a
+generated PAL entry. [docs/pal-hooks.md](docs/pal-hooks.md) lists the full mapping
+and the region-specific timing paths. The `dev` argument builds the F9 tools
+in `out/build/pal-dev`. Put the European ISO in the `assets` folder next to
+the executable you want to run. PAL cutscenes use the title's performance-counter clock.
+PAL deterministic replay records the resulting per-frame simulation ticks for
+gameplay and cutscenes. Record and replay with the same region.
+
+`XBE_NO_STREAM_RING_FIX=1` runs the PAL build without the stream callback-ring
+growth, for bisecting streaming problems.
 
 ## Switches for testing
 

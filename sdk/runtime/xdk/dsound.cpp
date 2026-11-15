@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdlib>
 #include <deque>
 #include <map>
 #include <optional>
@@ -25,6 +26,11 @@ extern const xbe::Image* g_image;
 namespace dispatch {
 X86Func* Find(uint32_t guest);
 }
+#if TCNYC_DEV_TOOLS
+namespace game {
+void ReportAudioRefill(uint32_t voice, int64_t completion_ms, int64_t submission_ms);
+}
+#endif
 
 // configs written before the SDK knew the name
 #ifndef SYM_IDirectSound_SynchPlayback
@@ -87,6 +93,10 @@ X86Func* Find(uint32_t guest);
 #define SYM_IDirectSoundBuffer_SetEG FFFFFF0E
 #define HAS_IDirectSoundBuffer_SetEG 0
 #endif
+#ifndef SYM_CDirectSoundStream_SetHeadroomStub
+#define SYM_CDirectSoundStream_SetHeadroomStub FFFFFF0F
+#define HAS_CDirectSoundStream_SetHeadroomStub 0
+#endif
 
 namespace {
 
@@ -139,6 +149,9 @@ struct Voice {
     uint32_t data = 0, bytes = 0, loop_start = 0, loop_len = 0, play_start = 0, play_len = 0;
     uint32_t owned = 0;  // memory the library made for the buffer
     bool playing = false, looping = false, paused = false;
+#if TCNYC_DEV_TOOLS
+    uint64_t trace_play = 0;  // one-shot request awaiting its first mix block
+#endif
     bool sync = false;  // held until IDirectSound_SynchPlayback
     bool active = false, ending = false;  // stream: took a packet since it went quiet, quiet again once they run out
     bool released = false;  // stream Release is running callbacks; hidden from lookups until it frees
@@ -147,6 +160,13 @@ struct Voice {
     // stream
     uint32_t max_packets = 1, callback = 0, context = 0;
     std::deque<Packet> packets;
+    uint32_t empty_frames = 0;
+#if TCNYC_DEV_TOOLS
+    int64_t last_packet_completion_ms = 0, gap_submission_ms = 0;
+#endif
+    int64_t gap_callback_wait_ms = -1;
+    uint32_t last_packet_bytes = 0, last_packet_status_ptr = 0, last_packet_context = 0;
+    bool last_packet_event_found = false;
     // levels
     float volume = 1, headroom = 1;
     uint8_t nbins = 0, bin[8] = {};
@@ -168,6 +188,7 @@ struct Voice {
 
 struct Done {
     uint32_t voice, callback, context, packet_context, status;
+    int64_t queued_ms;
 };
 
 std::recursive_mutex g_lock;
@@ -179,6 +200,10 @@ std::deque<Done> g_done;
 std::condition_variable_any g_done_cv;
 thread_local std::vector<Done> t_flushed;  // run by the STREAM call that flushed them, once g_lock is let go
 std::atomic<int64_t> g_pumped{0};          // the last DirectSoundDoWork, steady ms
+int64_t NowMs();
+#if TCNYC_DEV_TOOLS
+bool TraceAudio();
+#endif
 bool g_started = false;
 uint32_t g_ds = 0;
 // IDirectSound_SetMixBinHeadroom: the voice processor halves a bin per step, 1 for every bin but the last by default
@@ -263,13 +288,25 @@ float Sample(Voice& v, uint32_t data, uint32_t f, int c) {
 }
 
 void Complete(Voice& v, Packet& pk, uint32_t status) {
+    if (status == 0) {
+        v.last_packet_bytes = pk.size;
+        v.last_packet_status_ptr = pk.status_ptr;
+        v.last_packet_context = pk.context;
+        v.last_packet_event_found = false;
+#if TCNYC_DEV_TOOLS
+        if (v.channels == 2 && v.packets.empty() && TraceAudio()) v.last_packet_completion_ms = NowMs();
+#endif
+    }
     if (pk.completed_ptr) W32(pk.completed_ptr, status == 0 ? pk.size : pk.used);
     if (pk.status_ptr) W32(pk.status_ptr, status);
     if (v.callback) {
-        g_done.push_back({v.obj, v.callback, v.context, pk.context, status});
+        g_done.push_back({v.obj, v.callback, v.context, pk.context, status, NowMs()});
         g_done_cv.notify_one();
     } else if (pk.context) {
-        if (ObjectRef e = FromHandle(pk.context)) SetEvent(*e);
+        if (ObjectRef e = FromHandle(pk.context)) {
+            SetEvent(*e);
+            if (status == 0) v.last_packet_event_found = true;
+        }
     }
 }
 
@@ -505,6 +542,12 @@ float EarAt(const Voice& v, float delay) {
 // a stream goes quiet: the synch hold ends, a started one loses its pause as well
 void Deactivate(Voice& v) {
     v.sync = false;
+    v.empty_frames = 0;
+    v.gap_callback_wait_ms = -1;
+#if TCNYC_DEV_TOOLS
+    v.gap_submission_ms = 0;
+    v.last_packet_completion_ms = 0;
+#endif
     if (v.active) v.active = v.paused = v.ending = false;
 }
 
@@ -569,9 +612,50 @@ std::optional<Cursor> BufferFrame(Voice& v) {
 }
 
 // adds the voice to the bins, frames of kBins interleaved, its levels ramped across the block
+#if TCNYC_DEV_TOOLS
+bool TraceAudio() {
+    static const bool enabled = [] {
+        const char* flag = std::getenv("TCNYC_TEST_AUDIO_TRACE");
+        return flag && std::strcmp(flag, "1") == 0;
+    }();
+    return enabled;
+}
+
+void EndTracedPlay(Voice& v, const char* reason) {
+    if (!v.trace_play) return;
+    LOGI("audio trace: one-shot %08X request %llu %s before first mix",
+         v.obj, static_cast<unsigned long long>(v.trace_play), reason);
+    v.trace_play = 0;
+}
+#endif
+
 void MixVoice(Voice& v, float* bins, uint32_t frames) {
     Place at = Locate(v);
     Gains target = Levels(v, at);
+    if (v.stream && !v.packets.empty() && v.empty_frames) {
+        uint32_t gap_threshold = audio::kRate / 10;
+#if TCNYC_DEV_TOOLS
+        if (v.channels == 2 && TraceAudio()) gap_threshold = audio::kRate / 50;
+#endif
+        if (v.empty_frames >= gap_threshold) {
+            LOG_FIRST(32, "dsound: stream %08X (%u channels, callback %08X, capacity %u) resumed after "
+                          "%.0f ms without packets, completion queue wait %lld ms; "
+                          "last packet %u bytes, status write %s, context %08X, event found %s",
+                      v.obj, v.channels, v.callback, v.max_packets, 1000.0 * v.empty_frames / audio::kRate,
+                      static_cast<long long>(v.gap_callback_wait_ms), v.last_packet_bytes,
+                      v.last_packet_status_ptr ? "yes" : "no", v.last_packet_context,
+                      v.last_packet_event_found ? "yes" : "no");
+#if TCNYC_DEV_TOOLS
+            if (v.channels == 2 && TraceAudio() && v.last_packet_completion_ms && v.gap_submission_ms)
+                game::ReportAudioRefill(v.obj, v.last_packet_completion_ms, v.gap_submission_ms);
+#endif
+        }
+        v.empty_frames = 0;
+        v.gap_callback_wait_ms = -1;
+#if TCNYC_DEV_TOOLS
+        v.gap_submission_ms = 0;
+#endif
+    }
     float itd = Itd(at.azimuth);
     if (!v.has_gain) {
         v.gain = target;
@@ -590,10 +674,17 @@ void MixVoice(Voice& v, float* bins, uint32_t frames) {
         if (lane.row < kMaxChannels) read |= 1u << lane.row;
     }
     double rate = double(v.freq ? v.freq : v.rate) / audio::kRate;
+#if TCNYC_DEV_TOOLS
+    float start_peak = 0.0f;
+#endif
     v.block[v.last ^ 1] = -1;  // the title may have rewritten that block's memory since the last mix
     for (uint32_t i = 0; i < frames; i++) {
         std::optional<Cursor> cursor = v.stream ? StreamFrame(v) : BufferFrame(v);
-        if (!cursor) break;
+        if (!cursor) {
+            if (v.stream && v.active)
+                v.empty_frames = std::min(60u * audio::kRate, v.empty_frames + frames - i);
+            break;
+        }
         float t = float(v.pos - cursor->f);
         float row[kRows] = {};
         for (uint32_t c = 0; c < channels; c++) {
@@ -610,10 +701,21 @@ void MixVoice(Voice& v, float* bins, uint32_t frames) {
         float* frame = bins + size_t(i) * kBins;
         for (Lane& lane : lanes) {
             lane.gain += lane.step;
-            frame[lane.bin] += row[lane.row] * lane.gain;
+            const float sample = row[lane.row] * lane.gain;
+            frame[lane.bin] += sample;
+#if TCNYC_DEV_TOOLS
+            if (v.trace_play) start_peak = std::max(start_peak, std::abs(sample));
+#endif
         }
         v.pos += rate;
     }
+#if TCNYC_DEV_TOOLS
+    if (v.trace_play) {
+        LOGI("audio trace: one-shot %08X mix, request %llu, volume %.4f distance gain %.4f first block lane peak %.4f",
+             v.obj, static_cast<unsigned long long>(v.trace_play), v.volume, at.att, start_peak);
+        v.trace_play = 0;
+    }
+#endif
     v.gain = target;
     v.itd = itd;
 }
@@ -639,6 +741,21 @@ int64_t NowMs() {
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
+// Called under g_lock by either callback pump. Measure queueing before running guest code.
+void TakeCallbacks(std::vector<Done>& done) {
+    done.assign(g_done.begin(), g_done.end());
+    g_done.clear();
+    if (done.empty()) return;
+    const int64_t now = NowMs();
+    for (const Done& d : done) {
+        auto it = g_voices.find(d.voice);
+        if (d.status == 0 && it != g_voices.end() && it->second.empty_frames) {
+            Voice& v = it->second;
+            v.gap_callback_wait_ms = std::max(v.gap_callback_wait_ms, now - d.queued_ms);
+        }
+    }
+}
+
 void Run(X86Context& ctx, const std::vector<Done>& done) {
     for (const Done& d : done) CallGuest(ctx, d.callback, {d.context, d.packet_context, d.status});
 }
@@ -656,8 +773,7 @@ void Start() {
                 std::unique_lock<std::recursive_mutex> lock(g_lock);
                 g_done_cv.wait_for(lock, std::chrono::milliseconds(50));
                 if (NowMs() - g_pumped < kPumpMs) continue;
-                done.assign(g_done.begin(), g_done.end());
-                g_done.clear();
+                TakeCallbacks(done);
             }
             Run(ctx, done);
         }
@@ -855,8 +971,7 @@ HLE_STDCALL(DirectSoundDoWork, 0) {
     std::vector<Done> done;
     {
         std::lock_guard<std::recursive_mutex> lock(g_lock);
-        done.assign(g_done.begin(), g_done.end());
-        g_done.clear();
+        TakeCallbacks(done);
     }
     Run(ctx, done);
     return 0;
@@ -864,7 +979,14 @@ HLE_STDCALL(DirectSoundDoWork, 0) {
 // starts together every voice played or unpaused with the synch playback flag
 HLE_STDCALL(IDirectSound_SynchPlayback, 1) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
-    for (auto& [obj, v] : g_voices) v.sync = false;
+    for (auto& [obj, v] : g_voices) {
+#if TCNYC_DEV_TOOLS
+        if (v.sync && v.trace_play)
+            LOGI("audio trace: one-shot %08X request %llu released by SynchPlayback, paused %d",
+                 obj, static_cast<unsigned long long>(v.trace_play), v.paused);
+#endif
+        v.sync = false;
+    }
     return 0;
 }
 
@@ -958,6 +1080,9 @@ HLE_STDCALL(IDirectSound_CreateSoundBuffer, 4) { return NewBuffer(a[1], a[2]); }
 
 BUFFER(Release, 1) {
     if (--v.refs > 0) return uint32_t(v.refs);
+#if TCNYC_DEV_TOOLS
+    EndTracedPlay(v, "released");
+#endif
     if (v.owned) mem::FreeContiguous(v.owned);
     uint32_t obj = v.obj;
     g_voices.erase(obj);
@@ -967,6 +1092,11 @@ BUFFER(Release, 1) {
 BUFFER(Unlock, 5) { return 0; }
 BUFFER(SetBufferData, 3) {
     if (a[1] == v.data && a[2] == v.bytes) return 0;
+#if TCNYC_DEV_TOOLS
+    if (v.trace_play)
+        LOGI("audio trace: one-shot %08X request %llu data replaced before mix: %08X -> %08X",
+             v.obj, static_cast<unsigned long long>(v.trace_play), v.data, a[1]);
+#endif
     // the library frees its own memory, and makes it again for a size with no data
     if (v.owned && v.owned != a[1]) {
         mem::FreeContiguous(v.owned);
@@ -986,21 +1116,52 @@ BUFFER(Play, 4) {
     v.looping = a[3] & 1;
     if (a[3] & 2) v.pos = 0;
     v.sync = a[3] & 4;
+#if TCNYC_DEV_TOOLS
+    EndTracedPlay(v, "superseded by Play");
+    if (TraceAudio() && v.is3d && !v.looping) {
+        static uint64_t next_request = 0;  // the DirectSound lock serializes Play
+        v.trace_play = ++next_request;
+        LOGI("audio trace: one-shot %08X play, request %llu, data %08X length %u paused %d sync %d",
+             v.obj, static_cast<unsigned long long>(v.trace_play), v.data, v.play_len, v.paused, v.sync);
+    }
+#endif
     return 0;
 }
-BUFFER(Stop, 1) {
+
+// The Xbox buffer's immediate stop clears both the pause and synchronized
+// start bits. The title pools buffers and replays them for later effects.
+void StopBuffer(Voice& v) {
     v.playing = false;
+    v.paused = false;
+    v.sync = false;
+}
+
+BUFFER(Stop, 1) {
+#if TCNYC_DEV_TOOLS
+    EndTracedPlay(v, "stopped");
+#endif
+    StopBuffer(v);
     return 0;
 }
 // (this, time low, time high, flags): stops now, the release envelope is not reproduced
 BUFFER(StopEx, 4) {
-    v.playing = false;
+#if TCNYC_DEV_TOOLS
+    EndTracedPlay(v, "stopped by StopEx");
+#endif
+    StopBuffer(v);
     return 0;
 }
 // (this, flags): 0 resumes, 1 pauses, 2 holds until IDirectSound_SynchPlayback
 BUFFER(Pause, 2) {
+    // The Xbox pause routine only changes an active voice's playback state.
+    if (!v.playing) return 0;
     v.paused = a[1] == 1;
     v.sync = a[1] == 2;
+#if TCNYC_DEV_TOOLS
+    if (v.trace_play)
+        LOGI("audio trace: one-shot %08X request %llu Pause flags %u, paused %d sync %d",
+             v.obj, static_cast<unsigned long long>(v.trace_play), a[1], v.paused, v.sync);
+#endif
     return 0;
 }
 // envelopes are not played
@@ -1008,6 +1169,11 @@ BUFFER(SetEG, 2) { return 0; }
 // (this, start, length) in bytes, 0 length plays to the end. The loop becomes the whole region.
 BUFFER(SetPlayRegion, 3) {
     if (a[1] > v.bytes || a[2] > v.bytes - a[1]) return 0x88780032u;  // DSERR_INVALIDCALL
+#if TCNYC_DEV_TOOLS
+    if (v.trace_play)
+        LOGI("audio trace: one-shot %08X request %llu play region changed before mix: %u + %u",
+             v.obj, static_cast<unsigned long long>(v.trace_play), a[1], a[2]);
+#endif
     v.play_start = a[1];
     v.play_len = v.loop_len = a[2] ? a[2] : v.bytes - a[1];
     v.loop_start = 0;
@@ -1217,6 +1383,9 @@ STREAM(Process, 3) {
     Packet pk{R32(in), R32(in + 4), R32(in + 8), R32(in + 12), R32(in + 16)};
     if (pk.completed_ptr) W32(pk.completed_ptr, 0);
     if (pk.status_ptr) W32(pk.status_ptr, kPacketPending);
+#if TCNYC_DEV_TOOLS
+    if (v.channels == 2 && v.empty_frames && v.packets.empty() && TraceAudio()) v.gap_submission_ms = NowMs();
+#endif
     v.packets.push_back(pk);
     if (!v.active) v.has_gain = false;  // after going quiet a stream starts its levels fresh
     v.active = true;
@@ -1255,6 +1424,16 @@ STREAM(SetFilter, 2) { return 0; }
 HLE_STDCALL(IDirectSoundStream_SetEG, 2) { return 0; }
 STREAM(SetHeadroom, 2) {
     v.headroom = Db(-int32_t(a[1]));
+    return 0;
+}
+// The PAL image reaches SetHeadroom through a jmp stub the game calls directly;
+// naming the stub makes that call bind to the host too, instead of running the
+// recompiled stub's local weak body.
+HLE_STDCALL(CDirectSoundStream_SetHeadroomStub, 2) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    Voice* v = Find(a[0]);
+    if (!v) return 0x80004005u;
+    v->headroom = Db(-int32_t(a[1]));
     return 0;
 }
 STREAM(SetMixBinVolumes, 2) {

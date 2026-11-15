@@ -1,5 +1,5 @@
-// Cutscene sample clock, 60 FPS main-loop timing and opt-in deterministic replay
-// for default.xbe.
+#include "game_addresses.h"
+// 60 FPS main-loop timing and opt-in deterministic replay for default.xbe.
 //
 // 0x2914D2: DirectSoundGetSampleTime reads the APU's free-running 48 kHz
 // counter at FE80200C after checking the original DirectSound singleton. HLE
@@ -16,9 +16,13 @@
 // call order to <file>.timing ("v <vblank step>", "s <sample step>"); with
 // XBE_PAD_REPLAY=<file> the main loop gets those steps back in the same order
 // (real time again once the file runs out).
+// PAL has a different loop driven by the performance counter. Its timing
+// recordings store simulation ticks ("t") at the shared simulation hook.
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -32,28 +36,32 @@
 #include "kernel/kernel.h"
 #include "xdk/hle.h"
 #if TCNYC_DEV_TOOLS
+#include "core/input.h"
 #include "dev/dev.h"
+#include "kernel/memory.h"
 #endif
 
 namespace {
 // guest data
-constexpr uint32_t kRandomState = 0x3376C8; // 8 bytes
-constexpr uint32_t kSimTicks = 0x363D0C;
-constexpr uint32_t kLastVblank = 0x363D38;
-constexpr uint32_t kVblank = 0x420468;
-constexpr uint32_t kAudioClockMode = 0x360E0C;
-constexpr uint32_t kPreviousAudioClockMode = 0x360DE0;
-constexpr uint32_t kCutsceneClockStart = 0x360DD0;
-constexpr uint32_t kCutsceneState = 0x348E10;
+constexpr uint32_t kRandomState = TC_ADDR(0x3376C8); // 8 bytes
+constexpr uint32_t kSimTicks = TC_ADDR(0x363D0C);
+constexpr uint32_t kLastVblank = TC_ADDR(0x363D38);
+constexpr uint32_t kVblank = TC_ADDR(0x420468);
+constexpr uint32_t kAudioClockMode = TC_ADDR(0x360E0C);
+#if !TCNYC_PAL
+constexpr uint32_t kPreviousAudioClockMode = TC_ADDR(0x360DE0);
+constexpr uint32_t kCutsceneClockStart = TC_ADDR(0x360DD0);
+constexpr uint32_t kCutsceneState = TC_ADDR(0x348E10);
 constexpr uint32_t kTicksPerSample = 0x2D5DC8; // float, -60 / 48000
 
 // return addresses of the main loop's calls
 constexpr uint32_t kMainLoopSampleTime = 0xA786F;
 constexpr uint32_t kMainLoopVblank = 0xA78BD;
-constexpr uint32_t kMainLoopSimulate = 0xA7910;
-constexpr uint32_t kMainLoopRender = 0xA794B;
-constexpr uint32_t kMainLoopPresent = 0xA7952;
-constexpr uint32_t kSimulateVblank = 0xA5221; // the simulation's own vblank read
+#endif
+constexpr uint32_t kMainLoopSimulate = TC_ADDR(0xA7910);
+constexpr uint32_t kMainLoopRender = TC_ADDR(0xA794B);
+constexpr uint32_t kMainLoopPresent = TC_ADDR(0xA7952);
+constexpr uint32_t kSimulateVblank = TC_ADDR(0xA5221); // the simulation's own vblank read
 
 // The main loop's fast path only matches the game's own 60 Hz cadence. The
 // stored cap can be 0 (unlimited), 1 (monitor refresh) or above 60; the
@@ -85,12 +93,12 @@ void Load() {
             unsigned v;
             while (std::fscanf(f, " %c %u", &k, &v) == 2) {
                 g_in.push_back({k, v});
-                if (k == 'v' || k == 's' || k == 'r')
+                if (k == (TCNYC_PAL ? 't' : 'v') || k == 's' || k == 'r')
                     g_index[k == 's' ? 1 : k == 'r' ? 2 : 0].push_back(g_in.size() - 1);
             }
             std::fclose(f);
-            LOGR("tcnyc: replay timing %zu vblank steps, %zu sample steps, %zu seeds", g_index[0].size(),
-                 g_index[1].size(), g_index[2].size());
+            LOGR("tcnyc: replay timing %zu %s steps, %zu sample steps, %zu seeds", g_index[0].size(),
+                 TCNYC_PAL ? "frame" : "vblank", g_index[1].size(), g_index[2].size());
         }
     }
 }
@@ -135,12 +143,12 @@ X86_FUNC(sub_00229D50) {
     // repeat by themselves and run thousands of times a frame, so only the other
     // (timer-based) seeds are kept
     switch (ret) {
-    case 0x16E2A:
-    case 0x173D5:
-    case 0x240D22:
-    case 0x240E62:
-    case 0x240F74:
-    case 0x240F8E:
+    case TC_ADDR(0x16E2A):
+    case TC_ADDR(0x173D5):
+    case TC_ADDR(0x240D22):
+    case TC_ADDR(0x240E62):
+    case TC_ADDR(0x240F74):
+    case TC_ADDR(0x240F8E):
         return __imp__sub_00229D50(ctx, base);
     }
     timing::Load();
@@ -162,6 +170,92 @@ thread_local bool use_sampled_vblank = false;
 thread_local uint32_t sampled_vblank = 0;
 thread_local uint32_t frame_ticks = 0;
 thread_local bool fast_present = false;
+thread_local uint32_t guest_renders = 0;
+thread_local uint32_t guest_swaps = 0;
+
+#if TCNYC_DEV_TOOLS
+constexpr uint32_t kGameSession = TC_ADDR(0x360E00);
+constexpr uint32_t kSessionMenuActive = 0x2A54; // also checked by the guest render path
+constexpr uint32_t kExperimentalRenderCap = 120;
+constexpr uint32_t kRenderBeginFromMainRender = TC_ADDR(0xA75DD);
+constexpr uint32_t kGuestRenderQueueDepth = TC_ADDR(0x4C632C);
+constexpr uint32_t kVehicleStepCall = TC_ADDR(0x1CF101);
+constexpr uint32_t kWorldStep = TC_ADDR(0x37F630);
+thread_local uint32_t split_motion_vehicle = 0;
+thread_local uint32_t motion_calls = 0;
+std::atomic<bool> request_drive_test{false};
+thread_local uint32_t drive_test_vehicle = 0, drive_test_tick = 0;
+thread_local bool drive_test_simulating = false;
+constexpr uint32_t kThrottleTicks = 240, kBrakeTicks = 240;
+thread_local bool double_render = false;
+thread_local bool native_gameplay = false;
+using NativeClock = std::chrono::steady_clock;
+thread_local NativeClock::time_point native_last_swap;
+thread_local double native_sim_ms = 0, native_render_ms = 0;
+thread_local X86Context render_entry;
+
+uint32_t NativeGameplayCap() {
+    static const uint32_t cap = []() -> uint32_t {
+        if (std::getenv("XBE_PAD_RECORD") || std::getenv("XBE_PAD_REPLAY")) return 0;
+        if (const char *option = std::getenv("XBE_NATIVE_FPS")) {
+            char *end = nullptr;
+            const long value = std::strtol(option, &end, 10);
+            return end != option && !*end && value >= 61 && value <= 120 ? uint32_t(value) : 0;
+        }
+        const char *legacy = std::getenv("XBE_NATIVE_90FPS");
+        return legacy && std::strcmp(legacy, "1") == 0 ? 90 : 0;
+    }();
+    return cap;
+}
+
+bool NativeGameplayEnabled(uint8_t *base) {
+    return NativeGameplayCap() && dev::GameSpeed() == 4 && dev::InGameplay() && !kernel::MovieOpen() &&
+           !X86_MEM8(X86_MEM32(kGameSession) + kSessionMenuActive);
+}
+
+int VehicleStepProbe() {
+    static const int mode = [] {
+        const char *option = std::getenv("XBE_VEHICLE_STEP_PROBE");
+        if (!option || std::getenv("XBE_PAD_RECORD") || std::getenv("XBE_PAD_REPLAY")) return 0;
+        if (std::strcmp(option, "full") == 0) return 1;
+        if (std::strcmp(option, "split") == 0) return 2;
+        if (std::strcmp(option, "motion") == 0) return 3;
+        if (std::strcmp(option, "drive-full") == 0) return 4;
+        if (std::strcmp(option, "drive-motion") == 0) return 5;
+        if (std::strcmp(option, "straight-full") == 0) return 6;
+        if (std::strcmp(option, "straight-motion") == 0) return 7;
+        return 0;
+    }();
+    return mode;
+}
+
+bool PlayerDrivesVehicle(uint8_t *base, uint32_t vehicle) {
+    if (!dev::InGameplay()) return false;
+    const uint32_t session = X86_MEM32(kGameSession);
+    const uint32_t camera = X86_MEM32(session + 0xAC);
+    if (X86_MEM8(session + kSessionMenuActive) || X86_MEM8(camera + 0x19) != 13) return false;
+    // The script's GetMyVehicle follows the pawn's parent chain at +0x28.
+    uint32_t object = X86_MEM32(TC_ADDR(0x37D284));
+    for (unsigned depth = 0; depth < 8 && object && mem::IsCommitted(object + 0x2B); ++depth) {
+        if (object == vehicle) return true;
+        object = X86_MEM32(object + 0x28);
+    }
+    return X86_MEM32(camera + 0x17C) == vehicle;
+}
+
+bool ShouldDoubleRender(uint8_t *base) {
+    static const bool enabled = [] {
+        const char *option = std::getenv("XBE_EXPERIMENTAL_120FPS");
+        // Pad recordings use the guest swap count as their input clock.
+        return option && std::strcmp(option, "1") == 0 && !std::getenv("XBE_PAD_RECORD") &&
+               !std::getenv("XBE_PAD_REPLAY");
+    }();
+    if (!enabled || native_gameplay || VehicleStepProbe() || !fast_gameplay || frame_ticks != 1 || dev::GameSpeed() != 4 ||
+        game::choices::EffectiveFrameCap(app::FrameCap()) != 60 || !dev::InGameplay() || kernel::MovieOpen())
+        return false;
+    return !X86_MEM8(X86_MEM32(kGameSession) + kSessionMenuActive);
+}
+#endif
 
 void TraceFrame(uint32_t ticks, bool audio_clock, uint32_t steps) {
     static const bool enabled = std::getenv("XBE_TRACE_FRAME_TIMING") != nullptr;
@@ -176,17 +270,18 @@ void TraceFrame(uint32_t ticks, bool audio_clock, uint32_t steps) {
             LOGR("tcnyc: %s", audio_clock ? "entered audio-clock cutscene" : "left audio-clock cutscene");
         start = now;
         start_ticks = ticks;
-        frames = 0;
+        frames = guest_renders = guest_swaps = 0;
         zero_tick_frames = 0;
         previous_audio_clock = audio_clock;
     }
     const double seconds = std::chrono::duration<double>(now - start).count();
     if (seconds >= 2) {
-        LOGR("tcnyc: %s %.1f frames/s, %.1f ticks/s, %u zero-tick frames", audio_clock ? "cutscene" : "gameplay",
-             frames / seconds, (ticks - start_ticks) / seconds, zero_tick_frames);
+        LOGR("tcnyc: %s %.1f updates/s, %.1f ticks/s, %.1f renders/s, %.1f swaps/s, %u zero-tick updates",
+             audio_clock ? "cutscene" : "gameplay", frames / seconds, (ticks - start_ticks) / seconds,
+             guest_renders / seconds, guest_swaps / seconds, zero_tick_frames);
         start = now;
         start_ticks = ticks;
-        frames = 0;
+        frames = guest_renders = guest_swaps = 0;
         zero_tick_frames = 0;
     }
     ++frames;
@@ -196,14 +291,175 @@ void TraceFrame(uint32_t ticks, bool audio_clock, uint32_t steps) {
 
 namespace game {
 uint32_t MainLoopSwapInterval(uint32_t interval) { return fast_present && interval == 2 ? 1 : interval; }
+#if TCNYC_DEV_TOOLS
+uint32_t MainLoopSwapCapOverride() {
+    if (!fast_present) return 0;
+    if (native_gameplay) return NativeGameplayCap();
+    return double_render ? kExperimentalRenderCap : 0;
+}
+bool RequestStraightDrive() {
+    if (VehicleStepProbe() < 6) return false;
+    request_drive_test = true;
+    return true;
+}
+
+void ApplyStraightDrivePad(int port, input::Pad &pad) {
+    if (port != 0 || !drive_test_simulating || !drive_test_vehicle) return;
+    const uint32_t elapsed = kernel::R32(kSimTicks) - drive_test_tick;
+    if (elapsed >= kThrottleTicks + kBrakeTicks) return;
+    pad = {};
+    pad.connected = true;
+    // The title uses A for throttle and X for brake/reverse.
+    if (elapsed < kThrottleTicks) pad.analog[0] = 255;
+    else pad.analog[2] = 255;
+}
+#endif
 } // namespace game
 
+#if TCNYC_DEV_TOOLS
+X86_EXTERN_FUNC(__imp__sub_002219E0);
+X86_FUNC(sub_002219E0) {
+    const uint32_t caller = X86_MEM32(ctx.esp);
+    if (!split_motion_vehicle || ctx.ecx != split_motion_vehicle || (caller != TC_ADDR(0x1CCC46) && caller != TC_ADDR(0x1CCC72)))
+        return __imp__sub_002219E0(ctx, base);
+
+    const X86Context entry = ctx;
+    const uint32_t force = X86_MEM32(ctx.esp + 4);
+    const uint32_t torque = X86_MEM32(ctx.esp + 8);
+    const uint32_t step_arg = ctx.esp + 12;
+    const float step = X86_MEMF32(step_arg);
+    X86_MEMF32(step_arg) = step * 0.5f;
+    __imp__sub_002219E0(ctx, base);
+    ctx = entry;
+    X86_MEM32(ctx.esp) = caller;
+    X86_MEM32(ctx.esp + 4) = force;
+    X86_MEM32(ctx.esp + 8) = torque;
+    X86_MEMF32(step_arg) = step * 0.5f;
+    __imp__sub_002219E0(ctx, base);
+    X86_MEMF32(step_arg) = step;
+    ++motion_calls;
+}
+
+X86_EXTERN_FUNC(__imp__sub_001CA180);
+X86_FUNC(sub_001CA180) {
+    const int mode = VehicleStepProbe();
+    if (!mode || X86_MEM32(ctx.esp) != kVehicleStepCall || !fast_gameplay || dev::GameSpeed() != 4)
+        return __imp__sub_001CA180(ctx, base);
+
+    const uint32_t vehicle = ctx.ecx;
+    const float step = X86_MEMF32(kWorldStep);
+    const auto speed = [&] {
+        return std::hypot(X86_MEMF32(vehicle + 0x80), X86_MEMF32(vehicle + 0x88));
+    };
+    static thread_local uint32_t tracked = 0, samples = 0;
+    static thread_local std::chrono::steady_clock::time_point drive_start;
+    static thread_local bool drive_complete = false;
+    const bool straight = mode >= 6;
+    const bool driving = mode >= 4;
+    if (straight && !drive_test_vehicle && request_drive_test.load() && PlayerDrivesVehicle(base, vehicle)) {
+        request_drive_test = false;
+        if (speed() <= 0.005f) {
+            drive_test_vehicle = vehicle;
+            drive_test_tick = X86_MEM32(kSimTicks) + 1;
+            LOGR("straight drive: armed vehicle %08X model=%d", vehicle, int(X86_MEM16(vehicle + 0x448)));
+        } else {
+            LOGR("straight drive: stop the vehicle before pressing F7");
+        }
+    }
+    if (straight) {
+        if (!drive_test_vehicle || vehicle != drive_test_vehicle || !PlayerDrivesVehicle(base, vehicle))
+            return __imp__sub_001CA180(ctx, base);
+        const uint32_t elapsed = X86_MEM32(kSimTicks) - drive_test_tick;
+        if (elapsed >= kThrottleTicks + kBrakeTicks)
+            return __imp__sub_001CA180(ctx, base);
+    }
+    if (driving && tracked && !drive_complete && std::chrono::steady_clock::now() - drive_start >= std::chrono::minutes(1)) {
+        drive_complete = true;
+        LOGR("vehicle drive: complete, %u samples", samples);
+    }
+    if (!straight && ((driving ? drive_complete || !PlayerDrivesVehicle(base, vehicle) : samples >= 60) ||
+        (tracked && vehicle != tracked) || step < 0.99f || step > 1.01f || X86_MEM32(vehicle + 0x28) ||
+        (!tracked && speed() < 0.05f) || (!driving && speed() < 0.05f)))
+        return __imp__sub_001CA180(ctx, base);
+
+    if (driving && !straight && !tracked) {
+        drive_start = std::chrono::steady_clock::now();
+        LOGR("vehicle drive: started %s capture for vehicle %08X", mode == 5 ? "motion" : "baseline", vehicle);
+    }
+    tracked = vehicle;
+    const float x = X86_MEMF32(vehicle + 0x70);
+    const float z = X86_MEMF32(vehicle + 0x78);
+    const float before = speed();
+    if (mode == 2) {
+        const X86Context entry = ctx;
+        X86_MEMF32(kWorldStep) = step * 0.5f;
+        __imp__sub_001CA180(ctx, base);
+        ctx = entry;
+        X86_MEM32(ctx.esp) = kVehicleStepCall;
+    }
+    motion_calls = 0;
+    if (mode == 3 || mode == 5 || mode == 7) split_motion_vehicle = vehicle;
+    __imp__sub_001CA180(ctx, base);
+    split_motion_vehicle = 0;
+    X86_MEMF32(kWorldStep) = step;
+    const char *label = mode == 3 || mode == 5 || mode == 7 ? "motion" : mode == 2 ? "split" : "full";
+    LOGR("vehicle step: %s sample=%u tick=%u id=%08X model=%d dx=%.6f dz=%.6f speed=%.6f->%.6f flags=%08X motion=%u",
+         label, ++samples, X86_MEM32(kSimTicks), vehicle, int(X86_MEM16(vehicle + 0x448)),
+         X86_MEMF32(vehicle + 0x70) - x, X86_MEMF32(vehicle + 0x78) - z, before, speed(), X86_MEM32(vehicle + 0x14),
+         motion_calls);
+    if (straight && X86_MEM32(kSimTicks) - drive_test_tick == kThrottleTicks + kBrakeTicks - 1)
+        LOGR("straight drive: complete, %u samples", samples);
+}
+#endif
+
+namespace {
+void PrepareGameplayTiming(uint8_t *base) {
+    fast_gameplay = !X86_MEM8(kAudioClockMode) && AtGameFrameRate() && !timing::Enabled();
+#if TCNYC_DEV_TOOLS
+    const bool native = fast_gameplay && !VehicleStepProbe() && NativeGameplayEnabled(base);
+    if (native != native_gameplay)
+        LOGR("tcnyc: native %u FPS gameplay %s", NativeGameplayCap(), native ? "active" : "inactive");
+    native_gameplay = native;
+#endif
+    if (!fast_gameplay) return;
+    const uint32_t last = X86_MEM32(kLastVblank);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
+    sampled_vblank = X86_MEM32(kVblank);
+    // A frame can arrive before the next guest vblank on a fast host.
+    while (sampled_vblank == last && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        sampled_vblank = X86_MEM32(kVblank);
+    }
+}
+} // namespace
+
 // The main loop's simulation step uses elapsed vblanks in 60 FPS gameplay.
-// Cutscenes keep the title's audio-clock step.
+// Cutscenes keep the clock calculation in their region's guest loop.
 X86_EXTERN_FUNC(__imp__sub_000A5200);
 X86_FUNC(sub_000A5200) {
     if (X86_MEM32(ctx.esp) != kMainLoopSimulate) return __imp__sub_000A5200(ctx, base);
+#if TCNYC_PAL
+    // PAL gameplay computes its step inline from the performance counter,
+    // with no per-frame call to the vblank reader before simulation.
+    PrepareGameplayTiming(base);
+    fast_cutscene = X86_MEM8(kAudioClockMode) && AtGameFrameRate() && !timing::Enabled();
+#endif
 #if TCNYC_DEV_TOOLS
+    static const bool trace_audio = [] {
+        const char* flag = std::getenv("TCNYC_TEST_AUDIO_TRACE");
+        return flag && std::strcmp(flag, "1") == 0;
+    }();
+    const auto native_start = native_gameplay || trace_audio ? NativeClock::now() : NativeClock::time_point{};
+    if (trace_audio) {
+        thread_local NativeClock::time_point last_update;
+        if (last_update != NativeClock::time_point{}) {
+            const double ms = std::chrono::duration<double, std::milli>(native_start - last_update).count();
+            if (ms >= 35.0)
+                LOGI("audio trace: game update interval %.1f ms, thread %zx", ms,
+                     std::hash<std::thread::id>{}(std::this_thread::get_id()));
+        }
+        last_update = native_start;
+    }
     dev::OnFrame(ctx);
 #endif
     const uint32_t arg = ctx.esp + 4;
@@ -215,40 +471,124 @@ X86_FUNC(sub_000A5200) {
         frame_ticks = std::clamp(elapsed, 1u, 4u);
         use_sampled_vblank = elapsed != 0;
     }
+#if TCNYC_PAL
+    if (timing::Enabled()) {
+        timing::Load();
+        const int64_t recorded = timing::Next(0);
+        if (recorded >= 0) frame_ticks = uint32_t(recorded);
+        timing::Write('t', frame_ticks);
+        timing::Write('c', X86_MEM32(kRandomState) ^ (X86_MEM32(kSimTicks) * 2654435761u));
+    }
+#endif
 #if TCNYC_DEV_TOOLS
     frame_ticks = dev::AdjustTicks(frame_ticks); // debug menu: pause, slow motion, fast forward
 #endif
     TraceFrame(X86_MEM32(kSimTicks), X86_MEM8(kAudioClockMode) != 0, frame_ticks);
     X86_MEM32(arg) = frame_ticks;
+#if TCNYC_DEV_TOOLS
+    drive_test_simulating = drive_test_vehicle && fast_gameplay && PlayerDrivesVehicle(base, drive_test_vehicle);
+#endif
     __imp__sub_000A5200(ctx, base);
+#if TCNYC_DEV_TOOLS
+    drive_test_simulating = false;
+    if (native_gameplay || trace_audio) {
+        const double ms = std::chrono::duration<double, std::milli>(NativeClock::now() - native_start).count();
+        if (native_gameplay) native_sim_ms = ms;
+        if (trace_audio && ms >= 25.0)
+            LOGI("audio trace: game update took %.1f ms, thread %zx", ms,
+                 std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    }
+#endif
     use_sampled_vblank = false;
     X86_MEM32(arg) = original_ticks;
 }
 
+#if TCNYC_DEV_TOOLS
+X86_EXTERN_FUNC(__imp__sub_00242F20);
+X86_FUNC(sub_00242F20) {
+    // Render begin waits when this Xbox queue exceeds one entry. The HLE
+    // renderer already paces and synchronizes its own queue at Swap.
+    if (native_gameplay && X86_MEM32(ctx.esp) == kRenderBeginFromMainRender)
+        X86_MEM32(kGuestRenderQueueDepth) = 0;
+    __imp__sub_00242F20(ctx, base);
+}
+#endif
+
 // The main loop's render step gets the same tick count as the simulation.
 X86_EXTERN_FUNC(__imp__sub_000A73F0);
 X86_FUNC(sub_000A73F0) {
+    if (X86_MEM32(ctx.esp) != kMainLoopRender) return __imp__sub_000A73F0(ctx, base);
+    ++guest_renders;
 #if TCNYC_DEV_TOOLS
+    const auto native_start = native_gameplay ? NativeClock::now() : NativeClock::time_point{};
     const bool dev_speed = dev::GameSpeed() != 4;
+    double_render = ShouldDoubleRender(base);
+    if (double_render) render_entry = ctx;
 #else
     constexpr bool dev_speed = false;
 #endif
-    if (X86_MEM32(ctx.esp) != kMainLoopRender || (!fast_gameplay && !fast_cutscene && !dev_speed))
+    if (!fast_gameplay && !fast_cutscene && !dev_speed && !(TCNYC_PAL && timing::Enabled()))
         return __imp__sub_000A73F0(ctx, base);
     const uint32_t arg = ctx.esp + 4;
     const uint32_t original_ticks = X86_MEM32(arg);
     X86_MEM32(arg) = frame_ticks;
     __imp__sub_000A73F0(ctx, base);
+#if TCNYC_DEV_TOOLS
+    if (native_gameplay) native_render_ms = std::chrono::duration<double, std::milli>(NativeClock::now() - native_start).count();
+#endif
     X86_MEM32(arg) = original_ticks;
 }
 
 // The main loop presents after its render function returns.
 X86_EXTERN_FUNC(__imp__sub_00242F30);
 X86_FUNC(sub_00242F30) {
-    if (X86_MEM32(ctx.esp) != kMainLoopPresent || (!fast_gameplay && !fast_cutscene))
+    if (X86_MEM32(ctx.esp) != kMainLoopPresent) return __imp__sub_00242F30(ctx, base);
+    ++guest_swaps;
+    if (!fast_gameplay && !fast_cutscene)
         return __imp__sub_00242F30(ctx, base);
     fast_present = true;
+#if TCNYC_DEV_TOOLS
+    if (double_render) {
+        const uint32_t swap_flags = X86_MEM32(ctx.esp + 4);
+        __imp__sub_00242F30(ctx, base);
+        const X86Context after_swap = ctx;
+
+        // The swap argument overwrites the render return slot. The render
+        // arguments and matrix are still in the caller frame.
+        ctx = render_entry;
+        X86_MEM32(ctx.esp) = kMainLoopRender;
+        ++guest_renders;
+        __imp__sub_000A73F0(ctx, base);
+        ctx.esp -= 4;
+        X86_MEM32(ctx.esp) = swap_flags;
+        ctx.esp -= 4;
+        X86_MEM32(ctx.esp) = kMainLoopPresent;
+        ++guest_swaps;
+        __imp__sub_00242F30(ctx, base);
+        ctx = after_swap;
+        double_render = false;
+        fast_present = false;
+        return;
+    }
+#endif
+#if TCNYC_DEV_TOOLS
+    const auto native_start = native_gameplay ? NativeClock::now() : NativeClock::time_point{};
+#endif
     __imp__sub_00242F30(ctx, base);
+#if TCNYC_DEV_TOOLS
+    if (native_gameplay) {
+        const auto end = NativeClock::now();
+        static thread_local unsigned frames = 0;
+        if (native_last_swap != NativeClock::time_point{} && ++frames % 60 == 0) {
+            const auto ms = [](auto duration) { return std::chrono::duration<double, std::milli>(duration).count(); };
+            LOGR("native pacing: frame %.3f ms, sim %.3f, render %.3f, swap %.3f",
+                 ms(end - native_last_swap), native_sim_ms, native_render_ms, ms(end - native_start));
+        }
+        native_last_swap = end;
+    } else {
+        native_last_swap = {};
+    }
+#endif
     fast_present = false;
 }
 
@@ -261,17 +601,10 @@ X86_FUNC(sub_00243000) {
         ::kernel::Return(ctx, sampled_vblank, 0);
         return;
     }
+#if !TCNYC_PAL
     if (ret == kMainLoopVblank) {
-        fast_gameplay = !X86_MEM8(kAudioClockMode) && AtGameFrameRate() && !timing::Enabled();
+        PrepareGameplayTiming(base);
         if (fast_gameplay) {
-            const uint32_t last = X86_MEM32(kLastVblank);
-            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
-            sampled_vblank = X86_MEM32(kVblank);
-            // A frame can arrive before the next guest vblank on a fast host.
-            while (sampled_vblank == last && std::chrono::steady_clock::now() < deadline) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                sampled_vblank = X86_MEM32(kVblank);
-            }
             ::kernel::Return(ctx, sampled_vblank, 0);
             return;
         }
@@ -295,8 +628,13 @@ X86_FUNC(sub_00243000) {
     std::memcpy(&ticks, base + kSimTicks, 4);
     timing::Write('c', rng ^ (ticks * 2654435761u));
     ::kernel::Return(ctx, value, 0);
+#else
+    __imp__sub_00243000(ctx, base);
+#endif
 }
 
+#if !defined(TCNYC_PAL) || !TCNYC_PAL
+// US cutscenes use the DirectSound sample counter. PAL uses QPC instead.
 X86_FUNC(sub_002914D2) {
     using clock = std::chrono::steady_clock;
     static const auto start = clock::now();
@@ -310,6 +648,9 @@ X86_FUNC(sub_002914D2) {
     std::memcpy(&ret, base + ctx.esp, 4);
     if (ret == kMainLoopSampleTime) {
         fast_gameplay = false;
+#if TCNYC_DEV_TOOLS
+        if (X86_MEM8(kAudioClockMode)) native_gameplay = false;
+#endif
         fast_cutscene = X86_MEM8(kAudioClockMode) && AtGameFrameRate() && !timing::Enabled();
         // The title's render passes expect the simulation to update before each
         // picture. Wait for the audio clock when we are early instead of
@@ -348,3 +689,4 @@ X86_FUNC(sub_002914D2) {
     }
     ::kernel::Return(ctx, value, 0);
 }
+#endif

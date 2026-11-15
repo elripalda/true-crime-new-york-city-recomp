@@ -1,3 +1,4 @@
+#include "game_addresses.h"
 // Night shadows that pop in and out.
 //
 // Each frame 0x143650 takes the scene's shadow light: a vector at 0x37F8D0 (a direction with w 0 for the moon,
@@ -24,7 +25,7 @@
 
 namespace {
 
-constexpr uint32_t kLight = 0x37F8D0, kColour = 0x37F8BC, kStrength = 0x37F8F0;
+constexpr uint32_t kLight = TC_ADDR(0x37F8D0), kColour = TC_ADDR(0x37F8BC), kStrength = TC_ADDR(0x37F8F0);
 constexpr int kSettle = 30;     // frames (0.5 s at 60 fps)
 constexpr int kHoldNone = 300;  // frames (5 s at 60 fps)
 
@@ -227,7 +228,7 @@ X86_FUNC(sub_00143650) {
 
 X86_EXTERN_FUNC(__imp__sub_0025F100);
 X86_FUNC(sub_0025F100) {
-    const bool ours = X86_MEM32(ctx.esp) == 0x14396F;
+    const bool ours = X86_MEM32(ctx.esp) == TC_ADDR(0x14396F);
     __imp__sub_0025F100(ctx, base);
     if (ours) g_fit = ctx.eax & 0xFF;
 }

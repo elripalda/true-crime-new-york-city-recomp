@@ -43,6 +43,22 @@ struct GridSite {
     uint32_t occurrences;
 };
 
+#if defined(TCNYC_PAL) && TCNYC_PAL
+inline constexpr GridSite kGridSites[] = {
+    {0x0013945D, "ecx", 1},
+    {0x00139474, "edi", 1},
+    {0x0013FAA2, "ecx", 1},
+    {0x0013FAB9, "edi", 1},
+    {0x00147420, "esi", 3},
+    {0x0014746D, "ecx", 3},
+    {0x00147743, "esi", 2},
+    {0x0014778D, "ecx", 2},
+    {0x00147A63, "edi", 2},
+    {0x00147AAD, "ecx", 2},
+    {0x0014ACC1, "ecx", 1},
+    {0x0014ACE8, "esi", 1},
+};
+#else
 inline constexpr GridSite kGridSites[] = {
     {0x00138BCD, "ecx", 1},
     {0x00138BE4, "edi", 1},
@@ -57,8 +73,169 @@ inline constexpr GridSite kGridSites[] = {
     {0x0014A5D1, "ecx", 1},
     {0x0014A5F8, "esi", 1},
 };
+#endif
 inline constexpr uint32_t kGridSiteCount = sizeof(kGridSites) / sizeof(kGridSites[0]);
 inline constexpr uint32_t kGridExpectedOccurrences = 20;
+
+// 0x13E7F0 builds the visible-portal list in a stack frame: sub esp, 0x204, list at esp+0x190, so only
+// 0x204-0x190 = 0x74 bytes (29 entries) before it runs into the saved registers/return address. The 5x5
+// ring (16 extra nodes) fits; the 7x7 ring (40) overflows it and crashes in an indirect call. Enlarge the
+// frame; all locals are esp-relative, so the extra room is safe.
+struct FrameSite {
+    uint32_t address;
+    uint32_t from;
+    uint32_t to;
+};
+#if defined(TCNYC_PAL) && TCNYC_PAL
+inline constexpr FrameSite kFrameSites[] = {{0x0013F086, 0x204, 0x804}};
+#else
+inline constexpr FrameSite kFrameSites[] = {{0x0013E7F6, 0x204, 0x1004}};
+#endif
+inline constexpr uint32_t kFrameSiteCount = sizeof(kFrameSites) / sizeof(kFrameSites[0]);
+inline constexpr uint32_t kFrameExpectedOccurrences = 1;
+
+// The dynamic light table: 16 pointers at 0x349380 with the count at 0x3493CC. 0x3493C0 onwards is other
+// data, so the 17th light (reached by the 7x7 ring) lands in a foreign global and 0x61370 later reads a null
+// light. Lights are addressed only by index (each stores its own at +0x94), so every site reads the base
+// through xbe_light_table instead; the host moves the table to a larger array at a quiet point.
+#if defined(TCNYC_PAL) && TCNYC_PAL
+inline constexpr uint32_t kLightSites[] = {0x00061430, 0x000617C0, 0x000619B4, 0x00061D40, 0x00063729,
+                                           0x0006374C, 0x0006375F, 0x0006376C, 0x00063783};
+#else
+inline constexpr uint32_t kLightSites[] = {0x00061400, 0x00061790, 0x00061984, 0x00061D10, 0x000636F9,
+                                           0x0006371C, 0x0006372F, 0x0006373C, 0x00063753};
+#endif
+inline constexpr uint32_t kLightSiteCount = sizeof(kLightSites) / sizeof(kLightSites[0]);
+inline const char kLightDecl[] = "extern \"C\" uint32_t xbe_light_table;";
+#if defined(TCNYC_PAL) && TCNYC_PAL
+inline const char kLightDef[] =
+    "#ifdef _WIN32\n__declspec(dllexport)\n#endif\nextern \"C\" uint32_t xbe_light_table = 0x349C40u;";
+inline const char kLightFrom[] = "0x349C40u";
+inline const char kLightFromMinus4[] = "0x349C3Cu";
+#else
+inline const char kLightDef[] =
+    "#ifdef _WIN32\n__declspec(dllexport)\n#endif\nextern \"C\" uint32_t xbe_light_table = 0x349380u;";
+inline const char kLightFrom[] = "0x349380u";
+inline const char kLightFromMinus4[] = "0x34937Cu";
+#endif
+
+// The per-frame visible city instance list: 300 entries of {float sort key, instance} at city + 0x5AD0, count
+// at city + 0x6430, filled by 0x14A240/0x148A00 from the game's 3x3 tiles only and drawn by 0x144250 and
+// 0x1387F0. Every site that addresses it (base +0x5AD0/+0x5AD4) or checks its 300 cap (0x12C) goes through
+// XBE_INST(city) / xbe_inst_cap, so the host can move it to a larger array for the outer ring. Until it does,
+// XBE_INST(city) is city + 0x5AD0 and the cap is 300: unchanged behaviour. NTSC addresses only.
+#if defined(TCNYC_PAL) && TCNYC_PAL
+inline constexpr uint32_t kInstSites[] = {0};
+inline constexpr uint32_t kInstSiteCount = 0;
+#else
+inline constexpr uint32_t kInstSites[] = {0x0013882F, 0x00138D80, 0x0013F8E0, 0x00144590, 0x00148BBA, 0x00148BE7,
+                                          0x00148C60, 0x00148C6C, 0x00148CA1, 0x0014A939, 0x0014A966, 0x0014AA63,
+                                          0x0014AA75, 0x0014AA7B, 0x0014AAC0, 0x0014AAC5,
+                                          // insert 0x1481D0 / evict 0x147720 read the count at list base + 0x960
+                                          0x001481D3, 0x001481EF, 0x00148206, 0x00148210, 0x0014821D, 0x00147723,
+                                          0x0014772F, 0x00147754};
+inline constexpr uint32_t kInstSiteCount = sizeof(kInstSites) / sizeof(kInstSites[0]);
+#endif
+inline const char kInstMacro[] =
+    "#define XBE_INST(c) (xbe_inst_table ? xbe_inst_table : (uint32_t)(c) + 0x5AD0u)\n"
+    "#define XBE_CNT(l) (xbe_inst_table && (uint32_t)(l) == xbe_inst_table ? xbe_inst_count : (uint32_t)(l) + 0x960u)";
+inline const char kInstDecl[] = "extern \"C\" uint32_t xbe_inst_table, xbe_inst_cap, xbe_inst_count;";
+inline const char kInstDef[] =
+    "#ifdef _WIN32\n__declspec(dllexport)\n#endif\nextern \"C\" uint32_t xbe_inst_table = 0u;\n"
+    "#ifdef _WIN32\n__declspec(dllexport)\n#endif\nextern \"C\" uint32_t xbe_inst_cap = 0x12Cu;\n"
+    "#ifdef _WIN32\n__declspec(dllexport)\n#endif\nextern \"C\" uint32_t xbe_inst_count = 0u;";
+
+// Statements appended after a guest instruction. 0x13E7F0 (portal pass) checks an instance slot in one object's
+// table ([[esp+0x44]+0x50][idx], 0x13EC93) but then reads the city's table ([[0x37F8FC]+0x50][idx], 0x13ECB6)
+// and dereferences it at 0x13ECB9. In the normal game both are the same object; with the outer ring they can
+// differ, the city entry is null, and the pass crashed reading guest 0x30. Take the game's own skip path
+// (0x13EE8A, the target of the first check) when that entry is null. NTSC only.
+struct AppendSite {
+    uint32_t address;
+    const char* text;
+};
+#if defined(TCNYC_PAL) && TCNYC_PAL
+inline constexpr AppendSite kAppendSites[] = {{0, ""}};
+inline constexpr uint32_t kAppendSiteCount = 0;
+#else
+inline constexpr AppendSite kAppendSites[] = {{0, ""}};  // 0x13ECB6 null skip reverted: crashed sooner (181 s)
+inline constexpr uint32_t kAppendSiteCount = 0;
+#endif
+
+// Constants replaced at a guest instruction. 0x13E7F0 also keeps a byte array of portal flags at esp+0xA0+i next to
+// its pointer list at esp+0x190+i*4: only 240 bytes before the flags overwrite portal pointers. The 9x9 ring pushes
+// more portals than that; a corrupted pointer then gave an object with a null table (+0x54) and a crash at
+// 0x13EB1E (read of guest 0x30, ~17 min into the attract screen). With the frame at 0x1004 the flags move to
+// esp+0xC00 (1028 entries) and the pointer list keeps 0x190..0xC00 (668 entries). NTSC only.
+struct ReplaceSite {
+    uint32_t address;
+    const char* from;
+    const char* to;
+};
+#if defined(TCNYC_PAL) && TCNYC_PAL
+inline constexpr ReplaceSite kReplaceSites[] = {{0, "", ""}};
+inline constexpr uint32_t kReplaceSiteCount = 0;
+#else
+inline constexpr ReplaceSite kReplaceSites[] = {{0x0013EA38, "0xA0u", "0xC00u"}, {0x0013EA50, "0xA0u", "0xC00u"},
+                                                {0x0013EA70, "0xA0u", "0xC00u"}, {0x0013EA88, "0xA0u", "0xC00u"},
+                                                {0x0013EA9F, "0xA0u", "0xC00u"}};
+inline constexpr uint32_t kReplaceSiteCount = 5;
+#endif
+
+inline const ReplaceSite* ReplaceSiteAt(uint32_t address) {
+    for (uint32_t i = 0; i < kReplaceSiteCount; ++i)
+        if (kReplaceSites[i].address == address) return &kReplaceSites[i];
+    return nullptr;
+}
+
+inline const AppendSite* AppendSiteAt(uint32_t address) {
+    for (uint32_t i = 0; i < kAppendSiteCount; ++i)
+        if (kAppendSites[i].address == address) return &kAppendSites[i];
+    return nullptr;
+}
+
+inline bool IsInstSite(uint32_t address) {
+    for (uint32_t i = 0; i < kInstSiteCount; ++i)
+        if (kInstSites[i] == address) return true;
+    return false;
+}
+
+// Rewrites one generated statement; false if it has none of the three expected shapes.
+inline bool RewriteInstSite(std::string& code) {
+    if (const size_t at = code.find("(uint32_t)(ctx.esi + 0x960u)"); at != std::string::npos) {  // count via list base
+        code.replace(at, 28, "(uint32_t)(XBE_CNT(ctx.esi))");
+        if (const size_t cap = code.find("(0x12Cu)"); cap != std::string::npos) code.replace(cap, 8, "(xbe_inst_cap)");
+        return true;
+    }
+    for (const auto& [from, to] : {std::pair<std::string, std::string>{"(uint32_t)(0x5AD0u)", "(uint32_t)(XBE_INST(a) - a)"},
+                                   {"(uint32_t)(0x5AD4u)", "(uint32_t)(XBE_INST(a) + 4u - a)"}}) {
+        if (const size_t at = code.find(from); at != std::string::npos) {  // add reg, 0x5AD0 / 0x5AD4
+            code.replace(at, from.size(), to);
+            return true;
+        }
+    }
+    if (const size_t at = code.find("(0x12Cu)"); at != std::string::npos) {  // the 300 cap
+        code.replace(at, 8, "(xbe_inst_cap)");
+        return true;
+    }
+    for (const auto& [from, to] : {std::pair<std::string, std::string>{"0x5AD0u", "0u"}, {"0x5AD4u", "4u"}}) {
+        const size_t k = code.find(from);
+        if (k == std::string::npos) continue;
+        const size_t r = code.rfind("(uint32_t)(ctx.e", k);  // ea = (uint32_t)(ctx.REG + [ctx.IDX * 8u + ]K)
+        if (r == std::string::npos) return false;
+        const size_t reg = r + 11;
+        code.replace(k, from.size(), to);
+        code.replace(reg, 7, "XBE_INST(" + code.substr(reg, 7) + ")");
+        return true;
+    }
+    return false;
+}
+
+inline bool IsLightSite(uint32_t address) {
+    for (uint32_t site : kLightSites)
+        if (site == address) return true;
+    return false;
+}
 
 struct GridPatchResult {
     uint32_t files = 0;
@@ -95,6 +272,12 @@ inline const GridSite* GridSiteAt(uint32_t address) {
     return nullptr;
 }
 
+inline const FrameSite* FrameSiteAt(uint32_t address) {
+    for (const FrameSite& site : kFrameSites)
+        if (site.address == address) return &site;
+    return nullptr;
+}
+
 // Applies the fix to dir/x86_recomp.0..partitions-1.cpp. Every expected partition, site and
 // occurrence is required; files are replaced through a temporary file, and any mismatch is an
 // error. Calling it again on already-corrected sources verifies and accepts them.
@@ -121,6 +304,12 @@ inline GridPatchResult PatchGridSources(const std::filesystem::path& dir, uint32
         }
     } changes;
     std::vector<uint32_t> seen(kGridSiteCount, 0);
+    std::vector<uint32_t> seen_frame(kFrameSiteCount, 0);
+    uint32_t frame_occurrences = 0;
+    uint32_t light_occurrences = 0;
+    uint32_t inst_occurrences = 0;
+    uint32_t append_occurrences = 0;
+    uint32_t replace_occurrences = 0;
     for (uint32_t part = 0; part < partitions; part++) {
         const std::filesystem::path file = dir / ("x86_recomp." + std::to_string(part) + ".cpp");
         std::ifstream in(file, std::ios::binary);
@@ -142,6 +331,8 @@ inline GridPatchResult PatchGridSources(const std::filesystem::path& dir, uint32
             while (std::getline(stream, line)) lines.push_back(line);
         }
         bool changed = false;
+        bool light_here = false;
+        bool inst_here = false;
         for (size_t i = 0; i < lines.size(); i++) {
             const std::string& line = lines[i];
             const size_t comment = line.find("// ");
@@ -149,6 +340,113 @@ inline GridPatchResult PatchGridSources(const std::filesystem::path& dir, uint32
             uint32_t address = 0;
             if (!ParseHex(line, comment + 3, 8, address)) continue;
             if (comment + 12 > line.size()) continue;
+            if (IsLightSite(address)) {
+                size_t target = i + 1;
+                while (target < lines.size() && lines[target].find_first_not_of(" \t\r") == std::string::npos)
+                    target++;
+                std::string& code = lines[target < lines.size() ? target : i];
+                bool hit = false;
+                for (const auto& [from, to] : {std::pair<std::string, std::string>{kLightFrom, "xbe_light_table"},
+                                               {kLightFromMinus4, "(xbe_light_table - 4u)"}}) {
+                    const size_t at = code.find(from);
+                    if (at != std::string::npos) {
+                        code.replace(at, from.size(), to);
+                        changed = hit = true;
+                    }
+                }
+                if (!hit && code.find("xbe_light_table") == std::string::npos) {
+                    result.error = "light site " + ToHex(address) + " does not match";
+                    return result;
+                }
+                light_here = true;
+                light_occurrences++;
+                continue;
+            }
+            if (const ReplaceSite* site = ReplaceSiteAt(address)) {
+                size_t target = i + 1;
+                while (target < lines.size() && lines[target].find_first_not_of(" \t\r") == std::string::npos)
+                    target++;
+                if (target >= lines.size()) {
+                    result.error = "replace site " + ToHex(address) + " has no statement";
+                    return result;
+                }
+                std::string& code = lines[target];
+                const std::string from = std::string("+ ") + site->from + ")";
+                const std::string to = std::string("+ ") + site->to + ")";
+                if (const size_t at = code.find(from); at != std::string::npos) {
+                    code.replace(at, from.size(), to);
+                    changed = true;
+                } else if (code.find(to) == std::string::npos) {
+                    result.error = "replace site " + ToHex(address) + " does not match";
+                    return result;
+                }
+                replace_occurrences++;
+                continue;
+            }
+            if (const AppendSite* site = AppendSiteAt(address)) {
+                size_t target = i + 1;
+                while (target < lines.size() && lines[target].find_first_not_of(" \t\r") == std::string::npos)
+                    target++;
+                if (target >= lines.size()) {
+                    result.error = "append site " + ToHex(address) + " has no statement";
+                    return result;
+                }
+                if (lines[target].find(site->text) == std::string::npos) {
+                    std::string& code = lines[target];
+                    const bool cr = !code.empty() && code.back() == '\r';
+                    if (cr) code.pop_back();
+                    code += site->text;
+                    if (cr) code += '\r';
+                    changed = true;
+                }
+                append_occurrences++;
+                continue;
+            }
+            if (IsInstSite(address)) {
+                size_t target = i + 1;
+                while (target < lines.size() && lines[target].find_first_not_of(" \t\r") == std::string::npos)
+                    target++;
+                std::string& code = lines[target < lines.size() ? target : i];
+                if (code.find("XBE_INST(") == std::string::npos && code.find("xbe_inst_cap") == std::string::npos) {
+                    if (!RewriteInstSite(code)) {
+                        result.error = "instance site " + ToHex(address) + " does not match";
+                        return result;
+                    }
+                    changed = true;
+                }
+                inst_here = true;
+                inst_occurrences++;
+                continue;
+            }
+            if (line.compare(comment + 12, 3, "sub") == 0) {
+                const FrameSite* fs = FrameSiteAt(address);
+                if (!fs) continue;
+                const std::string expect = "sub esp, 0x" + ToHex(fs->from, 1);
+                if (line.find(expect) == std::string::npos) {
+                    result.error = "guest " + ToHex(address) + " does not match '" + expect + "'";
+                    return result;
+                }
+                size_t target = i + 1;
+                while (target < lines.size() && lines[target].find_first_not_of(" \t\r") == std::string::npos)
+                    target++;
+                if (target == lines.size()) {
+                    result.error = "the sub block after guest " + ToHex(address) + " is missing";
+                    return result;
+                }
+                const std::string from_u = "0x" + ToHex(fs->from, 1) + "u";
+                const std::string to_u = "0x" + ToHex(fs->to, 1) + "u";
+                const size_t at = lines[target].find(from_u);
+                if (at != std::string::npos) {
+                    lines[target].replace(at, from_u.size(), to_u);
+                    changed = true;
+                } else if (lines[target].find(to_u) == std::string::npos) {
+                    result.error = "unexpected sub frame after guest " + ToHex(address);
+                    return result;
+                }
+                seen_frame[size_t(fs - kFrameSites)]++;
+                frame_occurrences++;
+                continue;
+            }
             if (line.compare(comment + 12, 4, "idiv") != 0) continue;
             const GridSite* site = GridSiteAt(address);
             if (!site) continue;
@@ -193,6 +491,23 @@ inline GridPatchResult PatchGridSources(const std::filesystem::path& dir, uint32
             seen[index]++;
             result.occurrences++;
         }
+        // Declare (or, in partition 0, define) the light table base once per file that needs it.
+        const std::string want = part == 0 ? kLightDef : kLightDecl;
+        if ((part == 0 || light_here) && text.find(want) == std::string::npos && !lines.empty()) {
+            lines.insert(lines.begin() + 1, want);
+            changed = true;
+        }
+        if (kInstSiteCount && (part == 0 || inst_here) && !lines.empty()) {
+            const std::string inst = part == 0 ? kInstDef : kInstDecl;
+            if (text.find(kInstMacro) == std::string::npos) {
+                lines.insert(lines.begin() + 1, kInstMacro);
+                changed = true;
+            }
+            if (text.find(inst) == std::string::npos) {
+                lines.insert(lines.begin() + 1, inst);
+                changed = true;
+            }
+        }
         if (changed) {
             std::string patched;
             for (size_t i = 0; i < lines.size(); i++) {
@@ -213,6 +528,38 @@ inline GridPatchResult PatchGridSources(const std::filesystem::path& dir, uint32
     if (result.occurrences != kGridExpectedOccurrences) {
         result.error = "patched " + std::to_string(result.occurrences) + " sites, expected " +
                        std::to_string(kGridExpectedOccurrences);
+        return result;
+    }
+    for (uint32_t i = 0; i < kFrameSiteCount; i++) {
+        if (seen_frame[i] != 1) {
+            result.error = "frame site " + ToHex(kFrameSites[i].address) + " appears " +
+                           std::to_string(seen_frame[i]) + " time(s), expected 1";
+            return result;
+        }
+    }
+    if (frame_occurrences != kFrameExpectedOccurrences) {
+        result.error = "patched " + std::to_string(frame_occurrences) + " frame sites, expected " +
+                       std::to_string(kFrameExpectedOccurrences);
+        return result;
+    }
+    if (replace_occurrences < kReplaceSiteCount) {
+        result.error = "patched " + std::to_string(replace_occurrences) + " replace sites, expected " +
+                       std::to_string(kReplaceSiteCount);
+        return result;
+    }
+    if (append_occurrences < kAppendSiteCount) {
+        result.error = "patched " + std::to_string(append_occurrences) + " append sites, expected " +
+                       std::to_string(kAppendSiteCount);
+        return result;
+    }
+    if (inst_occurrences < kInstSiteCount) {
+        result.error = "patched " + std::to_string(inst_occurrences) + " instance sites, expected at least " +
+                       std::to_string(kInstSiteCount);
+        return result;
+    }
+    if (light_occurrences < kLightSiteCount) {
+        result.error = "patched " + std::to_string(light_occurrences) + " light sites, expected at least " +
+                       std::to_string(kLightSiteCount);
         return result;
     }
     // Validate the whole image before staging anything. Exclusive staging files also make a

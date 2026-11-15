@@ -90,6 +90,21 @@ set_source_files_properties(${XBE_SDK_DIR}/runtime/core/input.cpp PROPERTIES INC
 # with the same flags). Expects assets/<xbe> and the config's out = "generated/<game_dir>". At run time the game may be
 # a disc image instead.
 function(add_xbe_image target xbe config partitions game_dir)
+    # hook_dir is where this image's host hooks live (src/<hook_dir>); a second
+    # region of the same title can share them while keeping generated code apart.
+    set(hook_dir ${game_dir})
+    if(ARGC GREATER 5)
+        set(hook_dir ${ARGV5})
+    endif()
+    # xbe may be a file name in assets/ (the usual build) or a path relative to
+    # the source tree (a second region's image, for example assets-pal/default.xbe).
+    if(IS_ABSOLUTE ${xbe})
+        set(xbe_file ${xbe})
+    elseif(xbe MATCHES "/")
+        set(xbe_file ${CMAKE_CURRENT_SOURCE_DIR}/${xbe})
+    else()
+        set(xbe_file ${CMAKE_CURRENT_SOURCE_DIR}/assets/${xbe})
+    endif()
     set(GEN ${CMAKE_CURRENT_SOURCE_DIR}/generated/${game_dir})
     set(GEN_SOURCES ${GEN}/x86_func_mapping.cpp)
     math(EXPR last "${partitions} - 1")
@@ -111,14 +126,13 @@ function(add_xbe_image target xbe config partitions game_dir)
                 ${XBE_RECOMP_SOURCES}
                 ${XBE_SDK_DIR}/runtime/xbe/grid_patch.h
                 ${XBE_SDK_DIR}/tools/grid_patch/main.cpp
-                ${configs} ${CMAKE_CURRENT_SOURCE_DIR}/assets/${xbe}
+                ${configs} ${xbe_file}
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
         COMMENT "Recompiling ${xbe}"
         VERBATIM)
     add_custom_target(recompile_${target} DEPENDS ${GEN}/codegen.stamp)
-    file(GLOB GAME_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/${game_dir}/*.cpp)
+    file(GLOB GAME_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/${hook_dir}/*.cpp)
     # the xbe's SHA-1: the executable checks the game it finds is the release it was made from
-    set(xbe_file ${CMAKE_CURRENT_SOURCE_DIR}/assets/${xbe})
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${xbe_file})
     file(SHA1 ${xbe_file} xbe_sha1)
     set(XBE_HASH ${CMAKE_CURRENT_BINARY_DIR}/${target}_xbe.cpp)
@@ -131,6 +145,7 @@ function(add_xbe_image target xbe config partitions game_dir)
     target_include_directories(${target} SYSTEM PRIVATE ${imgui_SOURCE_DIR})
     target_compile_options(${target} PRIVATE -fno-strict-aliasing)
     target_compile_definitions(${target} PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+    target_compile_definitions(${target} PRIVATE XBE_IMAGE_CONFIG="${config}")
     target_link_libraries(${target} PRIVATE tomlplusplus::tomlplusplus $<LINK_ONLY:SDL3::SDL3-static> d3d12 dxgi dxguid d3dcompiler ole32 windowscodecs dbghelp winmm dwmapi ws2_32)
     target_link_libraries(${target} PRIVATE ${GEN}/code.lib delayimp)
     if(MINGW)

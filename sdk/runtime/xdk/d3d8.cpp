@@ -32,6 +32,10 @@
 
 using namespace kernel;
 
+std::atomic<uint64_t>& XbeDrawCalls();  // game draw calls (diagnostic)
+using XbeDrawProbeFn = void (*)(X86Context &, uint32_t vertex_buffer);
+XbeDrawProbeFn &XbeDrawProbe();  // optional game-side probe on each draw (diagnostic)
+
 namespace dispatch {
 bool InCode(uint32_t va);  // cpu/dispatch.cpp
 }
@@ -847,7 +851,8 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
     g_frame_draws = 0;
     uint32_t interval = R32(kRenderState + gpu::kRsPresentationInterval * 4);
     if (app::kGame.swap_interval) interval = app::kGame.swap_interval(interval);
-    app::Pace(interval >= 1 && interval <= 4 ? 60 / interval : interval == 0 ? 60 : 0);
+    const uint32_t cap_override = app::kGame.swap_cap_override ? app::kGame.swap_cap_override() : 0;
+    app::Pace(interval >= 1 && interval <= 4 ? 60 / interval : interval == 0 ? 60 : 0, cap_override);
     // like the XDK, the surfaces stay put and their memory rotates: titles keep back buffer pointers and copy its data
     const uint32_t buffers = std::clamp<uint32_t>(g_buffer_count, 2, 3);
     if (g_buffers[0] && g_buffers[buffers - 1]) {
@@ -1513,6 +1518,8 @@ HLE_STDCALL(D3DDevice_SetPixelShaderConstant, 3) {
 // drawing
 
 HLE_STDCALL(D3DDevice_DrawVertices, 3) {
+    ::XbeDrawCalls().fetch_add(1, std::memory_order_relaxed);
+    if (const XbeDrawProbeFn probe = ::XbeDrawProbe()) probe(ctx, R32(kStreams + XDK_Stream_Buffer));
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     Walk(Dev(kDevPush));  // a visibility test begun since the last draw counts this one
     SyncDeferred();
@@ -1523,6 +1530,8 @@ HLE_STDCALL(D3DDevice_DrawVertices, 3) {
 }
 
 HLE_STDCALL(D3DDevice_DrawIndexedVertices, 3) {
+    ::XbeDrawCalls().fetch_add(1, std::memory_order_relaxed);
+    if (const XbeDrawProbeFn probe = ::XbeDrawProbe()) probe(ctx, R32(kStreams + XDK_Stream_Buffer));
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     Walk(Dev(kDevPush));
     SyncDeferred();
@@ -1778,6 +1787,7 @@ void Walk(uint32_t end) {
 }  // namespace d3d
 
 HLE_STDCALL(D3DDevice_DrawVerticesUP, 4) {
+    ::XbeDrawCalls().fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     Walk(Dev(kDevPush));
     DrawUp(a[0], a[1], HostPtr(a[2]), a[3]);
@@ -1930,4 +1940,14 @@ HLE_STDCALL(D3DDevice_End, 0) {
     EndPrimitive();
     SetDev(XDK_CDevice_Flags, Dev(XDK_CDevice_Flags) & ~0x1800u);
     return 0;
+}
+
+std::atomic<uint64_t>& XbeDrawCalls() {
+    static std::atomic<uint64_t> calls{0};
+    return calls;
+}
+
+XbeDrawProbeFn& XbeDrawProbe() {
+    static XbeDrawProbeFn probe = nullptr;
+    return probe;
 }

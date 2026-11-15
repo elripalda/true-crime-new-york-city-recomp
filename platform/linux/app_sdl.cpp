@@ -372,7 +372,7 @@ std::recursive_mutex& UiLock() {
     return m;
 }
 
-void Pace(uint32_t max_fps) {
+void Pace(uint32_t max_fps, uint32_t cap_override) {
     // the presentation interval's rate and the menu's cap both apply; this runs on
     // the guest's swap thread only (the window loop must not pace as well)
     if (g_suspended.load(std::memory_order_relaxed)) {
@@ -385,6 +385,7 @@ void Pace(uint32_t max_fps) {
         cap = rate > 1.0f ? uint32_t(rate + 0.5f) : 0;
     }
     if (max_fps && (!cap || cap > max_fps)) cap = max_fps;
+    if (cap_override) cap = cap_override;
     static uint32_t logged = ~0u;
     if (cap != logged) {
         LOGR("linux: frame cap %u", cap);

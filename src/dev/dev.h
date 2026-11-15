@@ -77,4 +77,8 @@ void PlayerFrame(X86Context &ctx);    // once a frame, from OnFrame
 void RequestMission(int case_index, int mission_index);
 void RequestClock(int hour, int minute);
 
+// vehicle spawner and weather override (dev_world.cpp)
+void WorldFrame(X86Context &ctx); // once a frame in gameplay, from OnFrame
+void VehiclesWeatherUi();
+
 } // namespace dev

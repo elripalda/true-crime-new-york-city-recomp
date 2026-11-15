@@ -709,6 +709,28 @@ PixelKey MakePixelKey(const State& s, const TexInfo tex[4]) {
         k.dot_mapping = d[55];
         k.input_texture = d[56];
         k.compare_mode = d[42];
+        // TCNYC's DoubleConstBlend (clear coat) and DoubleConstBlendIgnoreAlpha (base coat)
+        // lerp the paint with a copy of the scene. Street and building silhouettes from that
+        // copy can look like holes in the panels. Keep the paint term at full weight.
+        // Match the combiner definition and target use so glass and other materials retain
+        // their reflection and alpha. These shader definitions are shared by USA and PAL.
+        constexpr uint32_t kLerpReflection = 0x11CDCC31;
+        const bool car_paint = d[53] == 0x11105 && d[54] == 0x21 && d[34] == 0xC4C80000 &&
+                               d[37] == kLerpReflection && d[48] == 0xC00 && d[8] == 0x33030C00 &&
+                               d[9] == 0x1C80 && (d[4] == 0x3C311010 || d[4] == 0x34311010);
+        if (car_paint && (k.tex_modes & 0x3FF) == 0x21 && !(tex[0].flags & kTexTarget) &&
+            (tex[1].flags & kTexTarget) && !tex[1].shadow &&
+            SimpleState(s, kMBlendEnable) && SimpleState(s, kMSrcBlend) == 1 &&
+            SimpleState(s, kMDestBlend) == 0x302) {
+            // Stage 3 normally writes C0.a * r1.rgb + (1 - C0.a) * r0.rgb to r0.
+            // Pass r0.rgb through as r0 * ONE + ZERO * ZERO and drop the unused target fetch.
+            k.rgb_in[3] = 0xCC200000;
+            k.rgb_in[2] = 0;
+            k.rgb_out[2] = 0;
+            k.a_in[2] = 0;
+            k.a_out[2] = 0;
+            k.tex_modes &= ~(0x1Fu << 5);
+        }
         return k;
     }
     // the console's stages divide by q; a vertex program's q is its own

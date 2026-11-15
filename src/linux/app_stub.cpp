@@ -49,7 +49,7 @@ float RenderStretch(uint32_t, uint32_t) {
     return 1.0f;
 }
 
-void Pace(uint32_t) {}
+void Pace(uint32_t, uint32_t) {}
 
 } // namespace app
 

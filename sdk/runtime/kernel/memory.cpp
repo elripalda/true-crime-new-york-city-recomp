@@ -2,18 +2,24 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
 #include <vector>
 
 #include "core/log.h"
+#include "kernel/kernel.h"
+
+#include <array>
+#include <unordered_map>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #else
 #include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 namespace mem {
@@ -32,40 +38,58 @@ static bool InPhysical(uint32_t va) {
            (va >= kWriteCombineBase && va < kWriteCombineBase + kPhysicalSize);
 }
 
+static bool OverlapsPhysical(uint32_t va, uint64_t end) {
+    return (va < kContiguousBase + kPhysicalSize && end > kContiguousBase) ||
+           (va < kWriteCombineBase + kPhysicalSize && end > kWriteCombineBase);
+}
+
 bool Init() {
-    const uint64_t size = 1ull << 32;
+    // Guest VAs are 32-bit. Leave slack beyond the two mapped windows when probing the host address space.
+    const uint64_t size = (1ull << 32) + kPhysicalSize;
 #ifdef _WIN32
     HANDLE ram = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, kPhysicalSize, nullptr);
     // a fixed base keeps crash dumps comparable between runs
     for (uint64_t hint : {0x100000000ull, 0x200000000ull, 0x300000000ull, 0ull}) {
         uint8_t* b = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(hint), size, MEM_RESERVE, PAGE_NOACCESS));
         if (!b) continue;
-        VirtualFree(b, 0, MEM_RELEASE);
-        // reserve around the two physical windows, then map the same memory into both
+        if (!VirtualFree(b, 0, MEM_RELEASE)) continue;
+        // Reserve all non-aliased guest addresses, then map the same memory into both physical windows.
         const uint64_t cuts[][2] = {{0, kContiguousBase},
                                     {kContiguousBase + kPhysicalSize, kWriteCombineBase},
-                                    {kWriteCombineBase + kPhysicalSize, size}};
+                                    {kWriteCombineBase + kPhysicalSize, 1ull << 32}};
         bool ok = ram != nullptr;
-        for (auto& c : cuts)
-            ok = ok && VirtualAlloc(b + c[0], size_t(c[1] - c[0]), MEM_RESERVE, PAGE_NOACCESS) == b + c[0];
+        std::array<void*, std::size(cuts)> reservations{};
+        for (size_t ci = 0; ok && ci < reservations.size(); ++ci) {
+            const auto& c = cuts[ci];
+            if (c[1] <= c[0]) continue;
+            reservations[ci] = VirtualAlloc(b + c[0], size_t(c[1] - c[0]), MEM_RESERVE, PAGE_NOACCESS);
+            ok = reservations[ci] == b + c[0];
+        }
         ok = ok && MapViewOfFileEx(ram, FILE_MAP_ALL_ACCESS, 0, 0, kPhysicalSize, b + kContiguousBase) == b + kContiguousBase;
         ok = ok && MapViewOfFileEx(ram, FILE_MAP_ALL_ACCESS, 0, 0, kPhysicalSize, b + kWriteCombineBase) == b + kWriteCombineBase;
+        if (!ok) LOGE("memory: candidate base %p failed (mapping %p), err %lu", static_cast<void*>(b),
+                      static_cast<void*>(ram), GetLastError());
         if (ok) {
             g_base = b;
             break;
         }
-        for (auto& c : cuts) VirtualFree(b + c[0], 0, MEM_RELEASE);
+        for (void* region : reservations)
+            if (region) VirtualFree(region, 0, MEM_RELEASE);
         UnmapViewOfFile(b + kContiguousBase);
         UnmapViewOfFile(b + kWriteCombineBase);
     }
+    if (ram) CloseHandle(ram);
 #else
     void* p = mmap(reinterpret_cast<void*>(0x100000000ull), size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     g_base = p == MAP_FAILED ? nullptr : static_cast<uint8_t*>(p);
     int fd = g_base ? memfd_create("ram", 0) : -1;
     if (fd < 0 || ftruncate(fd, kPhysicalSize) ||
         mmap(g_base + kContiguousBase, kPhysicalSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED ||
-        mmap(g_base + kWriteCombineBase, kPhysicalSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED)
+        mmap(g_base + kWriteCombineBase, kPhysicalSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED) {
+        if (g_base) munmap(g_base, size);
         g_base = nullptr;
+    }
+    if (fd >= 0) close(fd);
 #endif
     if (!g_base) {
         LOGE("memory: could not reserve the 4 GB guest space");
@@ -83,9 +107,13 @@ static uint8_t CommittedAt(size_t page) {
 }
 
 bool Commit(uint32_t va, uint32_t size) {
-    if (!size || InPhysical(va)) return true;
+    if (!size) return true;
     uint32_t first = va & ~(kPage - 1);
     uint64_t end = (uint64_t(va) + size + kPage - 1) & ~uint64_t(kPage - 1);
+    if (!g_base || end > (1ull << 32)) return false;
+    if (OverlapsPhysical(va, end))
+        return InPhysical(va) && end <= uint64_t(va >= kWriteCombineBase ? kWriteCombineBase : kContiguousBase) +
+                                           kPhysicalSize;
     std::lock_guard<std::recursive_mutex> lock(g_lock);
 #ifdef _WIN32
     if (!VirtualAlloc(g_base + first, size_t(end - first), MEM_COMMIT, PAGE_READWRITE)) {
@@ -103,16 +131,65 @@ bool Commit(uint32_t va, uint32_t size) {
     return true;
 }
 
+namespace {
+// XBE_TRACE_FREE: remember the guest return addresses behind the last decommit of each page, so an access
+// to freed memory can name who freed it (DescribeFree, called from the crash handler).
+// Lock-free: one fixed slot per page below 256 MB (thread id + 5 return addresses), plain relaxed stores,
+// so tracing barely changes timing.
+constexpr uint32_t kTracePages = 0x10000000u >> 12;
+std::atomic<uint32_t> (*g_free_sites)[6] = nullptr;
+
+void RecordFree(uint32_t va, uint32_t size) {
+    static const bool on = [] {
+        if (!std::getenv("XBE_TRACE_FREE")) return false;
+        g_free_sites = new std::atomic<uint32_t>[kTracePages][6]();
+        return true;
+    }();
+    if (!on) return;
+    uint32_t rets[6] = {};
+    kernel::Thread *t = kernel::Current();
+    if (t && t->ctx) {
+        rets[0] = t->id;
+        // Walk the ebp frame chain (real callers), not a raw stack scan (stale return addresses).
+        auto rd = [](uint32_t a) { return *reinterpret_cast<const uint32_t *>(g_base + a); };
+        if (IsCommitted(t->ctx->esp)) rets[1] = rd(t->ctx->esp);
+        uint32_t ebp = t->ctx->ebp;
+        for (size_t n = 2; n < 6; ++n) {
+            if (ebp < 0x10000u || (ebp & 3u) || !IsCommitted(ebp) || !IsCommitted(ebp + 7)) break;
+            rets[n] = rd(ebp + 4);
+            const uint32_t next = rd(ebp);
+            if (next <= ebp) break;
+            ebp = next;
+        }
+    }
+    for (uint64_t p = va >> 12; p < (uint64_t(va) + size + 0xFFFu) >> 12 && p < kTracePages; ++p)
+        for (int i = 0; i < 6; ++i) g_free_sites[p][i].store(rets[i], std::memory_order_relaxed);
+}
+} // namespace
+
+void DescribeFree(uint32_t va) {
+    const uint32_t p = va >> 12;
+    if (!g_free_sites || p >= kTracePages || !g_free_sites[p][1].load()) {
+        LOGE("  page %08X: no recorded free", va & ~0xFFFu);
+        return;
+    }
+    auto &r = g_free_sites[p];
+    LOGE("  page %08X last freed by thread %X from %08X %08X %08X %08X %08X", va & ~0xFFFu, r[0].load(),
+         r[1].load(), r[2].load(), r[3].load(), r[4].load(), r[5].load());
+}
+
 void Decommit(uint32_t va, uint32_t size) {
-    if (InPhysical(va)) return;
+    if (!g_base || !size) return;
     uint32_t first = va & ~(kPage - 1);
     uint64_t end = (uint64_t(va) + size + kPage - 1) & ~uint64_t(kPage - 1);
+    if (end > (1ull << 32) || OverlapsPhysical(va, end)) return;
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    RecordFree(va, size);
 #ifdef _WIN32
-    VirtualFree(g_base + first, size_t(end - first), MEM_DECOMMIT);
+    if (!VirtualFree(g_base + first, size_t(end - first), MEM_DECOMMIT)) return;
 #else
+    if (mprotect(g_base + first, size_t(end - first), PROT_NONE)) return;
     madvise(g_base + first, size_t(end - first), MADV_DONTNEED);
-    mprotect(g_base + first, size_t(end - first), PROT_NONE);
 #endif
     for (uint64_t p = first; p < end; p += kPage)
         std::atomic_ref<uint8_t>(g_committed[size_t(p >> 12)]).store(0, std::memory_order_relaxed);
@@ -359,6 +436,40 @@ bool QueryVirtual(uint32_t addr, RegionInfo& out) {
     return true;
 }
 
+// Phase 0 city-streaming probe: with XBE_TRACE_CITY=1, log the larger physical allocations and frees so tile
+// loads can be attributed from their timestamp. Off otherwise, so normal runs are unaffected.
+static bool CityTrace() {
+    static const bool on = std::getenv("XBE_TRACE_CITY") != nullptr;
+    return on;
+}
+
+namespace {
+// XBE_TRACE_CONTIG: live contiguous allocations with their guest caller chain, summarised by caller so a
+// growing group (a leak) stands out. Guarded by g_lock like the allocator itself.
+struct ContigRec {
+    uint32_t size;
+    uint32_t chain[4];
+};
+std::map<uint32_t, ContigRec> g_contig_live;
+bool ContigTrace() {
+    static const bool on = std::getenv("XBE_TRACE_CONTIG") != nullptr;
+    return on;
+}
+void ContigChain(uint32_t out[4]) {
+    kernel::Thread *t = kernel::Current();
+    if (!t || !t->ctx) return;
+    auto rd = [](uint32_t a) { return *reinterpret_cast<const uint32_t *>(g_base + a); };
+    uint32_t ebp = t->ctx->ebp;
+    for (int n = 0; n < 4; ++n) {
+        if (ebp < 0x10000u || (ebp & 3u) || !IsCommitted(ebp) || !IsCommitted(ebp + 7)) break;
+        out[n] = rd(ebp + 4);
+        const uint32_t next = rd(ebp);
+        if (next <= ebp) break;
+        ebp = next;
+    }
+}
+} // namespace
+
 uint32_t AllocContiguous(uint32_t size, uint32_t lowest, uint32_t highest, uint32_t align) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     LayoutChanged();
@@ -367,7 +478,7 @@ uint32_t AllocContiguous(uint32_t size, uint32_t lowest, uint32_t highest, uint3
     size = (size + kPage - 1) & ~(kPage - 1);
     if (!size) size = kPage;
     align = std::max<uint32_t>(align, kPage);
-    uint32_t lo = kContiguousBase | (lowest & (kPhysicalSize - 1));
+    uint32_t lo = kContiguousBase | std::min<uint32_t>(lowest, kPhysicalSize - 1);
     uint32_t hi = highest >= kPhysicalSize - 1 ? kContiguousBase + kPhysicalSize - 1 : kContiguousBase | highest;
     // highest fit first: low memory stays free for requests limited to it (D3D report pages, first 16 MB)
     uint32_t a = g_contig.Alloc(size, align, lo, hi, true);
@@ -382,14 +493,47 @@ uint32_t AllocContiguous(uint32_t size, uint32_t lowest, uint32_t highest, uint3
         return 0;
     }
     std::memset(g_base + a, 0, size);
+    if (ContigTrace()) {
+        ContigRec r{size, {}};
+        ContigChain(r.chain);
+        g_contig_live[a] = r;
+    }
+    if (CityTrace() && size >= 0x4000)
+        LOGR("citymem: alloc %u KB at %08X, %llu KB in use", size >> 10, a,
+             static_cast<unsigned long long>(g_contig.Used() >> 10));
     return a;
+}
+
+void DumpContigLedger() {
+    if (!ContigTrace()) return;
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    std::map<std::array<uint32_t, 4>, std::pair<uint32_t, uint64_t>> groups;
+    for (const auto &[va, r] : g_contig_live) {
+        auto &g = groups[{r.chain[0], r.chain[1], r.chain[2], r.chain[3]}];
+        g.first++;
+        g.second += r.size;
+    }
+    std::vector<std::pair<uint64_t, std::array<uint32_t, 4>>> top;
+    for (const auto &[k, v] : groups) top.push_back({v.second, k});
+    std::sort(top.rbegin(), top.rend());
+    for (size_t i = 0; i < top.size() && i < 8; ++i) {
+        const auto &g = groups[top[i].second];
+        LOGR("contig: %6llu KB in %4u allocs from %08X<%08X<%08X<%08X", (unsigned long long)(top[i].first >> 10),
+             g.first, top[i].second[0], top[i].second[1], top[i].second[2], top[i].second[3]);
+    }
 }
 
 void FreeContiguous(uint32_t va) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     LayoutChanged();
+    if (ContigTrace()) g_contig_live.erase(va);
     uint32_t size;
-    if (g_contig.Free(va, &size)) Decommit(va, size);
+    if (g_contig.Free(va, &size)) {
+        Decommit(va, size);
+        if (CityTrace() && size >= 0x4000)
+            LOGR("citymem: free %u KB at %08X, %llu KB in use", size >> 10, va,
+                 static_cast<unsigned long long>(g_contig.Used() >> 10));
+    }
 }
 
 uint32_t AllocSystem(uint32_t size, uint32_t align) {
@@ -420,7 +564,7 @@ uint32_t AllocStack(uint32_t size) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     LayoutChanged();
     EnsureRanges();
-    if (size > 0xFFFFFFFFu - 0xFFFFu) return 0;
+    if (size > kStackSize - 0x10000) return 0;
     size = (size + 0xFFFF) & ~0xFFFFu;
     // one uncommitted guard page below the stack
     uint32_t a = g_stacks.Alloc(size + 0x10000, 0x10000, kStackBase, kStackBase + kStackSize - 1, false);
@@ -468,7 +612,7 @@ uint32_t AllocationSize(uint32_t va) {
 }
 
 uint32_t PhysicalFromVirtual(uint32_t va) {
-    if (InPhysical(va)) return va & (kPhysicalSize - 1);
+    if (InPhysical(va)) return va - (va >= kWriteCombineBase ? kWriteCombineBase : kContiguousBase);
     return va;
 }
 

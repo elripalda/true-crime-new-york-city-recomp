@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cfloat>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -30,6 +31,7 @@
 #include <map>
 #include <optional>
 #include <thread>
+#include <future>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -232,6 +234,9 @@ void Dump() {
 
 namespace {
 
+// Defined with the shader cache below: waits for the background writer before the process ends.
+void FlushShaderCacheWrites();
+
 bool EnvFlag(const char* name) {
     const char* value = std::getenv(name);
     return value && *value && std::atoi(value) != 0;
@@ -278,8 +283,21 @@ constexpr size_t kMaxIdleSmallTargets = 64;  // small targets kept while unused,
 constexpr uint64_t kUploadSize = 64ull << 20;
 // a draw starting with less than this left in the frame's ring waits for the GPU and starts the ring over
 constexpr uint64_t kUploadReserve = 8ull << 20;
-constexpr uint32_t kSrvCount = 3 * 32768;
+// The SRV heap is the per-frame rings, then a few slots outside them for views the AO flush
+// binds. AO runs mid-flush, when the pending bundles are already recorded: allocating from the
+// ring there could exhaust it and force a submit that resets the list and overwrites descriptors
+// those bundles still name. The null view below is permanent; the AO passes only run when the
+// frame's ring has room for the rest (kAoFlushSrvHeadroom).
+constexpr uint32_t kSrvPerFrame = 32768;
+constexpr uint32_t kAoNullSrv = kFrames * kSrvPerFrame;  // t4 read when no AO ran
+constexpr uint32_t kAoReservedSrv = 4;                   // slack for further fixed AO views
+constexpr uint32_t kSrvCount = kAoNullSrv + kAoReservedSrv;
+constexpr uint32_t kAoFlushSrvHeadroom = 12;  // null view, GTAO table (4), blur table (4), occlusion view
 constexpr uint32_t kSamplerCount = 2048;
+// The sampler ring leaves four slots past the per-frame regions (3 x 680). They hold a permanent
+// clamp-sampler set used when a frame's ring is full - notably the AO passes, which run during
+// the deferred flush while pending bundles still name the ring's first set.
+constexpr uint32_t kFallbackSamplers = kSamplerCount - 4;
 constexpr uint32_t kRtvCount = 1024;
 constexpr uint32_t kDsvCount = 256;
 constexpr uint32_t kSmaaRtvs = 3;  // after the back buffers' views: SMAA edges, weights, output
@@ -1046,7 +1064,7 @@ private:
     // once the main bundle is closed (bundles share one allocator, one open list at a time).
     struct DepthReplay {
         ID3D12PipelineState* pso = nullptr;
-        D3D12_GPU_VIRTUAL_ADDRESS vsc = 0, dc = 0;
+        D3D12_GPU_VIRTUAL_ADDRESS vsc = 0, dc = 0, vcp = 0;
         uint32_t views = 0, samplers = 0;
         float blend[4] = {};
         uint32_t stencil = 0;
@@ -1146,7 +1164,7 @@ private:
                float blend, ID3D12Resource* src4 = nullptr, DXGI_FORMAT fmt4 = DXGI_FORMAT_UNKNOWN,
                D3D12_CPU_DESCRIPTOR_HANDLE rh2 = {}, DXGI_FORMAT rtv2 = DXGI_FORMAT_UNKNOWN);
     ID3D12PipelineState* EnsurePassPipeline(const char* hlsl, const char* entry, DXGI_FORMAT rtv, float blend,
-                                           DXGI_FORMAT rtv2 = DXGI_FORMAT_UNKNOWN);
+                                          DXGI_FORMAT rtv2 = DXGI_FORMAT_UNKNOWN, const char* pass = "fullscreen");
     // Draw, in call order, each callee right after its caller
     bool DepthCopy(const State& s);
     ID3D12PipelineState* EnsureDepthCopyPipeline(uint32_t samples);
@@ -1220,14 +1238,16 @@ private:
             if (backend->bundle_) backend->EndDeferredBundle();
         }
     };
-    bool UploadVertexBuffers(const Assembled& a);    // visibility tests
+    bool UploadGeometry(const Assembled& a, D3D12_VERTEX_BUFFER_VIEW* vbv,
+                        D3D12_INDEX_BUFFER_VIEW* ibv);  // visibility tests
     bool EnsureQueries();
     uint32_t BeginCountedDraw(const State& s);
     void EndCountedDraw(uint32_t query);
     float SamplesPerPixel() const;
     void DeliverReports();
     // shaders by source hash: Compile returns the bytecode and sets hash
-    ID3DBlob* Compile(const std::string& src, const char* entry, const char* profile, uint64_t& hash);
+    ID3DBlob* Compile(const std::string& src, const char* entry, const char* profile, uint64_t& hash,
+                      const char* pass = "draw");
     // Blit's pipeline
     ID3D12PipelineState* EnsureBlitPipeline(DXGI_FORMAT rtv, bool over, uint32_t samples, bool depth_single = false);
     D3D12_GRAPHICS_PIPELINE_STATE_DESC FullScreenPipelineDesc(ID3DBlob* vs, ID3DBlob* ps, DXGI_FORMAT rtv) const;
@@ -1243,7 +1263,11 @@ private:
     bool CreateFrames();
     void CreateGammaLut();
     void LoadSettings();
+    void PrepareAoPipelines();
     uint32_t SupportedMsaa(uint32_t samples);
+    // the sample count the AO prepass can use: R32F and the depth format may support fewer than
+    // the scene targets; the prepass pipelines key on the returned value
+    uint32_t PickAoSamples(uint32_t requested);
     // Present, in call order, each callee right after its caller; DrawFrame runs the two after it
     void FinishCapture(const Surface& front);
     void StartCapture();
@@ -1260,7 +1284,7 @@ private:
     bool EnsureAoDepth(const Target& like);
     bool EnsureAoOcclusion(uint32_t w, uint32_t h);
     bool RenderAoOcclusion(Target& rt, float near_z, float far_z);
-    void BindAoView(ID3D12Resource* occlusion);
+    void BindAoView(bool occlusion);
     void RenderUi(D3D12_CPU_DESCRIPTOR_HANDLE target);
     bool EnsureHdrUiTarget();
     ID3D12PipelineState* EnsureHdrUiPipeline(DXGI_FORMAT rtv);
@@ -1299,8 +1323,8 @@ private:
     // Depth targets the title samples as shadow maps (smaller than the frame, so never the scene's depth), by
     // guest address: Shadow quality makes them a fixed size (shadow_px_), see WantScale.
     std::unordered_set<uint32_t> shadow_maps_;
-    // colour targets ever drawn with a depth buffer (reflections and the frame), which are never shadow images
-    std::unordered_set<uint32_t> depth_drawn_;
+    // colour targets drawn with a depth buffer (reflections and the frame), which are never shadow images:
+    // Target::depth_frame marks them, so no per-draw set lookup is needed
     std::unordered_set<uint32_t> blurred_;  // offscreen images the game blurs into each other (the shadows)
     float shadow_soft_ = 0;  // console texels between the softening taps, 0 off
     void NoteShadowImage(const State& s, int stage, const Target& t, DrawTextures& stages);
@@ -1382,6 +1406,10 @@ private:
     // their first slot; resources freed in that time go to the frame's garbage, so no other one takes their address
     std::unordered_map<uint64_t, uint32_t> view_sets_;
     uint64_t view_sets_frame_ = UINT64_MAX;
+    // last view set handed out: consecutive draws mostly sample the same four views
+    D3D12_SHADER_RESOURCE_VIEW_DESC last_views_sv_[4] = {};
+    ID3D12Resource* last_views_res_[4] = {};
+    uint32_t last_views_slot_ = UINT32_MAX;
     // the constants last uploaded in this command list, reused while a draw's are the same; 0 after a submit
     decltype(State::vsc) last_vsc_{};
     D3D12_GPU_VIRTUAL_ADDRESS last_vsc_gpu_ = 0;
@@ -1411,6 +1439,9 @@ private:
     ComPtr<ID3D12PipelineLibrary> pso_lib_;
     std::vector<uint8_t> pso_lib_blob_;
     std::atomic<uint32_t> pso_lib_new_{0};  // pipelines stored since the last save (warm threads store too)
+    std::mutex pso_lib_save_mutex_;
+    std::future<void> pso_lib_write_;
+    std::future<bool> pso_keys_write_;
     // the library's own calls: D3D12 leaves two threads loading the same pipeline, and Serialize beside a
     // store, to the caller (the render thread, the warm threads and the exit save all use it)
     std::mutex pso_lib_mutex_;
@@ -1432,6 +1463,13 @@ private:
     std::vector<std::thread> warm_threads_;
     std::mutex warm_mutex_;
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> warm_psos_;  // built, not yet drawn with
+    // Shader blobs the warm threads decode from the cache, keyed by the same hash Compile uses.
+    // The render thread takes one instead of opening and parsing the file again; the entry moves
+    // out of this map into blobs_. Bounded so a big saved set cannot hold the whole cache twice.
+    std::unordered_map<uint64_t, ComPtr<ID3DBlob>> warm_blobs_;
+    // Pipelines the render thread built while warming: the warm threads skip them instead of
+    // compiling the same state a second time.
+    std::unordered_set<uint64_t> warm_skip_;
     void LoadPipelineKeys();
     void SavePipelineKeys(bool force);
     void RecordPipelineKey(const PsoKey& k, uint64_t h);
@@ -1439,9 +1477,49 @@ private:
     void StopPipelineWarm();
     void WarmPipelines();
     ComPtr<ID3D12PipelineState> TakeWarmPipeline(uint64_t h);
+    ComPtr<ID3DBlob> TakeWarmBlob(uint64_t h);
+    // Progressive AO. The receiver (t4) and depth-prepass variants of world draws are compiled and
+    // their pipelines built on worker threads. A draw applies AO only once its variant is ready;
+    // until then it uses the game's shader and is scheduled here. Switching AO on therefore costs
+    // nothing in the frame that switches it, instead of compiling every visible variant at once.
+    struct AoWarmJob {
+        uint64_t color_id = 0, depth_id = 0;
+        ComPtr<ID3DBlob> vs;
+        bool has_color = false, has_depth = false;
+        PsoKey color_key{}, depth_key{};
+        std::string color_src, depth_src;
+        uint64_t color_hash = 0, depth_hash = 0;
+    };
+    struct AoVariantSource {
+        std::string color_src, depth_src;
+        uint64_t color_hash = 0, depth_hash = 0;
+    };
+    std::unordered_map<uint64_t, AoVariantSource> ao_sources_;  // render thread only, by base hash
+    std::mutex ao_mutex_;
+    std::condition_variable ao_cv_;
+    std::deque<AoWarmJob> ao_jobs_;
+    std::vector<std::thread> ao_threads_;
+    bool ao_stop_ = false;
+    std::atomic<bool> ao_started_{false};  // the worker threads exist (checked before taking ao_mutex_)
+    std::unordered_set<uint64_t> ao_scheduled_color_, ao_scheduled_depth_;  // job ids queued/running
+    std::unordered_set<uint64_t> ao_color_ready_, ao_depth_ready_;          // AO pipeline identities
+    std::atomic<uint32_t> ao_built_{0};
+    void ScheduleAoVariants(const PixelKey& base, const PsoKey& k, ID3DBlob* vs, bool color, bool depth);
+    bool AoColorReady(uint64_t base);
+    bool AoDepthReady(uint64_t base);
+    void RefreshAoReadyView();
+    void StartAoWarm();
+    void StopAoWarm();
+    void AoWarmWorker();
+    ComPtr<ID3DBlob> AoLoadPixelShader(const std::string& source, uint64_t hash);
+    bool BuildWarmPipeline(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps, ComPtr<ID3D12PipelineState>& out);
+    PsoKey AoDepthPsoKey(const PsoKey& k, uint64_t ps);
     // sampler descriptors are rewritten per frame like the SRV ring; a descriptor set from an
     // earlier frame may still be referenced by in-flight GPU work until its fence completes.
     static constexpr uint32_t kSamplersPerFrame = (kSamplerCount / kFrames) & ~3u;
+    // the four sampler descs the last draw used and their slot: consecutive draws mostly repeat them
+    D3D12_SAMPLER_DESC last_sampler_sd_[4] = {};
+    uint32_t last_sampler_slot_ = UINT32_MAX;
     std::array<std::unordered_map<uint64_t, uint32_t>, kFrames> samplers_;
     std::unordered_map<uint64_t, Target> targets_;
     std::unordered_map<uint32_t, uint64_t> target_used_;  // target address to the frame it was last used
@@ -1682,6 +1760,9 @@ private:
         float w_scale = 1;  // the true view distance per unit of the normalised one (far planes past 1000)
     };
     std::unordered_map<Target*, SceneDepth> scene_depth_;  // per colour target, cleared at present
+    // last scene_depth_ entry written, so consecutive draws on the same target skip the map
+    Target* last_scene_rt_ = nullptr;
+    SceneDepth last_scene_depth_{};
     ID3D12Resource* dof_depth_ = nullptr;  // this frame's readable depth, set at present
     float dof_near_ = 0.1f, dof_far_ = 1000.0f;
     ComPtr<ID3D12Resource> ao_half_;
@@ -1699,6 +1780,11 @@ private:
     ComPtr<ID3D12Resource> ao_occ_;
     D3D12_RESOURCE_STATES ao_occ_state_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
     uint32_t ao_occ_w_ = 0, ao_occ_h_ = 0;
+    uint32_t ao_pick_requested_ = 0;  // PickAoSamples cache: the scene count asked for...
+    uint32_t ao_pick_samples_ = 1;    // ...and the count both AO targets accept
+    // A copy of the AO ready sets taken once a frame: a draw tests it without touching ao_mutex_, which
+    // the variant workers hold job by job. A variant that becomes ready applies from the next frame.
+    std::unordered_set<uint64_t> ao_color_ready_view_, ao_depth_ready_view_;
     DepthReplay depth_replay_;  // the current deferred receiver's bindings
     struct LastDraw {           // the geometry views DrawGeometry last recorded
         D3D12_VERTEX_BUFFER_VIEW vbv[16] = {};
@@ -1737,6 +1823,7 @@ private:
     std::atomic<uint64_t> presents_seen_{0};    // presents_ for DeliverLate
     std::atomic<uint64_t> present_fence_[kFrames + 1] = {};  // by presents_, for WaitGpuFrame
     Assembled asm_;  // kept between draws for its buffers
+    std::vector<D3D12_RECT> clear_rects_;  // Clear's scaled rects, kept between calls for its allocation
     // visibility tests: an occlusion query per counted draw, summed into report memory once the GPU is done
     struct Query {
         uint32_t index;
@@ -1798,20 +1885,26 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
     if (!CreateHeaps()) return false;
     if (!CreateBackBufferViews()) return false;
     if (!CreateRootSignature()) return false;
-    StartPipelineWarm();  // needs the root signature
     // the game ends through kernel::Shutdown, which runs no destructors: save the pipelines there
     g_exit_backend = this;
     kernel::SetExitSave([] {
         if (D3D12Backend* b = g_exit_backend.load()) {
+            b->StopAoWarm();  // no worker may build a pipeline while the library is serialized
+            b->StopPipelineWarm();
             b->SavePipelineLibrary(true);
             b->SavePipelineKeys(true);
         }
+        FlushShaderCacheWrites();  // the last shaders compiled this run are still queued
     });
     if (!CreateFrames()) return false;
     CreateGammaLut();
     ImGui_ImplDX12_Init(dev_.Get(), kFrames, DXGI_FORMAT_B8G8R8A8_UNORM, ui_heap_.Get(),
                         ui_heap_->GetCPUDescriptorHandleForHeapStart(), ui_heap_->GetGPUDescriptorHandleForHeapStart());
     LoadSettings();
+    PrepareAoPipelines();
+    EnsureBlitPipeline(kBgra, false, 1);
+    EnsureBlitPipeline(kBgra, false, 1, true);
+    StartPipelineWarm();
 #if !defined(TCNYC_HAVE_DLSS)
     g_dlss_state.store(DlssState::NotBuilt, std::memory_order_relaxed);
 #endif
@@ -2045,6 +2138,23 @@ bool D3D12Backend::CreateHeaps() {
     }
     for (uint32_t i = kRtvCount; i-- > 0;) free_rtv_.push_back(i);
     for (uint32_t i = kDsvCount; i-- > 0;) free_dsv_.push_back(i);
+    // The AO receiver shaders always declare t4. A permanent null view outside the frame rings
+    // lets the flush bind "no occlusion" without allocating a descriptor, so a full ring can
+    // never force a submit while the pending bundles are already recorded.
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.Format = kAoFormat;
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sv.Texture2D.MipLevels = 1;
+    dev_->CreateShaderResourceView(nullptr, &sv, Cpu(srv_heap_.Get(), kAoNullSrv, srv_inc_));
+    // the permanent fallback sampler set, same layout as the full-screen passes'
+    for (uint32_t i = 0; i < 4; i++) {
+        D3D12_SAMPLER_DESC sd{};
+        sd.Filter = i == 0 ? D3D12_FILTER_MIN_MAG_MIP_LINEAR : D3D12_FILTER_MIN_MAG_MIP_POINT;
+        sd.AddressU = sd.AddressV = sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        sd.MaxLOD = D3D12_FLOAT32_MAX;
+        dev_->CreateSampler(&sd, Cpu(smp_heap_.Get(), kFallbackSamplers + i, smp_inc_));
+    }
     // permanently reserve the few scratch views the resolve/shrink passes borrow
     for (uint32_t f = 0; f < kFrames; f++)
         for (uint32_t i = 0; i < kScratchViews; i++) {
@@ -2148,6 +2258,27 @@ void D3D12Backend::LoadSettings() {
     }
 }
 
+void D3D12Backend::PrepareAoPipelines() {
+    if (render_.ao == 0) return;
+    LOGR("d3d12: preparing ambient occlusion shaders");
+    const bool multisampled = PickAoSamples(msaa_) > 1;
+    bool ready = true;
+    for (bool depth_ms : {false, true}) {
+        if (depth_ms && !multisampled) break;
+        const auto resolve = AoResolveSource(depth_ms);
+        const auto* occlusion = EnsurePassPipeline(resolve.c_str(), "psmain", kAoFormat, -1, DXGI_FORMAT_UNKNOWN,
+                                                   "AO occlusion resolve");
+        ready = ready && occlusion;
+        for (uint32_t mode : {1u, 2u}) {
+            const auto horizon = AoHorizonSource(mode, depth_ms);
+            const auto* gtao = EnsurePassPipeline(horizon.c_str(), "psmain", kAoFormat, -1, DXGI_FORMAT_UNKNOWN,
+                                                  "GTAO horizon search");
+            ready = ready && gtao;
+        }
+    }
+    LOGR("d3d12: ambient occlusion shader preparation %s", ready ? "complete" : "incomplete");
+}
+
 void D3D12Backend::Begin() {
     ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get(), smp_heap_.Get()};
     cl_->SetDescriptorHeaps(2, heaps);
@@ -2181,16 +2312,20 @@ void D3D12Backend::Submit(bool wait) {
             kernel::Shutdown(1);
             return;
         }
+        hr = f.alloc->Reset();
+        if (FAILED(hr)) DeviceFailure(hr, "command allocator reset after submit");
         RecycleFrameViews(f, uint32_t(frame_ % kFrames));
-        f.alloc->Reset();
         f.garbage.clear();
         f.used = 0;
         f.srv = 0;
         f.smp = uint32_t(frame_ % kFrames) * kSamplersPerFrame;
         samplers_[frame_ % kFrames].clear();
         view_sets_.clear();
+        last_sampler_slot_ = UINT32_MAX;  // the descriptor rings start over: the memos' slots are gone
+        last_views_slot_ = UINT32_MAX;
         cl_ = lists_[frame_ % kFrames].Get();
-        cl_->Reset(f.alloc.Get(), nullptr);
+        hr = cl_->Reset(f.alloc.Get(), nullptr);
+        if (FAILED(hr)) DeviceFailure(hr, "command list reset after submit");
         Begin();
     }
 }
@@ -2204,7 +2339,12 @@ void D3D12Backend::Flush() {
 // fence that will never be signalled turns a driver reset into a frozen game.
 bool D3D12Backend::WaitFence(uint64_t value) {
     if (!fence_) return false;
-    if (fence_->GetCompletedValue() >= value) return true;
+    const uint64_t completed = fence_->GetCompletedValue();
+    if (completed == UINT64_MAX) {
+        LOGE("d3d12: device lost before fence wait (reason 0x%08lX)", dev_->GetDeviceRemovedReason());
+        return false;
+    }
+    if (completed >= value) return true;
     HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!event) return false;
     const HRESULT hr = fence_->SetEventOnCompletion(value, event);
@@ -2218,11 +2358,7 @@ bool D3D12Backend::WaitFence(uint64_t value) {
     bool done = false;
     for (;;) {
         const DWORD r = WaitForSingleObject(event, 1000);
-        if (r == WAIT_OBJECT_0) {
-            done = true;
-            break;
-        }
-        if (r != WAIT_TIMEOUT) {
+        if (r != WAIT_OBJECT_0 && r != WAIT_TIMEOUT) {
             LOGE("d3d12: fence wait failed (%lu)", GetLastError());
             break;
         }
@@ -2230,6 +2366,10 @@ bool D3D12Backend::WaitFence(uint64_t value) {
         if (FAILED(reason)) {
             LOGE("d3d12: device lost while waiting for fence %llu (reason 0x%08lX)",
                  static_cast<unsigned long long>(value), static_cast<unsigned long>(reason));
+            break;
+        }
+        if (r == WAIT_OBJECT_0) {
+            done = true;
             break;
         }
         if (GetTickCount64() >= deadline) {
@@ -2293,7 +2433,7 @@ D3D12Backend::Alloc D3D12Backend::Upload(uint64_t size, uint64_t align) {
 
 uint32_t D3D12Backend::AllocSrvSlots(uint32_t n) {
     Frame& f = CurrentFrame();
-    const uint32_t per = kSrvCount / kFrames;
+    const uint32_t per = kSrvPerFrame;
     if (f.srv + n > per) {
         // Never borrow another frame's region: those descriptors may still be
         // referenced by an in-flight command list. Start a new recording frame.
@@ -2355,6 +2495,7 @@ void D3D12Backend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator 
         std::erase_if(scene_depth_, [&](const auto& entry) { return entry.second.target == &it->second; });
     else
         scene_depth_.erase(&it->second);
+    last_scene_rt_ = nullptr;  // the one-entry scene_depth_ cache may name it
     if (bound_rt_ == &it->second || bound_ds_ == &it->second) bound_rt_ = bound_ds_ = nullptr;
     // The command list still references this view index: return it only after the frame's fence.
     (it->second.depth ? CurrentFrame().dsv_garbage : CurrentFrame().rtv_garbage).push_back(it->second.view);
@@ -2417,6 +2558,7 @@ bool D3D12Backend::CreateTargetResource(Target& t, const Surface& s) {
             msaa_hr = dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, t.state, &cv,
                                                     IID_PPV_ARGS(&t.res));
             if (SUCCEEDED(msaa_hr)) {
+                t.samples = samples;
                 static bool reported[2] = {};  // colour, depth: the first of each
                 if (!std::exchange(reported[t.depth ? 1 : 0], true))
                     LOGR("d3d12: allocated %ux MSAA %s target", msaa_, t.depth ? "depth" : "color");
@@ -2434,6 +2576,7 @@ bool D3D12Backend::CreateTargetResource(Target& t, const Surface& s) {
                                                      IID_PPV_ARGS(&t.res));
     if (FAILED(hr)) LOGE("d3d12: target %ux%u format %u could not be created (0x%08lX), device removed reason 0x%08lX",
                          t.w, t.h, unsigned(td.Format), hr, dev_->GetDeviceRemovedReason());
+    t.samples = SUCCEEDED(hr) ? td.SampleDesc.Count : 1;
     return SUCCEEDED(hr);
 }
 
@@ -2547,11 +2690,10 @@ void D3D12Backend::UpdateTargetUsed(uint32_t data) {
 bool D3D12Backend::BindTargets(const State& s) {
     Target* rt = EnsureTarget(s.rt, false);
     Target* ds = s.rs[kRsZEnable] || s.rs[kRsStencilEnable] ? EnsureTarget(s.zs, true) : nullptr;
-    if (rt && ds && (rt->w != ds->w || rt->h != ds->h ||
-                     rt->res->GetDesc().SampleDesc.Count != ds->res->GetDesc().SampleDesc.Count))
-        ds = nullptr;
+    if (rt && ds && (rt->w != ds->w || rt->h != ds->h || rt->samples != ds->samples)) ds = nullptr;
     if (!rt && !ds) return false;
-    if (rt && ds) depth_drawn_.insert(rt->data);
+    // NoteShadowImage asks whether a sampled target was ever drawn with depth (then it is no shadow image)
+    if (rt && ds) rt->has_depth = true;
     if (rt) {
         if (LatchCpuWrite(*rt)) UploadTarget(*rt, s.rt);
         Transition(rt->res.Get(), rt->state, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -2724,6 +2866,7 @@ void D3D12Backend::UploadTarget(Target& t, const Surface& s) {
     if (!over) {
         t.scene_frame = ~0ull;
         scene_depth_.erase(&t);
+        last_scene_rt_ = nullptr;
     }
     t.epoch = DirtyEpoch(t.data);
     t.sig = MemSig(t.data, t.bytes);
@@ -2734,6 +2877,8 @@ constexpr uint64_t kBlitSamplerKey = 0xB117;
 
 // four clamp samplers: linear at slot 0, point at slots 1 to 3
 uint32_t D3D12Backend::EnsureBlitSamplers() {
+    // 3 frame regions of 680 plus this permanent set must fit the heap
+    static_assert(kSamplersPerFrame * kFrames <= kFallbackSamplers, "sampler heap too small for the fallback set");
     uint64_t key = kBlitSamplerKey;
     const uint32_t frame_index = uint32_t(frame_ % kFrames);
     auto& cache = samplers_[frame_index];
@@ -2745,18 +2890,20 @@ uint32_t D3D12Backend::EnsureBlitSamplers() {
         Frame& f = CurrentFrame();
         if (f.smp < start) f.smp = start;
         if (f.smp + 4 > end) {
-            LOG_FIRST(4, "d3d12: sampler ring full within a frame, using the first set");
-            si = start;
+            // Reusing the region's first set would rewrite descriptors an earlier draw or a
+            // pending bundle still references; use the permanent set outside the rings.
+            LOG_FIRST(4, "d3d12: sampler ring full within a frame, using the fallback set");
+            si = kFallbackSamplers;  // written once in CreateHeaps, never rewritten
         } else {
             si = f.smp;
             f.smp += 4;
-        }
-        for (int i = 0; i < 4; i++) {
-            D3D12_SAMPLER_DESC sd{};
-            sd.Filter = i == 0 ? D3D12_FILTER_MIN_MAG_MIP_LINEAR : D3D12_FILTER_MIN_MAG_MIP_POINT;
-            sd.AddressU = sd.AddressV = sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-            sd.MaxLOD = D3D12_FLOAT32_MAX;
-            dev_->CreateSampler(&sd, Cpu(smp_heap_.Get(), si + i, smp_inc_));
+            for (int i = 0; i < 4; i++) {
+                D3D12_SAMPLER_DESC sd{};
+                sd.Filter = i == 0 ? D3D12_FILTER_MIN_MAG_MIP_LINEAR : D3D12_FILTER_MIN_MAG_MIP_POINT;
+                sd.AddressU = sd.AddressV = sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+                sd.MaxLOD = D3D12_FLOAT32_MAX;
+                dev_->CreateSampler(&sd, Cpu(smp_heap_.Get(), si + i, smp_inc_));
+            }
         }
         cache[key] = si;
     } else {
@@ -2768,6 +2915,7 @@ uint32_t D3D12Backend::EnsureBlitSamplers() {
 // the full screen triangle: cb at b0 and b1, views at srv_slot; without a sampler slot EnsureBlitSamplers gives it
 void D3D12Backend::DrawFullScreen(ID3D12PipelineState* pso, D3D12_GPU_VIRTUAL_ADDRESS cb, uint32_t srv_slot,
                                   std::optional<uint32_t> sampler_slot) {
+    if (!pso || !cb) return;  // a failed pipeline: draw nothing rather than a draw with no state
     binds_ = {};
     Cmd()->SetPipelineState(pso);
     Cmd()->SetGraphicsRootConstantBufferView(0, cb);
@@ -2861,6 +3009,85 @@ void WriteShaderCache(const std::filesystem::path& file, uint64_t key, const voi
     std::filesystem::remove(temporary, ec);
 }
 
+// Shader cache writes run on their own thread: a frame that compiles a burst of new variants
+// should spend the time in the compiler, not in create-directories/open/rename per shader. The
+// queue holds a copy of the blob (a few KB), and the thread dies with the process, so a lost
+// tail is harmless. Flush() is called from the exit save so the last run's work is kept.
+class ShaderCacheWriter {
+public:
+    static ShaderCacheWriter& Get() {
+        static ShaderCacheWriter writer;
+        return writer;
+    }
+    void Enqueue(const std::filesystem::path& file, uint64_t key, const void* data, size_t size) {
+        if (size < 4 || size > kShaderCacheMaxBytes) return;
+        Job job;
+        job.file = file;
+        job.key = key;
+        job.bytes.assign(static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + size);
+        {
+            std::lock_guard lock(mutex_);
+            if (!stopping_) {
+                queue_.push_back(std::move(job));
+                cv_.notify_one();
+                return;
+            }
+        }
+        // the writer was stopped (shutdown): keep the entry synchronously
+        WriteShaderCache(job.file, job.key, job.bytes.data(), job.bytes.size());
+    }
+    void Flush() {
+        std::unique_lock lock(mutex_);
+        idle_.wait(lock, [this] { return queue_.empty() && !writing_; });
+    }
+private:
+    struct Job {
+        std::filesystem::path file;
+        uint64_t key = 0;
+        std::vector<uint8_t> bytes;
+    };
+    ShaderCacheWriter() : thread_([this] { Run(); }) {}
+    ~ShaderCacheWriter() {
+        {
+            std::lock_guard lock(mutex_);
+            stopping_ = true;
+            cv_.notify_one();
+        }
+        if (thread_.joinable()) thread_.join();
+    }
+    void Run() {
+        for (;;) {
+            Job job;
+            {
+                std::unique_lock lock(mutex_);
+                cv_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
+                if (queue_.empty()) {
+                    if (stopping_) return;
+                    continue;
+                }
+                job = std::move(queue_.front());
+                queue_.pop_front();
+                writing_ = true;
+            }
+            WriteShaderCache(job.file, job.key, job.bytes.data(), job.bytes.size());
+            {
+                std::lock_guard lock(mutex_);
+                writing_ = false;
+                if (queue_.empty()) idle_.notify_all();
+            }
+        }
+    }
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::condition_variable idle_;
+    std::deque<Job> queue_;
+    bool writing_ = false;
+    bool stopping_ = false;
+    std::thread thread_;
+};
+
+void FlushShaderCacheWrites() { ShaderCacheWriter::Get().Flush(); }
+
 uint64_t ShaderCompilerFingerprint() {
     // Taking &D3DCompile can name an import thunk in the executable. Resolve
     // the DLL named by the linked compiler SDK instead of hashing that thunk's module.
@@ -2897,25 +3124,38 @@ const std::filesystem::path& ShaderCacheDirectory() {
     return directory;
 }
 
-ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const char* profile, uint64_t& hash) {
-    // one source can hold several entry points. The shared AO HLSL (and the AO prepass variant of
-    // the generated pixel shaders) has a Vulkan-only branch. Only those sources get the define:
-    // it is part of the cache key, and adding it to every shader would make each player's whole
-    // disk shader cache stale at once.
-    const bool vulkan_split = src.find("TCNYC_VULKAN") != std::string::npos;
-    const std::string source = vulkan_split ? "#define TCNYC_VULKAN 0\n" + src : src;
-    uint64_t profile_seed = Hash(profile, std::strlen(profile));
-    uint64_t entry_seed = Hash(entry, std::strlen(entry), profile_seed);
-    hash = Hash(source.data(), source.size(), entry_seed);
-    // Guest microcode should not create an unbounded cache over a long session.
-    constexpr size_t kMaxShaderBlobs = 4096;
-    if (blobs_.size() >= kMaxShaderBlobs) {
-        LOGW("d3d12: shader cache reached %zu entries, clearing it", blobs_.size());
-        blobs_.clear();
-        shader_src_.clear();
-    }
+// The source and key Compile uses. One source can hold several entry points, and the shared AO
+// HLSL (and the AO prepass variant of the generated pixel shaders) has a Vulkan-only branch. Only
+// those sources get the define: adding it to every shader would make each player's whole disk
+// shader cache stale at once. The AO variant warm below hashes exactly the same way.
+std::string ShaderCacheSource(const std::string& src) {
+    return src.find("TCNYC_VULKAN") != std::string::npos ? "#define TCNYC_VULKAN 0\n" + src : src;
+}
+uint64_t ShaderCacheHash(const std::string& source, const char* entry, const char* profile) {
+    const uint64_t profile_seed = Hash(profile, std::strlen(profile));
+    const uint64_t entry_seed = Hash(entry, std::strlen(entry), profile_seed);
+    return Hash(source.data(), source.size(), entry_seed);
+}
+
+ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const char* profile, uint64_t& hash,
+                              const char* pass) {
+    const std::string source = ShaderCacheSource(src);
+    hash = ShaderCacheHash(source, entry, profile);
+    // Guest microcode should not create an unbounded cache over a long session. AO and TAA add
+    // variants of most world shaders, so the cap is high enough that a session does not clear it
+    // in normal play: clearing would force every cached shader to be read and parsed again.
+    // The cap on the in-memory shader map is enforced at the frame boundary (ApplySettings):
+    // clearing here could free a blob a draw is already holding between its vertex and pixel
+    // shader lookups.
     auto it = blobs_.find(hash);
     if (it != blobs_.end()) return it->second.Get();
+    // The startup warm already decoded this shader from the cache. Take its blob instead of
+    // reading the file and parsing it again on the render thread.
+    if (ComPtr<ID3DBlob> warm = TakeWarmBlob(hash)) {
+        ++g_perf.shader_hits;
+        blobs_[hash] = std::move(warm);
+        return blobs_[hash].Get();
+    }
     ComPtr<ID3DBlob> code;
     ComPtr<ID3DBlob> err;
     std::filesystem::path cache;
@@ -2925,14 +3165,10 @@ ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const
         cache = ShaderCacheDirectory() / name;
         auto bytes = ReadShaderCache(cache, hash);
         if (!bytes.empty()) {
-            ComPtr<ID3D11ShaderReflection> reflection;
-            // mingw's IID_PPV_ARGS wants a __mingw_uuidof specialization its import
-            // libraries do not define; the reflection IID is fixed.
-            static const GUID kShaderReflectionIid = {
-                0x8d536ca1, 0x0cca, 0x4956, {0xa8, 0x37, 0x78, 0x69, 0x63, 0x75, 0x55, 0x84}};
-            if (SUCCEEDED(D3DReflect(bytes.data(), bytes.size(), kShaderReflectionIid,
-                                     reinterpret_cast<void**>(reflection.GetAddressOf()))) &&
-                SUCCEEDED(D3DCreateBlob(bytes.size(), &code))) {
+            // ReadShaderCache already checked the length, the "DXBC" tag and the checksum this
+            // writer stored. Re-parsing the blob with D3DReflect here only repeated that work on
+            // the render thread for every shader the warm threads had already read.
+            if (SUCCEEDED(D3DCreateBlob(bytes.size(), &code))) {
                 std::memcpy(code->GetBufferPointer(), bytes.data(), bytes.size());
                 ++g_perf.shader_hits;
                 blobs_[hash] = code;
@@ -2942,15 +3178,24 @@ ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const
     }
     PerfScope perf_compile{g_perf.compile};
     g_perf.shaders++;
+    const auto compile_started = std::chrono::steady_clock::now();
     HRESULT hr = D3DCompile(source.data(), source.size(), nullptr, nullptr, nullptr, entry, profile,
                             kShaderCompileFlags, 0, &code, &err);
+    const double compile_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - compile_started).count();
     if (FAILED(hr)) {
         LOGE("d3d12: %s compile failed: %s", profile, err ? static_cast<const char*>(err->GetBufferPointer()) : "?");
         LOGE("%s", source.c_str());
         blobs_[hash] = nullptr;
         return nullptr;
     }
-    if (!cache.empty()) WriteShaderCache(cache, hash, code->GetBufferPointer(), code->GetBufferSize());
+    // A compile this slow is a visible hitch; log it so a stutter report can be tied to a shader.
+    if (compile_ms >= 50.0)
+        LOGR("d3d12: %s %s compiled in %.1f ms (%zu bytes, pass %s, key %016llX)",
+             profile, entry, compile_ms, source.size(), pass, static_cast<unsigned long long>(hash));
+    // The write is off the render thread: a burst of new variants should compile, not wait on
+    // filesystem metadata.
+    if (!cache.empty()) ShaderCacheWriter::Get().Enqueue(cache, hash, code->GetBufferPointer(), code->GetBufferSize());
     blobs_[hash] = code;
     return code.Get();
 }
@@ -2979,8 +3224,10 @@ ID3D12PipelineState* D3D12Backend::EnsureBlitPipeline(DXGI_FORMAT rtv, bool over
     if (pso) return pso.Get();
     uint64_t h;
     const std::string text = depth_single ? std::string("#define DEPTH_SINGLE 1\n") + kBlitHlsl : std::string(kBlitHlsl);
-    ID3DBlob* vs = Compile(text, "vs", "vs_5_0", h);
-    ID3DBlob* ps = Compile(text, "psmain", "ps_5_0", h);
+    const char* pass = depth_single ? "fullscreen blit (single-sample depth)" : "fullscreen blit";
+    ID3DBlob* vs = Compile(text, "vs", "vs_5_0", h, pass);
+    ID3DBlob* ps = Compile(text, "psmain", "ps_5_0", h, pass);
+    if (!vs || !ps) return nullptr;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = FullScreenPipelineDesc(vs, ps, rtv);
     d.SampleDesc.Count = samples;
     if (over) {
@@ -3019,14 +3266,14 @@ ID3D12PipelineState* D3D12Backend::EnsureHdrUiPipeline(DXGI_FORMAT rtv) {
 
 // Pass's pipeline for the shader, kept in blit_psos_; null when it can't be made
 ID3D12PipelineState* D3D12Backend::EnsurePassPipeline(const char* hlsl, const char* entry, DXGI_FORMAT rtv,
-                                                      float blend, DXGI_FORMAT rtv2) {
+                                                      float blend, DXGI_FORMAT rtv2, const char* pass) {
     uint64_t seed = uint64_t(rtv2) << 32 | uint64_t(rtv) << 1 | (blend >= 0 ? 1 : 0);
     uint64_t source_seed = Hash(hlsl, std::strlen(hlsl), seed);
     auto& pso = blit_psos_[Hash(entry, std::strlen(entry), source_seed)];
     if (pso) return pso.Get();
     uint64_t h;
-    ID3DBlob* vs = Compile(hlsl, "vs", "vs_5_0", h);
-    ID3DBlob* ps = Compile(hlsl, entry, "ps_5_0", h);
+    ID3DBlob* vs = Compile(hlsl, "vs", "vs_5_0", h, pass);
+    ID3DBlob* ps = Compile(hlsl, entry, "ps_5_0", h, pass);
     if (!vs || !ps) return nullptr;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = FullScreenPipelineDesc(vs, ps, rtv);
     if (rtv2 != DXGI_FORMAT_UNKNOWN) {
@@ -3372,7 +3619,7 @@ HRESULT D3D12Backend::CreatePipeline(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& d
 }
 
 namespace {
-// a temporary file name of its own per write: a background write and the exit save can overlap
+// A temporary file name of its own per write.
 uint64_t NextTempId() {
     static std::atomic<uint64_t> next{0};
     return next++;
@@ -3430,22 +3677,28 @@ void D3D12Backend::OpenPipelineLibrary() {
 // Writes the library once a few seconds pass with no new pipeline (new ones come in bursts, at level loads
 // and new effects), so the copy and the write do not land in the middle of a burst. force writes any change.
 void D3D12Backend::SavePipelineLibrary(bool force) {
+    std::lock_guard save_lock(pso_lib_save_mutex_);
+    if (pso_lib_write_.valid()) {
+        if (!force && pso_lib_write_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+        pso_lib_write_.get();
+    }
     if (!pso_lib_ || !pso_lib_new_) return;
     if (!force && presents_ - pso_lib_quiet_since_ < 300) return;  // 5 s at 60 FPS
     if (!force && warm_running_.load()) return;  // the warm threads are still adding; save once they finish
     std::vector<uint8_t> bytes;
+    uint32_t added;
     {
         std::lock_guard lock(pso_lib_mutex_);
         const size_t size = pso_lib_->GetSerializedSize();
         if (!size || size > kPipelineCacheMaxBytes) return;
         bytes.resize(size);
         if (FAILED(pso_lib_->Serialize(bytes.data(), size))) return;
+        added = pso_lib_new_.exchange(0);
     }
-    const uint32_t added = pso_lib_new_.exchange(0);
     const auto file = ShaderCacheDirectory() / "pipelines.bin";
     // the write is off the render thread (the bytes are a copy, independent of the library), except a forced
     // save at exit, which must finish before the process ends
-    auto write = [file, bytes = std::move(bytes), added] {
+    auto write = [this, file, bytes = std::move(bytes), added] {
         std::error_code ec;
         std::filesystem::create_directories(file.parent_path(), ec);
         auto temporary = file;
@@ -3453,7 +3706,6 @@ void D3D12Backend::SavePipelineLibrary(bool force) {
         ShaderCacheHeader header{kPipelineCacheMagic, 0, bytes.size(), Hash(bytes.data(), bytes.size())};
         {
             std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
-            if (!out) return;
             out.write(reinterpret_cast<const char*>(&header), sizeof(header));
             out.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
             out.close();
@@ -3463,9 +3715,10 @@ void D3D12Backend::SavePipelineLibrary(bool force) {
             }
         }
         std::filesystem::remove(temporary, ec);
+        pso_lib_new_.fetch_add(added);
     };
     if (force) write();
-    else std::thread(std::move(write)).detach();
+    else pso_lib_write_ = std::async(std::launch::async, std::move(write));
 }
 
 ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps) {
@@ -3476,6 +3729,12 @@ ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, ID3DBlob* vs,
         ++g_perf.pso_warm;
         psos_[h] = warm;
         return warm.Get();
+    }
+    // The startup warm may still be running. Tell it not to compile this state a second time
+    // while this thread builds it; the warm thread checks again before it publishes its result.
+    if (warm_running_.load(std::memory_order_relaxed)) {
+        std::lock_guard lock(warm_mutex_);
+        warm_skip_.insert(h);
     }
     D3D12_INPUT_ELEMENT_DESC el[16];
     uint32_t n = FillInputLayout(k, el);
@@ -3508,6 +3767,7 @@ namespace {
 constexpr uint64_t kPipelineKeysMagic = 0x315359454B4F5350ull;  // "PSOKEYS1"
 constexpr size_t kMaxPipelineKeys = 8192;  // kept on disk
 constexpr size_t kMaxWarmPipelines = 4096;  // built at start, the oldest first
+constexpr size_t kMaxWarmBlobs = 4096;      // decoded shaders shared with the render thread (both stages)
 std::filesystem::path PipelineKeysFile() { return ShaderCacheDirectory() / "pipelines.keys"; }
 std::filesystem::path DxbcFile(uint64_t hash) {
     char name[24];
@@ -3548,6 +3808,10 @@ void D3D12Backend::RecordPipelineKey(const PsoKey& k, uint64_t h) {
 // Written like the library, after a quiet spell, off the render thread; past the cap the oldest keys go
 void D3D12Backend::SavePipelineKeys(bool force) {
     std::lock_guard lock(pso_keys_mutex_);
+    if (pso_keys_write_.valid()) {
+        if (!force && pso_keys_write_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+        if (!pso_keys_write_.get()) pso_keys_saved_ = 0;
+    }
     if (pso_keys_.size() == pso_keys_saved_) return;
     if (!force && (presents_ - pso_lib_quiet_since_ < 300 || warm_running_.load())) return;
     if (pso_keys_.size() > kMaxPipelineKeys) {
@@ -3565,16 +3829,19 @@ void D3D12Backend::SavePipelineKeys(bool force) {
         ShaderCacheHeader header{kPipelineKeysMagic, sizeof(PsoKey), bytes, Hash(keys.data(), bytes)};
         {
             std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
-            if (!out) return;
             out.write(reinterpret_cast<const char*>(&header), sizeof(header));
             out.write(reinterpret_cast<const char*>(keys.data()), std::streamsize(bytes));
             out.close();
-            if (out && MoveFileExW(temporary.c_str(), file.c_str(), MOVEFILE_REPLACE_EXISTING)) return;
+            if (out && MoveFileExW(temporary.c_str(), file.c_str(), MOVEFILE_REPLACE_EXISTING)) return true;
         }
         std::filesystem::remove(temporary, ec);
+        return false;
     };
-    if (force) write();  // at exit: finish before the process ends
-    else std::thread(std::move(write)).detach();
+    if (force) {
+        if (!write()) pso_keys_saved_ = 0;
+    } else {
+        pso_keys_write_ = std::async(std::launch::async, std::move(write));
+    }
 }
 
 // TCNYC_PIPELINE_WARM=0 turns it off
@@ -3607,11 +3874,64 @@ void D3D12Backend::StopPipelineWarm() {
     warm_threads_.clear();
 }
 
+// Build a pipeline from saved or freshly compiled shaders, through the kept library when it has
+// it. Safe on the warm threads and the AO worker: the device, the library (under its mutex) and
+// FillPipelineDesc are thread safe. It deliberately does not touch the render thread's counters.
+bool D3D12Backend::BuildWarmPipeline(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps,
+                                     ComPtr<ID3D12PipelineState>& out) {
+    D3D12_INPUT_ELEMENT_DESC el[16];
+    const uint32_t n = FillInputLayout(k, el);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
+    d.InputLayout = {el, n};
+    FillPipelineDesc(k, vs, ps, d);
+    if (pso_lib_) {
+        const std::wstring name = PipelineName(d);
+        bool loaded;
+        {
+            std::lock_guard lock(pso_lib_mutex_);
+            loaded = SUCCEEDED(pso_lib_->LoadGraphicsPipeline(name.c_str(), &d, IID_PPV_ARGS(&out)));
+        }
+        if (!loaded) {
+            out.Reset();
+            if (SUCCEEDED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&out)))) {
+                std::lock_guard lock(pso_lib_mutex_);
+                if (SUCCEEDED(pso_lib_->StorePipeline(name.c_str(), out.Get()))) ++pso_lib_new_;
+            }
+        }
+    } else if (FAILED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&out)))) {
+        out.Reset();
+    }
+    return out != nullptr;
+}
+
 // One warm thread: the device, the pipeline library and FillPipelineDesc are safe to use from several threads;
-// the shaders come from the disk cache, never through Compile
+// the shaders come from the disk cache (or another warm thread), never through Compile
 void D3D12Backend::WarmPipelines() {
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    // Lowest priority: these are speculative, and the render thread's own compiles must win.
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
     const auto started = std::chrono::steady_clock::now();
+    // Decode a saved shader, sharing it with the other warm threads and the render thread. The
+    // render thread takes the entry out of warm_blobs_ instead of reading and parsing the file
+    // again; a second warm thread reuses it rather than reading the same shader twice.
+    auto load_blob = [&](uint64_t hash) -> ComPtr<ID3DBlob> {
+        {
+            std::lock_guard lock(warm_mutex_);
+            auto it = warm_blobs_.find(hash);
+            if (it != warm_blobs_.end()) return it->second;
+        }
+        const auto bytes = ReadShaderCache(DxbcFile(hash), hash);
+        ComPtr<ID3DBlob> blob;
+        if (bytes.empty() || FAILED(D3DCreateBlob(bytes.size(), &blob))) return {};
+        std::memcpy(blob->GetBufferPointer(), bytes.data(), bytes.size());
+        {
+            std::lock_guard lock(warm_mutex_);
+            if (warm_blobs_.size() < kMaxWarmBlobs) {
+                auto [it, inserted] = warm_blobs_.emplace(hash, blob);
+                if (!inserted) return it->second;
+            }
+        }
+        return blob;
+    };
     while (!warm_stop_.load(std::memory_order_relaxed)) {
         const size_t i = warm_next_.fetch_add(1);
         if (i >= warm_keys_.size()) break;
@@ -3619,42 +3939,18 @@ void D3D12Backend::WarmPipelines() {
         const uint64_t h = Hash(&k, sizeof(k));
         {
             std::lock_guard lock(warm_mutex_);
-            if (warm_psos_.count(h)) continue;
+            // already built here, or the render thread built it while the warm threads ran
+            if (warm_psos_.count(h) || warm_skip_.count(h)) continue;
         }
-        const auto vs_bytes = ReadShaderCache(DxbcFile(k.vs), k.vs);
-        const auto ps_bytes = ReadShaderCache(DxbcFile(k.ps), k.ps);
-        ComPtr<ID3DBlob> vs, ps;
-        if (vs_bytes.empty() || ps_bytes.empty() || FAILED(D3DCreateBlob(vs_bytes.size(), &vs)) ||
-            FAILED(D3DCreateBlob(ps_bytes.size(), &ps))) continue;
-        std::memcpy(vs->GetBufferPointer(), vs_bytes.data(), vs_bytes.size());
-        std::memcpy(ps->GetBufferPointer(), ps_bytes.data(), ps_bytes.size());
-        D3D12_INPUT_ELEMENT_DESC el[16];
-        const uint32_t n = FillInputLayout(k, el);
-        D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
-        d.InputLayout = {el, n};
-        FillPipelineDesc(k, vs.Get(), ps.Get(), d);
+        ComPtr<ID3DBlob> vs = load_blob(k.vs);
+        ComPtr<ID3DBlob> ps = load_blob(k.ps);
+        if (!vs || !ps) continue;
         ComPtr<ID3D12PipelineState> pso;
-        if (pso_lib_) {
-            const std::wstring name = PipelineName(d);
-            bool loaded;
-            {
-                std::lock_guard lock(pso_lib_mutex_);
-                loaded = SUCCEEDED(pso_lib_->LoadGraphicsPipeline(name.c_str(), &d, IID_PPV_ARGS(&pso)));
-            }
-            if (!loaded) {
-                pso.Reset();
-                if (SUCCEEDED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)))) {
-                    std::lock_guard lock(pso_lib_mutex_);
-                    if (SUCCEEDED(pso_lib_->StorePipeline(name.c_str(), pso.Get()))) ++pso_lib_new_;
-                }
-            }
-        } else if (FAILED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)))) {
-            pso.Reset();
-        }
-        if (!pso) continue;
+        if (!BuildWarmPipeline(k, vs.Get(), ps.Get(), pso)) continue;
         ++warm_built_;
         std::lock_guard lock(warm_mutex_);
-        warm_psos_.emplace(h, std::move(pso));
+        // the render thread may have built it after our check above; do not hold a second copy
+        if (!warm_skip_.count(h)) warm_psos_.emplace(h, std::move(pso));
     }
     if (warm_running_.fetch_sub(1) == 1 && !warm_stop_) {
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started);
@@ -3664,13 +3960,255 @@ void D3D12Backend::WarmPipelines() {
 }
 
 ComPtr<ID3D12PipelineState> D3D12Backend::TakeWarmPipeline(uint64_t h) {
-    if (warm_keys_.empty()) return {};
+    // (warm_keys_ may be empty: the AO worker below adds pipelines of its own)
     std::lock_guard lock(warm_mutex_);
     auto it = warm_psos_.find(h);
     if (it == warm_psos_.end()) return {};
     ComPtr<ID3D12PipelineState> pso = std::move(it->second);
     warm_psos_.erase(it);
     return pso;
+}
+
+// A shader the warm threads decoded from the disk cache, handed to the render thread's Compile
+// so it does not have to open and parse the same file again.
+ComPtr<ID3DBlob> D3D12Backend::TakeWarmBlob(uint64_t h) {
+    std::lock_guard lock(warm_mutex_);
+    auto it = warm_blobs_.find(h);
+    if (it == warm_blobs_.end()) return {};
+    ComPtr<ID3DBlob> blob = std::move(it->second);
+    warm_blobs_.erase(it);
+    return blob;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Progressive ambient occlusion variants
+
+// The prepass pipeline for an AO receiver: depth plus the R32F view distance, no blend, red only,
+// no stencil, at the sample count the AO targets actually use. Shared by the draw path and the
+// background warm so the two can never derive different keys.
+PsoKey D3D12Backend::AoDepthPsoKey(const PsoKey& k, uint64_t ps) {
+    PsoKey dk = k;
+    dk.ps = ps;
+    dk.has_rt = 1;
+    dk.rtfmt = kAoDistFormat;
+    dk.blend = dk.src = dk.dst = dk.op = 0;
+    dk.wmask = 1;  // red
+    dk.motion = 0;
+    dk.samples = PickAoSamples(k.samples);
+    dk.a2c = dk.samples > 1 ? k.a2c : 0;
+    dk.sten = dk.sfunc = dk.smask = dk.swmask = dk.sfail = dk.szfail = dk.spass = 0;
+    return dk;
+}
+
+// Worker-side shader fetch for a scheduled AO variant: the shared warm cache, then the disk cache,
+// then the compiler. The source and hash were generated on the render thread, so this cannot
+// derive a different variant than the draw path will later ask for.
+ComPtr<ID3DBlob> D3D12Backend::AoLoadPixelShader(const std::string& source, uint64_t hash) {
+    {
+        std::lock_guard lock(warm_mutex_);
+        auto it = warm_blobs_.find(hash);
+        if (it != warm_blobs_.end()) return it->second;
+    }
+    const std::filesystem::path& dir = ShaderCacheDirectory();
+    std::filesystem::path cache;
+    if (!dir.empty()) {
+        char name[24];
+        std::snprintf(name, sizeof(name), "%016llX.dxbc", static_cast<unsigned long long>(hash));
+        cache = dir / name;
+        const auto bytes = ReadShaderCache(cache, hash);
+        ComPtr<ID3DBlob> code;
+        if (!bytes.empty() && SUCCEEDED(D3DCreateBlob(bytes.size(), &code))) {
+            std::memcpy(code->GetBufferPointer(), bytes.data(), bytes.size());
+            std::lock_guard lock(warm_mutex_);
+            if (warm_blobs_.size() < kMaxWarmBlobs) warm_blobs_.emplace(hash, code);
+            return code;
+        }
+    }
+    ComPtr<ID3DBlob> code;
+    ComPtr<ID3DBlob> err;
+    HRESULT hr = D3DCompile(source.data(), source.size(), nullptr, nullptr, nullptr, "main", "ps_5_0",
+                            kShaderCompileFlags, 0, &code, &err);
+    if (FAILED(hr)) {
+        LOGE("d3d12: AO pixel variant compile failed: %s",
+             err ? static_cast<const char*>(err->GetBufferPointer()) : "?");
+        return {};
+    }
+    if (!cache.empty())
+        ShaderCacheWriter::Get().Enqueue(cache, hash, code->GetBufferPointer(), code->GetBufferSize());
+    {
+        std::lock_guard lock(warm_mutex_);
+        if (warm_blobs_.size() < kMaxWarmBlobs) warm_blobs_.emplace(hash, code);
+    }
+    return code;
+}
+
+// The pixel program and the remaining pipeline state jointly identify a warm variant.
+static uint64_t AoVariantId(const PsoKey& key, uint64_t pixel) {
+    static_assert(offsetof(PsoKey, regs) == 2 * sizeof(uint64_t));
+    const auto* state = reinterpret_cast<const uint8_t*>(&key) + offsetof(PsoKey, regs);
+    constexpr size_t size = offsetof(PsoKey, motion) + sizeof(key.motion) - offsetof(PsoKey, regs);
+    return Hash(state, size, Hash(&key.vs, sizeof(key.vs), pixel));
+}
+
+bool D3D12Backend::AoColorReady(uint64_t base) { return ao_color_ready_view_.count(base) != 0; }
+
+bool D3D12Backend::AoDepthReady(uint64_t base) { return ao_depth_ready_view_.count(base) != 0; }
+
+// Publish worker progress at a frame boundary.
+void D3D12Backend::RefreshAoReadyView() {
+    std::lock_guard lock(ao_mutex_);
+    if (ao_color_ready_view_ != ao_color_ready_) ao_color_ready_view_ = ao_color_ready_;
+    if (ao_depth_ready_view_ != ao_depth_ready_) ao_depth_ready_view_ = ao_depth_ready_;
+}
+
+// Queue the AO variants a draw needs. The HLSL and the pipeline keys are made here, on the render
+// thread (the generated shader code and the extension hooks are render-thread state); the worker
+// only compiles and builds. Sources are cached per base pixel key: a scene uses one shader with
+// many blend/depth states, so the same source is reused while each state gets its own pipeline.
+void D3D12Backend::ScheduleAoVariants(const PixelKey& base, const PsoKey& k, ID3DBlob* vs, bool color,
+                                      bool depth) {
+    if ((!color && !depth) || !vs) return;
+    if (k.topo == uint32_t(Topology::Points) || k.topo == uint32_t(Topology::Lines)) return;
+    const uint64_t base_hash = Hash(&base, sizeof(base));
+    AoWarmJob job;
+    if (color) job.color_id = AoVariantId(k, base_hash);
+    if (depth) {
+        PixelKey depth_pixel = base;
+        depth_pixel.motion = 0;
+        job.depth_id = AoVariantId(AoDepthPsoKey(k, 0), Hash(&depth_pixel, sizeof(depth_pixel)));
+    }
+    {
+        std::lock_guard lock(ao_mutex_);
+        if (ao_jobs_.size() >= 256) return;
+        color = color && !ao_color_ready_.count(job.color_id) && ao_scheduled_color_.insert(job.color_id).second;
+        depth = depth && !ao_depth_ready_.count(job.depth_id) && ao_scheduled_depth_.insert(job.depth_id).second;
+    }
+    if (!color && !depth) return;
+    job.vs = vs;
+    AoVariantSource source;
+    auto it = ao_sources_.find(base_hash);
+    if (it != ao_sources_.end()) source = it->second;  // copied: the job may outlive the cache entry
+    // A base shader can first be needed only as a receiver (alpha colour pass) and later also as a
+    // depth writer (the depth-only pass). Fill in whichever variant the cached source lacks.
+    if (color && source.color_hash == 0) {
+        PixelKey p = base;
+        p.ao = 1;
+        source.color_src = ShaderCacheSource(PixelHlsl(p));
+        source.color_hash = ShaderCacheHash(source.color_src, "main", "ps_5_0");
+    }
+    if (depth && source.depth_hash == 0) {
+        PixelKey p = base;
+        p.ao = 3;
+        p.motion = 0;
+        source.depth_src = ShaderCacheSource(PixelHlsl(p));
+        source.depth_hash = ShaderCacheHash(source.depth_src, "main", "ps_5_0");
+    }
+    if (ao_sources_.size() < 1024) ao_sources_[base_hash] = source;
+    if (color) {
+        job.has_color = true;
+        job.color_src = std::move(source.color_src);  // the cache kept a copy above
+        job.color_hash = source.color_hash;
+        job.color_key = k;
+        job.color_key.ps = source.color_hash;
+    }
+    if (depth) {
+        job.has_depth = true;
+        job.depth_src = std::move(source.depth_src);
+        job.depth_hash = source.depth_hash;
+        job.depth_key = AoDepthPsoKey(k, source.depth_hash);
+    }
+    {
+        std::lock_guard lock(ao_mutex_);
+        ao_jobs_.push_back(std::move(job));
+    }
+    ao_cv_.notify_all();
+    static std::atomic<bool> announced{false};
+    if (!announced.exchange(true))
+        LOGR("d3d12: warming ambient occlusion shader variants in the background");
+    if (!ao_started_.load(std::memory_order_acquire)) StartAoWarm();
+}
+
+void D3D12Backend::StartAoWarm() {
+    // called for every variant: an atomic first, so the common case does not take the queue's mutex
+    if (ao_started_.load(std::memory_order_acquire)) return;
+    std::lock_guard lock(ao_mutex_);
+    if (ao_threads_.empty() && !ao_stop_) {
+        const unsigned cores = std::max(1u, std::thread::hardware_concurrency());
+        const uint32_t threads = uint32_t(std::clamp<unsigned>(cores > 2 ? cores - 2 : 1, 1, 3));
+        for (uint32_t i = 0; i < threads; i++) ao_threads_.emplace_back([this] { AoWarmWorker(); });
+        LOGR("d3d12: AO variant worker started on %u threads", threads);
+    }
+    ao_started_.store(true, std::memory_order_release);
+}
+
+void D3D12Backend::StopAoWarm() {
+    {
+        std::lock_guard lock(ao_mutex_);
+        ao_stop_ = true;
+        ao_jobs_.clear();  // do not drain a long queue at exit; a lost warm entry is harmless
+    }
+    ao_cv_.notify_all();
+    for (auto& t : ao_threads_)
+        if (t.joinable()) t.join();
+    ao_threads_.clear();
+}
+
+void D3D12Backend::AoWarmWorker() {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+    for (;;) {
+        AoWarmJob job;
+        {
+            std::unique_lock lock(ao_mutex_);
+            ao_cv_.wait(lock, [this] { return ao_stop_ || !ao_jobs_.empty(); });
+            if (ao_jobs_.empty()) {
+                if (ao_stop_) return;
+                continue;
+            }
+            job = std::move(ao_jobs_.front());
+            ao_jobs_.pop_front();
+        }
+        bool color_ok = false, depth_ok = false;
+        if (job.has_color) {
+            ComPtr<ID3DBlob> ps = AoLoadPixelShader(job.color_src, job.color_hash);
+            ComPtr<ID3D12PipelineState> pso;
+            if (ps && BuildWarmPipeline(job.color_key, job.vs.Get(), ps.Get(), pso)) {
+                const uint64_t h = Hash(&job.color_key, sizeof(job.color_key));
+                {
+                    std::lock_guard lock(warm_mutex_);
+                    warm_psos_.emplace(h, pso);
+                }
+                color_ok = true;
+            } else if (ps) {
+                static std::atomic<int> logged{0};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+                    LOGE("d3d12: AO receiver pipeline failed; those draws stay without AO");
+            }
+        }
+        if (job.has_depth) {
+            ComPtr<ID3DBlob> ps = AoLoadPixelShader(job.depth_src, job.depth_hash);
+            ComPtr<ID3D12PipelineState> pso;
+            if (ps && BuildWarmPipeline(job.depth_key, job.vs.Get(), ps.Get(), pso)) {
+                const uint64_t h = Hash(&job.depth_key, sizeof(job.depth_key));
+                {
+                    std::lock_guard lock(warm_mutex_);
+                    warm_psos_.emplace(h, pso);
+                }
+                depth_ok = true;
+            } else if (ps) {
+                static std::atomic<int> logged{0};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+                    LOGE("d3d12: AO depth pipeline failed; those draws stay without AO");
+            }
+        }
+        // Ready only once the shader and its pipeline are both in the handoff maps above, so the
+        // next draw that sees this variant takes both without compiling anything.
+        {
+            std::lock_guard lock(ao_mutex_);
+            if (color_ok) ao_color_ready_.insert(job.color_id);
+            if (depth_ok) ao_depth_ready_.insert(job.depth_id);
+        }
+        if (color_ok || depth_ok) ++ao_built_;
+    }
 }
 
 TexKind TextureKind(const TextureDesc& d) {
@@ -3700,7 +4238,7 @@ bool ProjectedLookup(const State& s, int stage) {
 void D3D12Backend::NoteShadowImage(const State& s, int stage, const Target& t, DrawTextures& stages) {
     // square (the shadow image is 256x256; HUD icons and other small targets are not), and read in the scene with a
     // projected lookup (the glow image, also 256x256, is read flat)
-    if (t.depth || t.gw != t.gh || t.gw < 64 || t.gw >= guest_h_ || depth_drawn_.count(t.data)) return;
+    if (t.depth || t.gw != t.gh || t.gw < 64 || t.gw >= guest_h_ || t.has_depth) return;
     const bool scene_read = draw_rt_ && draw_ds_ && s.rs[kRsZEnable] && draw_rt_->gw >= guest_w_ &&
                             draw_rt_->gh >= guest_h_ && ProjectedLookup(s, stage);
     if (scene_read) {
@@ -4076,6 +4614,8 @@ D3D12_SAMPLER_DESC StageSampler(const State& s, int i, const DrawTextures& stage
     sd.MipLODBias = Bits(t[kTssMipLodBias]);
     sd.MinLOD = float(t[kTssMaxMipLevel]);
     sd.MaxLOD = mip ? D3D12_FLOAT32_MAX : sd.MinLOD;
+    static const bool force_mip0 = std::getenv("XBE_FORCE_MIP0") != nullptr;  // diagnostic: top level only
+    if (force_mip0) sd.MaxLOD = sd.MinLOD;
     Color(t[kTssBorderColor], sd.BorderColor);
     if (stages.info[i].shadow) {
         // the console tests texel OP r, D3D12 tests r OP texel; with both reversed (g_reversed_depth) it is the same OP
@@ -4091,25 +4631,34 @@ uint32_t D3D12Backend::EnsureStageSamplers(const State& s, const DrawTextures& s
     D3D12_SAMPLER_DESC sd[4];
     uint32_t aniso = render_.aniso;
     for (int i = 0; i < 4; i++) sd[i] = StageSampler(s, i, stages, clamp, aniso);
+    // consecutive draws usually ask for the same four samplers: one memcmp beats hashing and probing
+    if (last_sampler_slot_ != UINT32_MAX && std::memcmp(sd, last_sampler_sd_, sizeof(sd)) == 0) return last_sampler_slot_;
     uint64_t key = Hash(sd, sizeof(sd));
     const uint32_t frame_index = uint32_t(frame_ % kFrames);
     auto& cache = samplers_[frame_index];
     auto it = cache.find(key);
-    if (it != cache.end()) return it->second;
+    if (it != cache.end()) {
+        last_sampler_slot_ = it->second;
+        std::memcpy(last_sampler_sd_, sd, sizeof(sd));
+        return it->second;
+    }
     const uint32_t start = frame_index * kSamplersPerFrame;
     const uint32_t end = start + kSamplersPerFrame;
     Frame& f = CurrentFrame();
     if (f.smp < start) f.smp = start;
     if (f.smp + 4 > end) {
         // The frame's sampler region is full. Reusing slot 0 would rewrite descriptors an earlier
-        // draw in the same command list still references; use a fixed fallback set instead.
-        LOG_FIRST(4, "d3d12: sampler ring full within a frame, using the first set");
-        return 0;
+        // draw in the same command list still references; use the permanent fallback set instead.
+        LOG_FIRST(4, "d3d12: sampler ring full within a frame, using the fallback set");
+        last_sampler_slot_ = UINT32_MAX;  // do not memoise it: the fallback is not this draw's set
+        return kFallbackSamplers;
     }
     uint32_t base = f.smp;
     f.smp += 4;
     for (int i = 0; i < 4; i++) dev_->CreateSampler(&sd[i], Cpu(smp_heap_.Get(), base + i, smp_inc_));
     cache[key] = base;
+    last_sampler_slot_ = base;
+    std::memcpy(last_sampler_sd_, sd, sizeof(sd));
     return base;
 }
 
@@ -4176,9 +4725,13 @@ std::string VertexHlsl(const State& s, const Assembled& a, const DrawShaders& sh
 void D3D12Backend::EnsureVertexShader(const State& s, const Assembled& a, DrawShaders& sh) {
     auto vit = shader_src_.find(sh.vkey);
     if (vit != shader_src_.end()) {
-        sh.vs_code = blobs_[vit->second].Get();
-        sh.vh = vit->second;
-        return;
+        auto bit = blobs_.find(vit->second);
+        if (bit != blobs_.end()) {
+            sh.vs_code = bit->second.Get();
+            sh.vh = vit->second;
+            return;
+        }
+        shader_src_.erase(vit);  // the blob cache was cleared; compile the program again
     }
     std::string src = ReversedDepthHlsl(VertexHlsl(s, a, sh));
     sh.vs_code = Compile(sh.quad ? QuadHlsl(std::move(src)) : src, "main", "vs_5_0", sh.vh);
@@ -4206,9 +4759,13 @@ void D3D12Backend::EnsurePixelShader(const PixelKey& pk, DrawShaders& sh) {
     // pixel shaders share the map with vertex shaders, the salt keeps their keys apart
     auto pit = shader_src_.find(sh.pkey ^ kPixelKeySalt);
     if (pit != shader_src_.end()) {
-        sh.ps_code = blobs_[pit->second].Get();
-        sh.ph = pit->second;
-        return;
+        auto bit = blobs_.find(pit->second);
+        if (bit != blobs_.end()) {
+            sh.ps_code = bit->second.Get();
+            sh.ph = pit->second;
+            return;
+        }
+        shader_src_.erase(pit);  // the blob cache was cleared; compile the shader again
     }
     sh.ps_code = Compile(PixelHlsl(pk), "main", "ps_5_0", sh.ph);
     shader_src_[sh.pkey ^ kPixelKeySalt] = sh.ph;
@@ -4253,14 +4810,17 @@ void D3D12Backend::KeyDepthStencil(const State& s, const Assembled& a, PsoKey& k
         k.spass = SimpleState(s, kMStencilPass);
     }
     // polygon offset: the slope here, toward the camera is up on reversed depth; the units are in ReversedDepthHlsl
-    if (OffsetsPolygons(s, a.topology)) k.zslope = -HostSlopeScale(s, bound_ds_);
+    if (OffsetsPolygons(s, a.topology)) {
+        const float slope = HostSlopeScale(s, bound_ds_);
+        if (std::isfinite(slope) && slope != 0.0f) k.zslope = -slope;
+    }
 }
 
 void KeyRasterizer(const State& s, const Assembled& a, PsoKey& k) {
     uint32_t cull = s.rs[kRsCullMode];
     k.cull = cull != 0 && a.topology == Topology::Triangles;
     k.ccw = cull == kCullCw;  // culling clockwise leaves counter clockwise as the front
-    k.fill = s.rs[kRsFillMode];
+    k.fill = s.rs[kRsFillMode] == kFillWireframe ? kFillWireframe : 0;
 }
 
 void D3D12Backend::BuildPipelineKey(const State& s, const Assembled& a, uint64_t vh, uint64_t ph, PsoKey& k) {
@@ -4837,15 +5397,28 @@ uint32_t D3D12Backend::EnsureViewSet(const DrawTextures& stages) {
     if (view_sets_frame_ != frame_) {
         view_sets_.clear();
         view_sets_frame_ = frame_;
+        last_views_slot_ = UINT32_MAX;
     }
+    // consecutive draws mostly sample the same four views: one memcmp beats two hashes and a probe
+    if (last_views_slot_ != UINT32_MAX && std::memcmp(stages.sv, last_views_sv_, sizeof(stages.sv)) == 0 &&
+        std::memcmp(stages.res, last_views_res_, sizeof(stages.res)) == 0)
+        return last_views_slot_;
     uint64_t key = Hash(stages.sv, sizeof(stages.sv), Hash(stages.res, sizeof(stages.res)));
     auto it = view_sets_.find(key);
-    if (it != view_sets_.end()) return it->second;
+    if (it != view_sets_.end()) {
+        last_views_slot_ = it->second;
+        std::memcpy(last_views_sv_, stages.sv, sizeof(stages.sv));
+        std::memcpy(last_views_res_, stages.res, sizeof(stages.res));
+        return it->second;
+    }
     uint32_t slot = AllocSrvSlots(4);
     for (int i = 0; i < 4; i++) {
         dev_->CreateShaderResourceView(stages.res[i], &stages.sv[i], Cpu(srv_heap_.Get(), slot + i, srv_inc_));
     }
     view_sets_[key] = slot;
+    last_views_slot_ = slot;
+    std::memcpy(last_views_sv_, stages.sv, sizeof(stages.sv));
+    std::memcpy(last_views_res_, stages.res, sizeof(stages.res));
     return slot;
 }
 
@@ -4938,33 +5511,45 @@ D3D_PRIMITIVE_TOPOLOGY PrimitiveTopology(const Assembled& a) {
     return a.strip ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 }
 
-bool D3D12Backend::UploadVertexBuffers(const Assembled& a) {
-    D3D12_VERTEX_BUFFER_VIEW vbv[16];
+// Uploads a draw's streams and its index list as one ring block: one allocation and one memcpy per
+// buffer instead of an allocation and its bookkeeping for each.
+bool D3D12Backend::UploadGeometry(const Assembled& a, D3D12_VERTEX_BUFFER_VIEW* vbv,
+                                  D3D12_INDEX_BUFFER_VIEW* ibv) {
+    const uint32_t ibytes = a.index_count ? a.index_count * (a.index16 ? 2u : 4u) : 0;
+    uint64_t offs[16] = {};
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < a.buffer_count; i++) {
+        offs[i] = (total + 15) & ~uint64_t(15);
+        total = offs[i] + a.buffers[i].bytes;
+    }
+    const uint64_t ib_off = (total + 15) & ~uint64_t(15);
+    total = ib_off + ibytes;
+    Alloc block = Upload(total, 16);
+    if (!block.res) return false;
     for (uint32_t i = 0; i < a.buffer_count; i++) {
         const VertexBuffer& b = a.buffers[i];
-        Alloc vb = Upload(b.bytes, 16);
-        if (!vb.res) return false;
-        std::memcpy(vb.cpu, b.src, b.bytes);
-        vbv[i] = {vb.gpu, b.bytes, b.stride};
+        std::memcpy(block.cpu + offs[i], b.src, b.bytes);
+        vbv[i] = {block.gpu + offs[i], b.bytes, b.stride};
     }
-    Cmd()->IASetVertexBuffers(0, a.buffer_count, vbv);
-    last_draw_.vb_count = std::min<uint32_t>(a.buffer_count, 16);
-    std::memcpy(last_draw_.vbv, vbv, last_draw_.vb_count * sizeof(vbv[0]));
+    if (ibytes) {
+        std::memcpy(block.cpu + ib_off, a.index_src, ibytes);
+        *ibv = {block.gpu + ib_off, ibytes, a.index16 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT};
+    }
     return true;
 }
 
 void D3D12Backend::DrawGeometry(const Assembled& a) {
     last_draw_.ok = false;
-    if (!UploadVertexBuffers(a)) return;
+    D3D12_VERTEX_BUFFER_VIEW vbv[16];
+    D3D12_INDEX_BUFFER_VIEW ibv{};
+    if (!UploadGeometry(a, vbv, &ibv)) return;
+    Cmd()->IASetVertexBuffers(0, a.buffer_count, vbv);
+    last_draw_.vb_count = std::min<uint32_t>(a.buffer_count, 16);
+    std::memcpy(last_draw_.vbv, vbv, last_draw_.vb_count * sizeof(vbv[0]));
     D3D_PRIMITIVE_TOPOLOGY topology = PrimitiveTopology(a);
     if (topology != binds_.topology) Cmd()->IASetPrimitiveTopology(topology);
     binds_.topology = topology;
     if (a.index_count) {
-        uint32_t ibytes = a.index_count * (a.index16 ? 2 : 4);
-        Alloc ib = Upload(ibytes, 4);
-        if (!ib.res) return;
-        std::memcpy(ib.cpu, a.index_src, ibytes);
-        D3D12_INDEX_BUFFER_VIEW ibv{ib.gpu, ibytes, a.index16 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT};
         Cmd()->IASetIndexBuffer(&ibv);
         Cmd()->DrawIndexedInstanced(a.index_count, 1, 0, a.base_vertex, 0);
         last_draw_.ibv = ibv;
@@ -5048,6 +5633,7 @@ void D3D12Backend::DeliverReports() {
     constexpr uint32_t kCount = 8;
     constexpr uint32_t kStatus = 12;
     uint64_t done = fence_->GetCompletedValue();
+    if (done == UINT64_MAX) return;
     while (!reports_.empty() && reports_.front().fence <= done) {
         const Report& r = reports_.front();
         double pixels = 0;
@@ -5140,7 +5726,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     }
     // Keep a margin for this draw's texture views and any resolves/uploads below; a wrap
     // would alias descriptors already recorded, including those in pending bundles.
-    if (CurrentFrame().srv + 48 > kSrvCount / kFrames) {
+    if (CurrentFrame().srv + 48 > kSrvPerFrame) {
         if (defer_scene_ && !bundle_) FlushDeferredScene();
         Submit(true);
     }
@@ -5268,7 +5854,6 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     }
     PixelKey pk = MakePixelKey(s, stages.info);
     pk.quad = sh.quad;
-    pk.ao = ao_receiver ? 1 : 0;
     // The guest HUD is composited into the scene before Present. Mark its alpha-blended
     // screen-space draws so Native AA can preserve those pixels from the current frame.
     const auto& hud_texture = stages.desc[0];
@@ -5285,6 +5870,35 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
                           BlendOp(SimpleState(s, kMBlendOp)) == D3D12_BLEND_OP_ADD &&
                           (SimpleState(s, kMColorWriteEnable) & 0x010101);
     pk.motion = prev_consts ? 1 : fsr_hud ? 2 : reactive ? 3 : 0;
+    // Progressive AO: apply the AO variant only once its shader and pipeline are ready. Until
+    // then this draw uses the game's shader and is scheduled to the background worker below.
+    // Points and lines add a geometry shader through Compile, which is the render thread's alone,
+    // so they keep the direct path (a handful of thin draws is not a compile burst).
+    const bool ao_progressive = a.topology != Topology::Points && a.topology != Topology::Lines;
+    PsoKey k;
+    BuildPipelineKey(s, a, sh.vh, 0, k);
+    k.sprite = sh.sprite;
+    const uint32_t motion_bound = k.motion;
+    k.motion |= pk.motion == 3 ? kReactiveWrite : pk.motion ? kMotionWrite : 0u;
+
+    PixelKey pk_base;
+    bool ao_color_pending = false, ao_depth_pending = false;
+    if (defer_now && ao_progressive && render_.ao != 0 && (ao_receiver || opaque)) {
+        pk_base = pk;
+        pk_base.ao = 0;
+        const uint64_t ao_base = Hash(&pk_base, sizeof(pk_base));
+        if (ao_receiver && !AoColorReady(AoVariantId(k, ao_base))) {
+            ao_receiver = false;
+            ao_color_pending = true;
+        }
+        if (opaque) {
+            PixelKey depth_pixel = pk_base;
+            depth_pixel.motion = 0;
+            const uint64_t id = AoVariantId(AoDepthPsoKey(k, 0), Hash(&depth_pixel, sizeof(depth_pixel)));
+            ao_depth_pending = !AoDepthReady(id);
+        }
+    }
+    pk.ao = ao_receiver ? 1 : 0;
     sh.pkey = Hash(&pk, sizeof(pk));
     EnsurePixelShader(pk, sh);
     if (ao_receiver && !sh.ps_code) {
@@ -5298,6 +5912,12 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     if (pk.motion && !sh.ps_code) {  // the motion variant failed to compile: draw it without motion
         LOG_FIRST(4, "d3d12: TAA motion pixel shader failed, drawing without motion");
         pk.motion = 0;
+        if (ao_progressive && defer_now) {
+            ao_color_pending = ao_color_pending || ao_receiver;
+            ao_receiver = false;
+            pk.ao = 0;
+            ao_depth_pending = opaque;
+        }
         sh.pkey = Hash(&pk, sizeof(pk));
         EnsurePixelShader(pk, sh);
         sh.motion = false;
@@ -5307,20 +5927,19 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     }
     if (!sh.vs_code || !sh.ps_code) return;
 
-    // pipeline
-    PsoKey k;
-    BuildPipelineKey(s, a, sh.vh, sh.ph, k);
-    k.sprite = sh.sprite;
-    if (pk.motion == 3) {
-        k.motion |= kReactiveWrite;
-        if (trace_motion) motion_trace_["reactive"]++;
-    } else if (pk.motion) {
-        k.motion |= kMotionWrite;
-    }
+    k.vs = sh.vh;
+    k.ps = sh.ph;
+    k.motion = motion_bound | (pk.motion == 3 ? kReactiveWrite : pk.motion ? kMotionWrite : 0u);
+    if (pk.motion == 3 && trace_motion) motion_trace_["reactive"]++;
+    if (ao_color_pending || ao_depth_pending) pk_base.motion = pk.motion;
+    // Queue whichever AO variants this draw still needs. Done after the pipeline key is final so
+    // the worker builds exactly the keys the next draw will look up.
+    if (defer_now && (ao_color_pending || ao_depth_pending))
+        ScheduleAoVariants(pk_base, k, sh.vs_code, ao_color_pending, ao_depth_pending);
     ID3D12PipelineState* pso = EnsurePipeline(k, sh.vs_code, sh.ps_code);
     if (!pso) return;
     depth_replay_ = {};
-    if (defer_now && opaque) {
+    if (defer_now && opaque && !ao_depth_pending) {
         // The same draw for the AO depth prepass: depth plus its view distance (clip w) into the
         // R32F distance target, through the pixel shader's distance variant so alpha tests and
         // discards still apply. No stencil: the AO depth's stencil is always 0, so the game's
@@ -5332,14 +5951,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         dsh.pkey = Hash(&dpk, sizeof(dpk));
         EnsurePixelShader(dpk, dsh);
         if (dsh.ps_code) {
-            PsoKey dk = k;
-            dk.ps = dsh.ph;
-            dk.has_rt = 1;
-            dk.rtfmt = kAoDistFormat;
-            dk.blend = dk.src = dk.dst = dk.op = 0;
-            dk.wmask = 1;  // red
-            dk.motion = 0;
-            dk.sten = dk.sfunc = dk.smask = dk.swmask = dk.sfail = dk.szfail = dk.spass = 0;
+            const PsoKey dk = AoDepthPsoKey(k, dsh.ph);
             depth_replay_.pso = EnsurePipeline(dk, dsh.vs_code, dsh.ps_code);
         }
     }
@@ -5376,9 +5988,19 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
             range.near_w *= 1000.0f / range.far_w;
             range.far_w = 1000.0f;
         }
-        if (range.near_w > 0 && range.far_w > range.near_w)
-            scene_depth_.insert_or_assign(bound_rt_, SceneDepth{bound_ds_, range.near_w, range.far_w,
-                                                                range.far_w > 0 ? r.far_w / range.far_w : 1.0f});
+        if (range.near_w > 0 && range.far_w > range.near_w) {
+            // nearly every scene draw carries the same target and projection: skip the map write when the
+            // last one did, which is the common case for the whole frame
+            const SceneDepth sd{bound_ds_, range.near_w, range.far_w,
+                                range.far_w > 0 ? r.far_w / range.far_w : 1.0f};
+            if (bound_rt_ != last_scene_rt_ || sd.target != last_scene_depth_.target ||
+                sd.near_z != last_scene_depth_.near_z || sd.far_z != last_scene_depth_.far_z ||
+                sd.w_scale != last_scene_depth_.w_scale) {
+                scene_depth_.insert_or_assign(bound_rt_, sd);
+                last_scene_rt_ = bound_rt_;
+                last_scene_depth_ = sd;
+            }
+        }
     }
     // TAA: the frame's sub-pixel jitter on the 3D scene's program draws (the vertex epilogue adds ext.xy)
     if (TemporalEnabled() && sh.prog && depth_available && bound_rt_ && !a.pretransformed && bound_rt_->gw == guest_w_ &&
@@ -5412,7 +6034,11 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         Alloc pc = Upload(sizeof(VertexConstants), 256);
         if (pc.res) std::memcpy(pc.cpu, prev_consts->data(), sizeof(VertexConstants));
         // without room for them the draw's own constants stand in: no motion, never an unset buffer
-        Cmd()->SetGraphicsRootConstantBufferView(5, pc.res ? pc.gpu : last_vsc_gpu_);
+        const D3D12_GPU_VIRTUAL_ADDRESS vcp = pc.res ? pc.gpu : last_vsc_gpu_;
+        // The AO depth prepass reuses this motion vertex shader, so its bundle must bind b2 too:
+        // an unset root CBV is undefined (and can be a device reset) if the shader dereferences it.
+        depth_replay_.vcp = vcp;
+        Cmd()->SetGraphicsRootConstantBufferView(5, vcp);
     }
     uint32_t query = BeginCountedDraw(s);
     if (defer_now) bundle_desc_.drew = true;
@@ -5468,6 +6094,11 @@ ID3D12GraphicsCommandList* D3D12Backend::AcquireBundleList() {
         return nullptr;
     }
     f.bundle_next++;
+    // Both bundle types set root arguments and descriptor tables. Match the
+    // direct list so they can also inherit its AO view during replay.
+    ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get(), smp_heap_.Get()};
+    list->SetDescriptorHeaps(2, heaps);
+    list->SetGraphicsRootSignature(root_.Get());
     return list;
 }
 
@@ -5513,6 +6144,9 @@ void D3D12Backend::EndDeferredBundle() {
             dl->SetGraphicsRootConstantBufferView(1, d.dc);
             dl->SetGraphicsRootDescriptorTable(2, Gpu(srv_heap_.Get(), d.views, srv_inc_));
             dl->SetGraphicsRootDescriptorTable(3, Gpu(smp_heap_.Get(), d.samplers, smp_inc_));
+            // the motion vertex shader reads the previous-frame constants (b2); the main bundle
+            // set them, but bundles inherit root arguments only from the calling list
+            if (d.vcp) dl->SetGraphicsRootConstantBufferView(5, d.vcp);
             dl->OMSetBlendFactor(d.blend);
             dl->OMSetStencilRef(d.stencil);
             dl->IASetPrimitiveTopology(d.topology);
@@ -5596,8 +6230,16 @@ void D3D12Backend::FlushDeferredScene() {
     uint32_t receivers = 0;
     for (const BundleDesc& b : bundles)
         if (b.depth_list) receivers++;
+    // The AO passes need a handful of SRV slots (null view, two 4-slot tables, occlusion view).
+    // Only run them when the frame's ring has that room: otherwise the flush would exhaust the
+    // ring, submit mid-flush, reset the command list and overwrite descriptors the pending
+    // bundles below still name. Without room the receivers draw with the null view (no AO) for
+    // this flush; a later draw that exhausts the ring flushes these bundles before it submits.
+    const bool ao_wanted = receivers && render_.ao != 0 && defer_rt_ && defer_ds_;
+    const bool ao_room = CurrentFrame().srv + kAoFlushSrvHeadroom <= kSrvPerFrame;
+    if (ao_wanted && !ao_room) LOG_FIRST(4, "d3d12: AO skipped this flush: descriptor ring near full");
     bool ao_bound = false;
-    if (receivers && render_.ao != 0 && defer_rt_ && defer_ds_) {
+    if (ao_wanted && ao_room) {
         const auto depth = scene_depth_.find(defer_rt_);
         if (depth != scene_depth_.end() && depth->second.target == defer_ds_ && EnsureAoDepth(*defer_ds_)) {
             const D3D12_CPU_DESCRIPTOR_HANDLE dh = Cpu(dsv_heap_.Get(), ao_depth_view_, dsv_inc_);
@@ -5611,7 +6253,7 @@ void D3D12Backend::FlushDeferredScene() {
                 const float far_dist[4] = {kAoDistClear, 0, 0, 0};
                 cl_->ClearRenderTargetView(distv, far_dist, 0, nullptr);
             }
-            BindAoView(nullptr);  // the receivers' shaders declare it; the prepass does not read it
+            BindAoView(false);  // the receivers' shaders declare it; the prepass does not read it
             cl_->OMSetRenderTargets(1, &distv, FALSE, &dh);
             for (const BundleDesc& b : bundles) {
                 if (!b.depth_list) continue;
@@ -5622,7 +6264,7 @@ void D3D12Backend::FlushDeferredScene() {
             Transition(ao_dist_.Get(), ao_dist_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             ao_bound = RenderAoOcclusion(*defer_rt_, 0.0f, kAoDistClear);  // far: the distance clear
             cl_->SetGraphicsRootSignature(root_.Get());
-            if (ao_bound) BindAoView(ao_occ_.Get());
+            if (ao_bound) BindAoView(true);
             rtv = dsv = ~SIZE_T(0);
             binds_ = {};
             if (!ao_bound) LOG_FIRST(4, "d3d12: deferred AO pass failed");
@@ -5631,36 +6273,49 @@ void D3D12Backend::FlushDeferredScene() {
                       static_cast<unsigned long long>(frame_));
         }
     }
-    if (!ao_bound) BindAoView(nullptr);  // receivers draw unchanged
+    if (!ao_bound) BindAoView(false);  // receivers draw unchanged
     for (BundleDesc& b : bundles) execute(b);
-    if (ao_bound) defer_ao_applied_ = true;
+    if (ao_bound) {
+        static std::atomic<bool> announced{false};
+        if (!announced.exchange(true))
+            LOGR("d3d12: ambient occlusion active (%u variants warmed)", ao_built_.load());
+        defer_ao_applied_ = true;
+    }
     Begin();
 }
 
-// Point the AO root table (parameter 4) at the occlusion target, or at a null view, which reads
-// 0 occlusion. Set on the direct list; the receivers' bundles inherit it.
-void D3D12Backend::BindAoView(ID3D12Resource* occlusion) {
+// Point the AO root table (parameter 4) at the occlusion target, or at the permanent null view,
+// which reads 0 occlusion. Set on the direct list; the receivers' bundles inherit it. The null
+// case never allocates, so a flush can always bind it even when the descriptor ring is full.
+void D3D12Backend::BindAoView(bool occlusion) {
+    if (!occlusion) {
+        cl_->SetGraphicsRootDescriptorTable(4, Gpu(srv_heap_.Get(), kAoNullSrv, srv_inc_));
+        return;
+    }
     const uint32_t slot = AllocSrvSlots(1);
     D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
     sv.Format = kAoFormat;
     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     sv.Texture2D.MipLevels = 1;
-    dev_->CreateShaderResourceView(occlusion, &sv, Cpu(srv_heap_.Get(), slot, srv_inc_));
+    dev_->CreateShaderResourceView(ao_occ_.Get(), &sv, Cpu(srv_heap_.Get(), slot, srv_inc_));
     cl_->SetGraphicsRootDescriptorTable(4, Gpu(srv_heap_.Get(), slot, srv_inc_));
 }
 
-// The AO depth target, matching the scene depth's size and sample count.
+// The AO depth target, matching the scene depth's size and the sample count the AO distance
+// format supports (PickAoSamples caps it; the prepass pipelines key on the same value).
 bool D3D12Backend::EnsureAoDepth(const Target& like) {
     const D3D12_RESOURCE_DESC want = like.res->GetDesc();
-    if (ao_depth_) {
+    const uint32_t samples = PickAoSamples(want.SampleDesc.Count);
+    if (ao_depth_ && ao_dist_) {
         const D3D12_RESOURCE_DESC have = ao_depth_->GetDesc();
         if (have.Width == want.Width && have.Height == want.Height &&
-            have.SampleDesc.Count == want.SampleDesc.Count)
+            have.SampleDesc.Count == samples)
             return true;
-        // the old one may still be in use by submitted work
-        for (auto& fr : frames_)
-            if (fr.fence && !WaitFence(fr.fence)) return false;
+        // The old images may still be named by commands in flight or already recorded in this
+        // list; release them with the frame instead of destroying them here.
+        CurrentFrame().garbage.push_back(ao_depth_);
+        CurrentFrame().garbage.push_back(ao_dist_);
         ao_depth_.Reset();
         ao_dist_.Reset();
     }
@@ -5672,7 +6327,7 @@ bool D3D12Backend::EnsureAoDepth(const Target& like) {
     D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
     D3D12_RESOURCE_DESC td = Texture2DDesc(kDepthTypeless, uint32_t(want.Width), want.Height);
     td.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-    td.SampleDesc.Count = want.SampleDesc.Count;
+    td.SampleDesc.Count = samples;
     D3D12_CLEAR_VALUE cv{};
     cv.Format = kDepthFormat;
     cv.DepthStencil.Depth = kDepthFar;
@@ -5689,7 +6344,7 @@ bool D3D12Backend::EnsureAoDepth(const Target& like) {
     // the view distance target: same size and sample count, so it pairs with the depth
     D3D12_RESOURCE_DESC dd = Texture2DDesc(kAoDistFormat, uint32_t(want.Width), want.Height);
     dd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-    dd.SampleDesc.Count = want.SampleDesc.Count;
+    dd.SampleDesc.Count = samples;
     D3D12_CLEAR_VALUE dcv{};
     dcv.Format = kAoDistFormat;
     dcv.Color[0] = kAoDistClear;
@@ -5710,8 +6365,8 @@ bool D3D12Backend::EnsureAoDepth(const Target& like) {
 bool D3D12Backend::EnsureAoOcclusion(uint32_t w, uint32_t h) {
     if (ao_occ_ && ao_occ_w_ == w && ao_occ_h_ == h) return true;
     if (ao_occ_) {
-        for (auto& fr : frames_)
-            if (fr.fence && !WaitFence(fr.fence)) return false;
+        // still named by commands in flight or already recorded; release it with the frame
+        CurrentFrame().garbage.push_back(ao_occ_);
         ao_occ_.Reset();
     }
     D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
@@ -5723,7 +6378,12 @@ bool D3D12Backend::EnsureAoOcclusion(uint32_t w, uint32_t h) {
         LOGE("d3d12: AO occlusion target could not be created");
         return false;
     }
-    dev_->CreateRenderTargetView(ao_occ_.Get(), nullptr, Cpu(rtv_heap_.Get(), kAoOccRtv, rtv_inc_));
+    const D3D12_CPU_DESCRIPTOR_HANDLE view = Cpu(rtv_heap_.Get(), kAoOccRtv, rtv_inc_);
+    dev_->CreateRenderTargetView(ao_occ_.Get(), nullptr, view);
+    // The occlusion pass writes every pixel, but clear it anyway: a failed pass used to leave
+    // uninitialised memory for the receivers to sample.
+    const float zero[4] = {0, 0, 0, 0};
+    cl_->ClearRenderTargetView(view, zero, 0, nullptr);
     ao_occ_w_ = w;
     ao_occ_h_ = h;
     return true;
@@ -5740,20 +6400,23 @@ bool D3D12Backend::RenderAoOcclusion(Target& rt, float near_z, float far_z) {
     if (!ao_half_ready_ || !EnsureAoOcclusion(rt.w, rt.h)) return false;
     const bool depth_ms = ao_dist_->GetDesc().SampleDesc.Count > 1;
     // built once per variant, not on every AO run
-    static const std::string kShaders[2] = {std::string("#define DEPTH_MS 0\n") + kAoOcclusionHlsl,
-                                            std::string("#define DEPTH_MS 1\n") + kAoOcclusionHlsl};
+    static const std::string kShaders[2] = {AoResolveSource(false), AoResolveSource(true)};
     const std::string& shader = kShaders[depth_ms ? 1 : 0];
-    if (!EnsurePassPipeline(shader.c_str(), "psmain", kAoFormat, -1)) return false;
+    if (!EnsurePassPipeline(shader.c_str(), "psmain", kAoFormat, -1, DXGI_FORMAT_UNKNOWN, "AO occlusion resolve"))
+        return false;
     Transition(ao_occ_.Get(), ao_occ_state_, D3D12_RESOURCE_STATE_RENDER_TARGET);
     ID3D12Resource* src[3] = {ao_half_.Get(), ao_dist_.Get(), nullptr};
     DXGI_FORMAT fmt[3] = {kAoFormat, kAoDistFormat, kBgra};
     // cbuffer { float4 src; float4 planes; }: texel size in src.xy, near/far in planes.xy
     const float p[8] = {1.0f / float(std::max(ao_half_w_, 1u)), 1.0f / float(std::max(ao_half_h_, 1u)), 0, 0,
                         near_z, far_z, 0, 0};
-    Pass(shader.c_str(), "psmain", kAoFormat, Cpu(rtv_heap_.Get(), kAoOccRtv, rtv_inc_), ao_occ_w_, ao_occ_h_, src,
-         fmt, p, -1);
+    // The pipeline may have failed or the constants upload may be unavailable: only claim AO ran
+    // when the occlusion pass actually recorded, so the receivers bind the null view instead of
+    // sampling the cleared (or an unwritten) target.
+    const bool drew = PassN(shader.c_str(), "psmain", kAoFormat, Cpu(rtv_heap_.Get(), kAoOccRtv, rtv_inc_),
+                            ao_occ_w_, ao_occ_h_, src, fmt, p, 8, -1);
     Transition(ao_occ_.Get(), ao_occ_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    return true;
+    return drew;
 }
 
 // Pending bundles must execute before an immediate command that reads or rewrites their
@@ -5841,6 +6504,7 @@ void D3D12Backend::ClearTarget(Target& t, const State& s, const ClearArgs& c, st
         // D3DCLEAR_TARGET_R/G/B/A are bits 4 to 7, D3D12's write mask has the same order
         uint8_t mask = uint8_t((c.flags & kClearTarget) >> 4);
         scene_depth_.erase(&t);
+        last_scene_rt_ = nullptr;
         if (mask == D3D12_COLOR_WRITE_ENABLE_ALL) {
             cl_->ClearRenderTargetView(Cpu(rtv_heap_.Get(), t.view, rtv_inc_), col, UINT(rs.size()), rs.data());
         } else {
@@ -5915,7 +6579,8 @@ void D3D12Backend::Clear(const State& s, uint32_t count, const uint8_t* rects, u
     uint32_t gw;
     uint32_t gh;
     SurfaceSize(rt ? s.rt : s.zs, gw, gh);
-    std::vector<D3D12_RECT> rs;
+    std::vector<D3D12_RECT>& rs = clear_rects_;  // kept between clears: a level clears thousands of small rects
+    rs.clear();
     ClearArgs c{.count = count, .rects = rects, .flags = flags, .color = color, .z = z, .stencil = stencil};
     for (Target* t : {rt, ds}) {
         if (t) ClearTarget(*t, s, c, rs);
@@ -6108,6 +6773,7 @@ void D3D12Backend::Copy(const Surface& src, const Surface& dst, uint32_t count, 
         CopyByRegion(*src_t, copy_src, copy_state, *dst_t, l);
 
     scene_depth_.erase(dst_t);
+    last_scene_rt_ = nullptr;
     bool full = !count || !src_rects;
     if (count == 1 && src_rects) {
         const auto r = ReadDrawnRect(src_rects, dst_points, 0);
@@ -6862,7 +7528,11 @@ bool Invert4(const float* m, float* out) {
 
 D3D12Backend::~D3D12Backend() {
     g_exit_backend = nullptr;
+    StopAoWarm();
     StopPipelineWarm();
+    SavePipelineLibrary(true);
+    SavePipelineKeys(true);
+    FlushShaderCacheWrites();
     ReleaseDlss();
     if (fsr3_.context) {
         WaitFence(fence_value_);
@@ -7647,10 +8317,8 @@ bool D3D12Backend::EnsureAoHalf(uint32_t w, uint32_t h) {
     const uint32_t ah = render_.ao == 1 ? std::max(1u, h / 2) : std::max(1u, h);
     if (ao_half_ && ao_half_w_ == aw && ao_half_h_ == ah) return true;
     if (ao_half_) {
-        // Called from the deferred flush, where Flush would re-enter it. Every earlier submit
-        // is already on the queue, so waiting for the fences is enough to release the target.
-        for (auto& f : frames_)
-            if (f.fence && !WaitFence(f.fence)) return false;
+        // still named by commands in flight or already recorded; release it with the frame
+        CurrentFrame().garbage.push_back(ao_half_);
         ao_half_.Reset();
         ao_half_w_ = ao_half_h_ = 0;
     }
@@ -7692,14 +8360,8 @@ void D3D12Backend::RenderHalfAo(Target& t) {
     const float fov = game::g_camera_fov_degrees.load(std::memory_order_relaxed);
     if (fov > 1.0f && fov < 179.0f && aspect > 0.1f)
         tan_half_fov = std::tan(fov * 3.14159265f / 360.0f) / aspect;
-    const std::string shader = std::string("#define DEPTH_MS ") +
-                               (depth_desc.SampleDesc.Count > 1 ? "1\n" : "0\n") +
-                               // GTAO cost: slices x steps per side, 3 x 6 at Half (a quarter of the
-                               // pixels, so a third slice is cheap and 2 left visible grain), 3 x 8 at Full
-                               (render_.ao == 1 ? "#define GTAO_SLICES 3\n#define GTAO_STEPS 6\n"
-                                                : "#define GTAO_SLICES 3\n#define GTAO_STEPS 8\n") +
-                               kAoHlsl;
-    if (!EnsurePassPipeline(shader.c_str(), "psmain", kAoFormat, -1)) {
+    const std::string shader = AoHorizonSource(render_.ao, depth_desc.SampleDesc.Count > 1);
+    if (!EnsurePassPipeline(shader.c_str(), "psmain", kAoFormat, -1, DXGI_FORMAT_UNKNOWN, "GTAO horizon search")) {
         static std::atomic<int> logged_pipe{0};
         if (logged_pipe.fetch_add(1, std::memory_order_relaxed) < 4)
             LOGR("d3d12: deferred AO skipped: pipeline failed");
@@ -7708,10 +8370,10 @@ void D3D12Backend::RenderHalfAo(Target& t) {
     ID3D12Resource* depth_src[3] = {dof_depth_, nullptr, nullptr};
     DXGI_FORMAT depth_fmt[3] = {kAoDistFormat, kBgra, kBgra};  // the prepass view distance
     const float p[8] = {src[0], src[1], src[2], src[3], kAoStrength, kAoRadius, tan_half_fov, aspect};
-    Pass(shader.c_str(), "psmain", kAoFormat, Cpu(rtv_heap_.Get(), kAoRtv, rtv_inc_), ao_half_w_, ao_half_h_,
-         depth_src, depth_fmt, p, -1);
+    const bool drew = PassN(shader.c_str(), "psmain", kAoFormat, Cpu(rtv_heap_.Get(), kAoRtv, rtv_inc_),
+                            ao_half_w_, ao_half_h_, depth_src, depth_fmt, p, 8, -1);
     Transition(ao_half_.Get(), ao_half_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    ao_half_ready_ = true;
+    ao_half_ready_ = drew;
 }
 
 void D3D12Backend::DrawFrame(Target* t, uint32_t bi, ID3D12Resource* aa) {
@@ -7794,7 +8456,9 @@ void D3D12Backend::CollectFsr3Profile(Frame& frame) {
 
 void D3D12Backend::ResetFrame() {
     Frame& f = CurrentFrame();
-    if (f.fence && fence_->GetCompletedValue() < f.fence) {
+    const uint64_t completed = fence_->GetCompletedValue();
+    if (completed == UINT64_MAX) DeviceFailure(DXGI_ERROR_DEVICE_REMOVED, "frame fence");
+    if (completed < f.fence) {
         PerfScope perf_wait{g_perf.wait};
         if (!WaitFence(f.fence)) {
             LOGE("d3d12: frame fence %llu did not complete; stopping",
@@ -7803,15 +8467,20 @@ void D3D12Backend::ResetFrame() {
         }
     }
     if (fsr_profile_queries_) CollectFsr3Profile(f);
+    RefreshAoReadyView();  // the AO workers' progress, for this frame's draws to read without locking
+    HRESULT hr = f.alloc->Reset();
+    if (FAILED(hr)) DeviceFailure(hr, "frame command allocator reset");
     RecycleFrameViews(f, uint32_t(frame_ % kFrames));
-    f.alloc->Reset();
     f.garbage.clear();
     f.used = 0;
     f.srv = 0;
     f.smp = uint32_t(frame_ % kFrames) * kSamplersPerFrame;
     samplers_[frame_ % kFrames].clear();
-    if (f.bundle_alloc && FAILED(f.bundle_alloc->Reset()))
-        LOGE("d3d12: bundle allocator reset failed for frame slot %u", uint32_t(frame_ % kFrames));
+    last_sampler_slot_ = UINT32_MAX;  // the slot belongs to the frame region that was just recycled
+    if (f.bundle_alloc) {
+        hr = f.bundle_alloc->Reset();
+        if (FAILED(hr)) DeviceFailure(hr, "frame bundle allocator reset");
+    }
     f.bundles.clear();
     f.bundle_next = 0;
     bundle_ = nullptr;
@@ -7831,7 +8500,8 @@ void D3D12Backend::ResetFrame() {
     defer_bundles_this_frame_ = 0;
     defer_flushes_this_frame_ = 0;
     cl_ = lists_[frame_ % kFrames].Get();
-    cl_->Reset(f.alloc.Get(), nullptr);
+    hr = cl_->Reset(f.alloc.Get(), nullptr);
+    if (FAILED(hr)) DeviceFailure(hr, "frame command list reset");
     Begin();
 }
 
@@ -7976,6 +8646,7 @@ void D3D12Backend::Present(const Surface& front) {
     road_projection_now_ = {};
     motion_rt_ = nullptr;
     scene_depth_.clear();
+    last_scene_rt_ = nullptr;
     dof_depth_ = nullptr;
     Submit(false);
     present_fence_[presents_ % (kFrames + 1)].store(fence_value_);
@@ -8060,7 +8731,7 @@ void D3D12Backend::WaitFrameLatency() {
 // the slot is not reused before the caller's wait: the title runs at most one present ahead
 void D3D12Backend::WaitGpuFrame(uint64_t n) {
     uint64_t fence = present_fence_[n % (kFrames + 1)].load();
-    if (fence > fence_->GetCompletedValue() && !WaitFence(fence)) {
+    if (!WaitFence(fence)) {
         LOGE("d3d12: present fence %llu did not complete; stopping", static_cast<unsigned long long>(fence));
         kernel::Shutdown(1);
     }
@@ -8077,6 +8748,32 @@ uint32_t D3D12Backend::SupportedMsaa(uint32_t samples) {
         }
     }
     return samples;
+}
+
+// The AO prepass writes R32F view distance beside the AO depth. R32F's supported sample counts
+// are independent of the scene colour/depth target, so cap the prepass to a count the scene, R32F
+// and the depth format all accept (the Vulkan backend does the same). The prepass pipelines key
+// on the result, so the AO targets and their pipelines never disagree on samples.
+uint32_t D3D12Backend::PickAoSamples(uint32_t requested) {
+    if (requested == ao_pick_requested_) return ao_pick_samples_;
+    uint32_t picked = 1;
+    for (uint32_t samples : {8u, 4u, 2u}) {
+        if (requested < samples) continue;
+        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS color{kAoDistFormat, samples};
+        D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS depth{kDepthFormat, samples};
+        if (SUCCEEDED(dev_->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &color, sizeof(color))) &&
+            color.NumQualityLevels &&
+            SUCCEEDED(dev_->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &depth, sizeof(depth))) &&
+            depth.NumQualityLevels) {
+            picked = samples;
+            break;
+        }
+    }
+    if (requested > 1 && picked < requested)
+        LOGR("d3d12: AO prepass capped to %ux MSAA (scene %ux)", picked, requested);
+    ao_pick_requested_ = requested;
+    ao_pick_samples_ = picked;
+    return picked;
 }
 
 void D3D12Backend::ApplySettings() {
@@ -8096,12 +8793,33 @@ void D3D12Backend::ApplySettings() {
         LOGR("d3d12: deferred scene display list %s (%s)", want_defer ? "on" : "off",
              defer_forced_ ? "TCNYC_DEFER_SCENE" : "ambient occlusion setting");
     }
-    // Shader microcode variants should not accumulate for the whole session.
-    constexpr size_t kMaxDrawPipelines = 4096;
+    // Shader microcode variants should not accumulate for the whole session. AO and TAA add
+    // receiver/motion variants of most world shaders, so this is high enough not to clear in
+    // normal play; clearing only makes the next uses reload from the pipeline library.
+    constexpr size_t kMaxDrawPipelines = 8192;
     if (psos_.size() > kMaxDrawPipelines) {
         Flush();
         psos_.clear();
+        {
+            std::lock_guard lock(ao_mutex_);
+            ao_color_ready_.clear();
+            ao_depth_ready_.clear();
+            ao_scheduled_color_.clear();
+            ao_scheduled_depth_.clear();
+        }
+        ao_color_ready_view_.clear();
+        ao_depth_ready_view_.clear();
         LOGW("d3d12: pipeline cache reached %zu entries, cleared it", kMaxDrawPipelines);
+    }
+    // The in-memory shader blobs are cleared here, never inside Compile: a draw holds its vertex
+    // and pixel blobs across both lookups, and freeing them mid-draw would leave a dangling
+    // pointer. ApplySettings runs at the end of Present, when no draw is in progress.
+    constexpr size_t kMaxShaderBlobs = 8192;
+    if (blobs_.size() > kMaxShaderBlobs) {
+        const size_t entries = blobs_.size();
+        blobs_.clear();
+        shader_src_.clear();
+        LOGW("d3d12: shader cache reached %zu entries, cleared it", entries);
     }
     float want = app::RenderScale(guest_h_);
     float want_stretch = app::RenderStretch(guest_w_, guest_h_);
@@ -8118,6 +8836,7 @@ void D3D12Backend::ApplySettings() {
         road_projection_was_ = {};
         Flush();
         scene_depth_.clear();
+        last_scene_rt_ = nullptr;
         if (remake) {
             for (auto& [key, tg] : targets_)
                 (tg.depth ? CurrentFrame().dsv_garbage : CurrentFrame().rtv_garbage).push_back(tg.view);
@@ -8313,6 +9032,7 @@ bool D3D12Backend::DeliverLate(uint32_t data) {
     if (it == late_.end()) return false;
     Late& l = it->second;
     uint64_t done = fence_->GetCompletedValue();
+    if (done == UINT64_MAX) return false;
     uint64_t now = presents_seen_.load();
     int best = -1;
     for (int i = 0; i < kFrames; i++) {
@@ -8412,7 +9132,8 @@ void D3D12Backend::RecordLate(uint32_t data) {
     }
     // a copy for a later lock, unless the GPU is a whole ring behind
     uint32_t slot = l.next;
-    if (l.fence[slot] > fence_->GetCompletedValue()) return;
+    const uint64_t completed = fence_->GetCompletedValue();
+    if (completed == UINT64_MAX || l.fence[slot] > completed) return;
     ID3D12Resource* src = PrepareLateSource(t, l);
     if (!src) return;
     RecordLateCopy(l, slot, src);

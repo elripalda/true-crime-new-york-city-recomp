@@ -1,3 +1,4 @@
+﻿#include "game_addresses.h"
 // Field of view for the gameplay camera.
 //
 // The renderer (global object 0x36FE80) builds its perspective projection in
@@ -28,12 +29,13 @@
 #include "kernel/kernel.h"
 #include "xdk/d3d8.h"
 #include "xdk/hle.h"
+void DrawRingInDistantPass(uint8_t *base, X86Context &ctx);  // city_stream.cpp
 
 namespace {
 
-constexpr uint32_t kRenderer = 0x36FE80;
+constexpr uint32_t kRenderer = TC_ADDR(0x36FE80);
 // return addresses of the gameplay camera's projection calls
-constexpr uint32_t kGameplayProjection[] = {0x0007E1BA, 0x000A7558};
+constexpr uint32_t kGameplayProjection[] = {TC_ADDR(0x0007E1BA), TC_ADDR(0x000A7558)};
 // renderer fields: x and y scale per unit k, near and far planes
 constexpr uint32_t kScaleX = 0x08, kScaleY = 0x10, kNear = 0x1C, kFar = 0x20;
 
@@ -121,8 +123,8 @@ X86_FUNC(sub_00245CE0) { RunProjection(ctx, base, "infinite projection", __imp__
 // depth clip still sees the original depth and preserves the mesh coverage.
 X86_EXTERN_FUNC(__imp__sub_002453C0);
 X86_FUNC(sub_002453C0) {
-    constexpr uint32_t kDistantCityViewportReturn = 0x13F188;
-    constexpr uint32_t kRestoreCityViewportReturn = 0x13F3DA;
+    constexpr uint32_t kDistantCityViewportReturn = TC_ADDR(0x13F188);
+    constexpr uint32_t kRestoreCityViewportReturn = TC_ADDR(0x13F3DA);
     const uint32_t caller = X86_MEM32(ctx.esp);
     if (caller == kDistantCityViewportReturn || caller == kRestoreCityViewportReturn) {
         const bool enabled = [] {
@@ -146,7 +148,7 @@ X86_FUNC(sub_002453C0) {
 // fix on, the sun gets the same scale, so the two keep the console's order.
 X86_EXTERN_FUNC(__imp__sub_0021C800);
 X86_FUNC(sub_0021C800) {
-    constexpr uint32_t kSunReturns[] = {0x0014475A, 0x00150034};
+    constexpr uint32_t kSunReturns[] = {TC_ADDR(0x0014475A), TC_ADDR(0x00150034)};
     const uint32_t caller = X86_MEM32(ctx.esp);
     if (std::ranges::find(kSunReturns, caller) == std::end(kSunReturns)) {
         __imp__sub_0021C800(ctx, base);
@@ -175,10 +177,14 @@ X86_FUNC(sub_0021C800) {
 // far-off city in the haze; its cut-out alpha is kept. (Left out, the sky's bare horizon band shows instead.)
 X86_EXTERN_FUNC(__imp__sub_0013C390);
 X86_FUNC(sub_0013C390) {
-    constexpr uint32_t kSkylineReturn = 0x0013F2BB;
+    constexpr uint32_t kSkylineReturn = TC_ADDR(0x0013F2BB);
     if (X86_MEM32(ctx.esp) != kSkylineReturn) {
         __imp__sub_0013C390(ctx, base);
         return;
+    }
+    {   // the outer city ring draws here, after the game's distant cells and before the skyline (city_stream.cpp)
+
+        ::DrawRingInDistantPass(base, ctx);
     }
     {
         std::lock_guard lock(d3d::Lock());
@@ -196,7 +202,7 @@ X86_FUNC(sub_0013F090) {
         const char *value = std::getenv("XBE_HIDE_DISTANT_CITY");
         return value && std::strcmp(value, "1") == 0;
     }();
-    if (hide && X86_MEM32(ctx.esp) == 0x142CEE) {
+    if (hide && X86_MEM32(ctx.esp) == TC_ADDR(0x142CEE)) {
         ctx.eax = 0;
         ctx.esp += 8; // Return address and the renderer argument.
         return;

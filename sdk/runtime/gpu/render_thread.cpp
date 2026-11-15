@@ -15,6 +15,7 @@
 #include <bit>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -96,6 +97,23 @@ bool Same(const uint8_t* a, const uint8_t* b, size_t n) {
 
 using Clock = std::chrono::steady_clock;
 uint64_t Ns(Clock::time_point t) { return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t).count()); }
+
+#if TCNYC_DEV_TOOLS
+bool TraceAudioWaits() {
+    static const bool enabled = [] {
+        const char* flag = std::getenv("TCNYC_TEST_AUDIO_TRACE");
+        return flag && std::strcmp(flag, "1") == 0;
+    }();
+    return enabled;
+}
+
+void ReportAudioWait(const char* reason, Clock::time_point start) {
+    const double ms = Ns(start) / 1e6;
+    if (ms >= 25.0)
+        LOGI("audio trace: render wait %s %.1f ms, thread %zx", reason, ms,
+             std::hash<std::thread::id>{}(std::this_thread::get_id()));
+}
+#endif
 
 // committed bytes from va forward, at most max; physical windows end at their own boundary
 uint64_t CommittedBytes(uint32_t va, uint64_t max) {
@@ -245,7 +263,15 @@ public:
         // the title records one frame while the one before it draws, on the GPU too: a GPU bound frame rate then paces
         // the game like a frame rate cap, and the frame times the game measures match the frames shown
         Wait(last_present_, WaitFor::Frame, nullptr);
-        if (presents_) inner_->WaitGpuFrame(presents_ - 1);
+        if (presents_) {
+#if TCNYC_DEV_TOOLS
+            const auto start = TraceAudioWaits() ? Clock::now() : Clock::time_point{};
+#endif
+            inner_->WaitGpuFrame(presents_ - 1);
+#if TCNYC_DEV_TOOLS
+            if (start != Clock::time_point{}) ReportAudioWait("GPU frame fence", start);
+#endif
+        }
         presents_++;
         last_present_ = id;
     }
@@ -475,11 +501,22 @@ private:
         if (!id || done_.load() >= id) return;
         if (id >= cur_->id) id = Submit();
         const bool perf = diag::Perf();
+#if TCNYC_DEV_TOOLS
+        const bool trace_audio = TraceAudioWaits();
+        const auto t = perf || trace_audio ? Clock::now() : Clock::time_point{};
+#else
         const auto t = perf ? Clock::now() : Clock::time_point{};
+#endif
         {
             std::unique_lock lock(m_);
             done_cv_.wait(lock, [&] { return done_.load() >= id; });
         }
+#if TCNYC_DEV_TOOLS
+        if (trace_audio) {
+            constexpr const char* reasons[] = {"read-back", "resource", "command fence", "flush", "copy", "rendered frame"};
+            ReportAudioWait(why ? why : reasons[size_t(kind)], t);
+        }
+#endif
         if (perf) {
             uint64_t ns = Ns(t);
             g_perf_wait_ns += ns;

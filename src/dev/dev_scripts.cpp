@@ -24,6 +24,7 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "game/game_addresses.h"
 #include "common/guest_values.h"
 #include "core/log.h"
 #include "dev/dev.h"
@@ -38,8 +39,8 @@ constexpr uint32_t kCurrentState = 0x424;
 constexpr uint32_t kStateTable = 0x478;
 constexpr uint32_t kRequestedState = 0x490;
 // stack of characters whose scripts 0xFD340 is running: depth, then the slots
-constexpr uint32_t kOwnerDepth = 0x2E78C0;
-constexpr uint32_t kOwnerStack = 0x37BE28;
+constexpr uint32_t kOwnerDepth = TC_ADDR(0x2E78C0);
+constexpr uint32_t kOwnerStack = TC_ADDR(0x37BE28);
 
 struct Live {
     uint32_t owner = 0;
@@ -189,8 +190,8 @@ X86_FUNC(sub_000FD220) {
 // frame, the running script instance (0x37BE08[[0x2E78BC]]) and its state. A native gets the
 // script VM stack pointer as its argument; its arguments sit just below it.
 namespace {
-constexpr uint32_t kRunningDepth = 0x2E78BC;
-constexpr uint32_t kRunningStack = 0x37BE08;
+constexpr uint32_t kRunningDepth = TC_ADDR(0x2E78BC);
+constexpr uint32_t kRunningStack = TC_ADDR(0x37BE08);
 
 std::string Running() {
     const int32_t depth = int32_t(kernel::R32(kRunningDepth));
@@ -269,7 +270,7 @@ void SumoAfter(uint32_t grapple, bool push_window) {
     LOGR("dev sumo: %.1f ms frame %llu grapple %08X state %u -> %u, timer %.3f -> %.3f, balance %.3f, "
          "timer2 %.3f, dt %.4f%s",
          ms, static_cast<unsigned long long>(g_frame), grapple, g_sumo_state, state, g_sumo_timer, timer,
-         guest::ReadF32(grapple + 0x40), guest::ReadF32(grapple + 0x44), guest::ReadF32(0x37F630),
+         guest::ReadF32(grapple + 0x40), guest::ReadF32(grapple + 0x44), guest::ReadF32(TC_ADDR(0x37F630)),
          push_window ? " (push window, slowed)" : "");
 }
 

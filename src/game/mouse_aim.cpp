@@ -1,3 +1,4 @@
+#include "game_addresses.h"
 // Direct mouse aim for the gameplay camera.
 //
 // The camera object is [[0x360E00] + 0xAC]. It owns one look controller per
@@ -75,20 +76,20 @@
 
 namespace {
 
-constexpr uint32_t kGame = 0x360E00;   // [0x360E00] -> game/session object
+constexpr uint32_t kGame = TC_ADDR(0x360E00);   // [0x360E00] -> game/session object
 constexpr uint32_t kCamera = 0xAC;     // game + 0xAC -> gameplay camera
 constexpr uint32_t kOwner = 0x34;      // controller + 0x34 -> camera
 constexpr uint32_t kActive = 0x174;    // camera + 0x174 -> active controller
 constexpr uint32_t kTarget = 0x17C;    // camera + 0x17C -> followed pawn
 constexpr uint32_t kActiveFlag = 0x18C;
 constexpr uint32_t kMode = 0x19;       // camera + 0x19 -> camera mode
-constexpr uint32_t kYaw = 0x348B20;    // radians, accumulated by the controller
-constexpr uint32_t kPitch = 0x348A80;  // radians
+constexpr uint32_t kYaw = TC_ADDR(0x348B20);    // radians, accumulated by the controller
+constexpr uint32_t kPitch = TC_ADDR(0x348A80);  // radians
 // Profile setting: while the right stick is idle, the look controller blends
 // the pitch back toward its rest angle. Set by the game's camera settings
 // update; read only by the shared look-input routine sub_000205A0.
-constexpr uint32_t kAutoCenter = 0x348C24;
-constexpr uint32_t kPlayer = 0x37D284; // [0x37D284] -> local player pawn
+constexpr uint32_t kAutoCenter = TC_ADDR(0x348C24);
+constexpr uint32_t kPlayer = TC_ADDR(0x37D284); // [0x37D284] -> local player pawn
 constexpr uint32_t kLockTarget = 0xB4; // player + 0xB4 -> locked pawn
 constexpr uint32_t kInvertX = 0xFEF;   // game + 0xFEF
 constexpr uint32_t kInvertY = 0xFEE;   // game + 0xFEE

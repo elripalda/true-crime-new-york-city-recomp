@@ -2,6 +2,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -130,6 +131,9 @@ struct File : Object {
     size_t next = 0;
     bool listed = false;
     bool delete_on_close = false;
+#if TCNYC_DEV_TOOLS
+    bool trace_wma = false;
+#endif
     std::mutex io;  // threads sharing a handle: seek and transfer stay together
     File() : Object(ObjType::File) {}
     ~File() override {
@@ -146,6 +150,19 @@ struct File : Object {
         }
     }
 };
+
+#if TCNYC_DEV_TOOLS
+void TraceWmaOpen(File& file) {
+    static const bool enabled = [] {
+        const char* flag = std::getenv("TCNYC_TEST_AUDIO_TRACE");
+        return flag && std::strcmp(flag, "1") == 0;
+    }();
+    if (!enabled || file.dir) return;
+    const std::string path = Upper(file.xbox);
+    file.trace_wma = path.find("\\DATA\\SOUNDS\\") != std::string::npos && path.ends_with(".WMA");
+    if (file.trace_wma) LOGR("audio trace: opened %s", file.xbox.c_str());
+}
+#endif
 
 struct Link : Object {
     std::string target;
@@ -422,6 +439,9 @@ uint32_t OpenOnDisc(const Disc::Entry* e, const std::string& name, uint32_t hand
     f->entry = e;
     f->dir = e->dir;
     f->read_only = true;
+#if TCNYC_DEV_TOOLS
+    TraceWmaOpen(*f);
+#endif
     RegisterFile(f);
     W32(handle_out, NewHandle(f));
     IoStatus(iosb, kSuccess, 1);
@@ -570,6 +590,9 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
     f->writable = std::strchr(mode, '+') != nullptr;
     f->read_only = t.read_only;
     f->delete_on_close = options & 0x1000;  // FILE_DELETE_ON_CLOSE
+#if TCNYC_DEV_TOOLS
+    TraceWmaOpen(*f);
+#endif
     RegisterFile(f);
     W32(handle_out, NewHandle(f));
     IoStatus(iosb, kSuccess, info);
@@ -602,6 +625,9 @@ KERNEL_EXPORT(202, NtOpenFile, 6) {
         if (!f->fp && !t.read_only) f->fp = OpenHostFile(host, "rb");
         if (!f->fp) return kAccessDenied;
     }
+#if TCNYC_DEV_TOOLS
+    TraceWmaOpen(*f);
+#endif
     RegisterFile(f);
     (void)options;
     W32(handle_out, NewHandle(f));
@@ -629,6 +655,10 @@ static uint32_t Transfer(const Args& a, bool write, uint32_t pages) {
     auto f = FileFromHandle(h);
     if (!f || (!f->fp && !f->entry)) return kInvalidHandle;
     if (write && (f->entry || f->read_only)) return kAccessDenied;
+#if TCNYC_DEV_TOOLS
+    const bool trace_read = f->trace_wma && !write;
+    const auto read_start = trace_read ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+#endif
     ResetEvent(*f);
     std::lock_guard<std::mutex> lock(f->io);
     uint64_t pos = Offset(*f, off);
@@ -644,6 +674,14 @@ static uint32_t Transfer(const Args& a, bool write, uint32_t pages) {
         if (done < chunk) break;
     }
     f->pos = pos + n;
+#if TCNYC_DEV_TOOLS
+    if (trace_read) {
+        const auto elapsed = std::chrono::steady_clock::now() - read_start;
+        if (elapsed >= std::chrono::milliseconds(20))
+            LOGR("audio trace: %s read %u of %u bytes at %llu in %.1f ms", f->xbox.c_str(), n, len,
+                 static_cast<unsigned long long>(pos), std::chrono::duration<double, std::milli>(elapsed).count());
+    }
+#endif
     if (write && n < len) return Finish(*f, 0xC000007F, n, event, apc, apc_ctx, iosb);  // disk full
     if (!write && len && !n) return Finish(*f, kEndOfFile, 0, event, apc, apc_ctx, iosb);
     return Finish(*f, kSuccess, n, event, apc, apc_ctx, iosb);

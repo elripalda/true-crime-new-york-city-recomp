@@ -1,3 +1,4 @@
+#include "game_addresses.h"
 // Impact damage cap. The Xbox version applies "impact" damage from a passing
 // car to a player who is standing still, most visibly during the enter/exit
 // animation. The amount comes from the car's velocity, so a scrape can deal
@@ -33,12 +34,12 @@
 
 namespace {
 
-constexpr uint32_t kPlayer = 0x37D284;
+constexpr uint32_t kPlayer = TC_ADDR(0x37D284);
 constexpr uint32_t kPlayerHealth = 0xBC;    // player + 0xBC: the player's health component
 constexpr uint32_t kHealthOwner = 0x04;
 constexpr uint32_t kHealthMax = 0x08;
 constexpr uint32_t kHealthCurrent = 0x10;
-constexpr uint32_t kSimTicks = 0x363D0C;    // simulation tick counter, 60 a second (timing.cpp)
+constexpr uint32_t kSimTicks = TC_ADDR(0x363D0C);    // simulation tick counter, 60 a second (timing.cpp)
 constexpr uint32_t kTicksPerWindow = 60;    // one second of game time
 constexpr uint32_t kDamageTypeImpact = guest::Crc32("DAMAGETYPE_IMPACT"); // 0x2B2D2DAF
 constexpr float kMaxImpactPerWindow = 0.15f;       // of max health

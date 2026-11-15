@@ -5,10 +5,17 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 get_filename_component(REPO "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
-set(GEN "${REPO}/generated/game")
+
+option(TCNYC_PAL "Build for the European (PAL) XBE" OFF)
+if(TCNYC_PAL)
+    set(GEN "${REPO}/generated/game-pal")
+    set(XBE_FILE "${REPO}/assets-pal/default.xbe")
+else()
+    set(GEN "${REPO}/generated/game")
+    set(XBE_FILE "${REPO}/assets/default.xbe")
+endif()
 
 # the xbe's SHA-1: the executable checks the game it finds is the release it was made from
-set(XBE_FILE "${REPO}/assets/default.xbe")
 if(NOT EXISTS "${XBE_FILE}")
     message(FATAL_ERROR
         "Missing game image: ${XBE_FILE}\n"
@@ -103,6 +110,9 @@ target_include_directories(TrueCrimeNYC PRIVATE
     ${SDL3_INCLUDE_DIRS})
 
 target_compile_definitions(TrueCrimeNYC PRIVATE XBE_RAW_VERTICES=1 XBE_RENDER_THREAD=1)
+if(TCNYC_PAL)
+    target_compile_definitions(TrueCrimeNYC PRIVATE TCNYC_PAL=1)
+endif()
 # TCNYC_FRAME_POINTERS=ON keeps frame pointers for the sampling profiler's callers (TCNYC_SAMPLE)
 option(TCNYC_FRAME_POINTERS "keep frame pointers (profiling)" OFF)
 target_compile_options(TrueCrimeNYC PRIVATE -march=x86-64-v2 -fno-strict-aliasing -O2 -g

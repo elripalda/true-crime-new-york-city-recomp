@@ -43,10 +43,26 @@ if(NOT TCNYC_DEV_TOOLS)
     list(FILTER XBE_HOST_SOURCES EXCLUDE REGEX "/src/dev/")
 endif()
 
-# partitions as xbe_symbols wrote them into config/game.toml
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS config/game.toml)
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/config/game.toml)
-    file(STRINGS config/game.toml GAME_PARTITIONS REGEX "^partitions *=")
+# The European (PAL) release is a separate XBE with its own layout. It builds
+# from assets-pal/default.xbe and config/game-pal.toml into the same target name,
+# so use a separate binary directory (the pal preset) and keep its settings and
+# logs apart from the USA build.
+option(TCNYC_PAL "Build for the European (PAL) XBE" OFF)
+if(TCNYC_PAL)
+    set(GAME_XBE assets-pal/default.xbe)
+    set(GAME_CONFIG game-pal.toml)
+    set(GAME_DIR game-pal)
+else()
+    set(GAME_XBE default.xbe)
+    set(GAME_CONFIG game.toml)
+    set(GAME_DIR game)
+endif()
+
+# partitions as xbe_symbols wrote them into the config
+set(GAME_CONFIG_PATH ${CMAKE_CURRENT_SOURCE_DIR}/config/${GAME_CONFIG})
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${GAME_CONFIG_PATH})
+if(EXISTS ${GAME_CONFIG_PATH})
+    file(STRINGS ${GAME_CONFIG_PATH} GAME_PARTITIONS REGEX "^partitions *=")
     string(REGEX MATCH "[0-9]+" GAME_PARTITIONS "${GAME_PARTITIONS}")
 endif()
 # no config yet: build.bat writes it with xbe_symbols, the change reconfigures
@@ -55,9 +71,13 @@ if(NOT GAME_PARTITIONS)
 endif()
 
 # target name = GAME_EXE in build.bat, xbe = GAME_XBE
-add_xbe_image(TrueCrimeNYC default.xbe game.toml ${GAME_PARTITIONS} game)
+add_xbe_image(TrueCrimeNYC ${GAME_XBE} ${GAME_CONFIG} ${GAME_PARTITIONS} ${GAME_DIR} game)
 if(TCNYC_DEV_TOOLS)
     target_compile_definitions(TrueCrimeNYC PRIVATE TCNYC_DEV_TOOLS=1)
+endif()
+if(TCNYC_PAL)
+    target_compile_definitions(TrueCrimeNYC PRIVATE TCNYC_PAL=1)
+    target_compile_definitions(grid_patch PRIVATE TCNYC_PAL=1)
 endif()
 
 # Optional NVIDIA DLSS SDK. The headers are proprietary, so they are not vendored: point this at a
