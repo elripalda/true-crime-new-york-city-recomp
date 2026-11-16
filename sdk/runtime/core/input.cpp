@@ -28,6 +28,8 @@ namespace input {
 
 uint32_t g_mouse_sensitivity_percent = 100;
 uint32_t g_mouse_vertical_sensitivity_percent = 100;
+uint32_t g_controller_aim_response = 0;
+uint32_t g_controller_aim_sensitivity_percent = 100;
 // PC defaults: R reload, E use/action, G climb (the port's own action), and no
 // configurable heavy key because Left Alt and mouse side button 2 are the defaults.
 uint32_t g_reload_key = 'R', g_heavy_attack_key = 0, g_use_key = 'E', g_climb_key = 'G';
@@ -49,6 +51,8 @@ bool g_sdl = false;
 SDL_Gamepad* g_pads[4] = {};
 std::atomic<PromptStyle> g_prompt_style{PromptStyle::Original};
 std::atomic<bool> g_keyboard_mouse_active{false};
+// the last poll's right stick came from the mouse fallback, not a controller
+std::atomic<bool> g_mouse_look_stick_active{false};
 // the player is in a vehicle: the keyboard prompts show the pedal keys
 std::atomic<bool> g_keyboard_driving{false};
 // until the camera takes a direct sample the mouse keeps the old stick path,
@@ -861,6 +865,8 @@ bool LockOnHeld() { return g_lock_held.load(std::memory_order_relaxed); }
 
 bool KeyboardMouseActive() { return g_keyboard_mouse_active.load(std::memory_order_relaxed); }
 
+bool MouseLookStickActive() { return g_mouse_look_stick_active.load(std::memory_order_relaxed); }
+
 void SetLockOnStick(int16_t x, int16_t y) {
     g_lock_stick_x.store(x, std::memory_order_relaxed);
     g_lock_stick_y.store(y, std::memory_order_relaxed);
@@ -1027,6 +1033,7 @@ Pad Poll(int port) {
             p.ry = int16_t(-1 - axis(SDL_GAMEPAD_AXIS_RIGHTY));
         }
     }
+    bool from_keyboard_mouse = false;
     if (port == 0) {
         Pad keyboard_mouse;
         const bool active = ReadKeyboardMouse(keyboard_mouse);
@@ -1061,6 +1068,7 @@ Pad Poll(int port) {
         if (!ui && (active || !p.connected)) {
             keyboard_mouse.connected = true;
             p = keyboard_mouse;
+            from_keyboard_mouse = true;
         } else if (ui) {
             // Keep port 0 present as before. With no controller the pad is
             // already neutral; keyboard overlay controls never enter it.
@@ -1077,6 +1085,8 @@ Pad Poll(int port) {
         p = Pad{};
         p.connected = connected;
     }
+    if (port == 0)
+        g_mouse_look_stick_active.store(from_keyboard_mouse && (p.rx || p.ry), std::memory_order_relaxed);
     if (app::kGame.pad) app::kGame.pad(port, p);
     return p;
 }

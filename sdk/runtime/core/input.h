@@ -88,6 +88,11 @@ extern uint32_t g_reload_key, g_heavy_attack_key, g_use_key, g_climb_key;
 extern uint32_t g_mouse_sensitivity_percent;
 // optional separate vertical scale for direct aim; 100 matches the PC raw path
 extern uint32_t g_mouse_vertical_sensitivity_percent;
+// gameplay camera right-stick response: 0 refined (radial dead zone + quadratic),
+// 1 original Xbox (per-axis dead zone + cubic)
+extern uint32_t g_controller_aim_response;
+// applied after the refined curve; 100 is the original full-stick turn speed
+extern uint32_t g_controller_aim_sensitivity_percent;
 // when set, mouse motion is not folded into the right stick: the gameplay
 // camera reads the same pixels as an angle, see src/game/mouse_aim.cpp
 extern bool g_direct_mouse_aim;
@@ -101,6 +106,8 @@ bool ConsumeMouseAim(float& dx, float& dy);
 void UseDirectMouseAim();
 // a direct sample was applied recently (the PC fix stops its direct path after 5 s idle)
 bool DirectAimRecent();
+// the right stick the game is reading comes from the mouse fallback, not a pad
+bool MouseLookStickActive();
 // the mouse moved within the last 100 ms and no overlay owns the pointer
 bool MouseMovedRecently();
 // an overlay (the Graphics menu) owns the pointer: no look input, no direct aim

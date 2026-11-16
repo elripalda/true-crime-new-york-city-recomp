@@ -8,6 +8,10 @@ if(BUILD_TESTING)
     target_include_directories(tcnyc_display_graphics_test PRIVATE "${TCNYC_REPO}/src")
     add_test(NAME display_graphics_options COMMAND tcnyc_display_graphics_test)
 
+    add_executable(tcnyc_controller_look_test "${TCNYC_REPO}/tests/controller_look.cpp")
+    target_include_directories(tcnyc_controller_look_test PRIVATE "${TCNYC_REPO}/src")
+    add_test(NAME controller_look COMMAND tcnyc_controller_look_test)
+
     add_executable(tcnyc_guest_format_test "${TCNYC_REPO}/tests/guest_format.cpp")
     target_include_directories(tcnyc_guest_format_test PRIVATE "${TCNYC_REPO}/sdk/runtime")
     add_test(NAME guest_format COMMAND tcnyc_guest_format_test)

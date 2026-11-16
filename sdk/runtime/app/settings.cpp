@@ -203,6 +203,9 @@ void Load() {
             // The field of view is a percentage with a fixed range; a
             // hand-edited file must not push the camera outside it.
             if (std::strcmp(o.key, "fov_percent") == 0) *o.value = std::clamp(*o.value, 50u, 200u);
+            if (std::strcmp(o.key, "controller_aim_response") == 0) *o.value = std::min(*o.value, 1u);
+            if (std::strcmp(o.key, "controller_aim_sensitivity_percent") == 0)
+                *o.value = std::clamp(*o.value, 100u, 400u);
         }
     }
     if (kGame.load) kGame.load(&t);

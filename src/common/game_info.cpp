@@ -155,6 +155,8 @@ const app::GameInfo app::kGame = {
     .options = {{"show_fps", &game::g_show_fps, nullptr}, {"fov_percent", nullptr, &game::g_fov_percent},
                 {"mouse_sensitivity_percent", nullptr, &input::g_mouse_sensitivity_percent},
                 {"mouse_vertical_sensitivity_percent", nullptr, &input::g_mouse_vertical_sensitivity_percent},
+                {"controller_aim_response", nullptr, &input::g_controller_aim_response},
+                {"controller_aim_sensitivity_percent", nullptr, &input::g_controller_aim_sensitivity_percent},
                 {"direct_mouse_aim", &input::g_direct_mouse_aim, nullptr},
                 {"prompt_style", nullptr, &input::g_prompt_override}},
     .load = input::LoadBindings,          // [controls], and the older letter keys

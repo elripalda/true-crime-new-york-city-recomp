@@ -11,6 +11,8 @@ namespace input {
 
 uint32_t g_mouse_sensitivity_percent = 100;
 uint32_t g_mouse_vertical_sensitivity_percent = 100;
+uint32_t g_controller_aim_response = 0;
+uint32_t g_controller_aim_sensitivity_percent = 100;
 uint32_t g_reload_key = 'R', g_heavy_attack_key = 0, g_use_key = 'E', g_climb_key = 'G';
 bool g_direct_mouse_aim = true;
 
@@ -25,6 +27,8 @@ bool DirectAimRecent() {
 }
 
 bool MouseMovedRecently() { return false; }
+
+bool MouseLookStickActive() { return false; }
 
 bool CanBindKey(uint32_t) { return false; }
 void LoadBindings(const void*) {}

@@ -179,6 +179,7 @@ constexpr uint32_t TC_ADDR(uint32_t usa) {
         case 0x003F58E0u: return 0x003F61B0u;
         case 0x00400000u: return 0x00400000u;
         case 0x00420468u: return 0x00420D38u;
+        case 0x004204ECu: return 0x00420DBCu;  // input state: right stick bytes at +0x70
         case 0x004C632Cu: return 0x004C6C2Cu;
         case 0x004C6380u: return 0x004C6C80u;
         case 0x004D48A4u: return 0x004D51A4u;
@@ -230,6 +231,8 @@ constexpr uint32_t TC_ADDR(uint32_t usa) {
 #define __imp__sub_00018C80 __imp__sub_00018CC0
 #define sub_00019230 sub_00019270
 #define __imp__sub_00019230 __imp__sub_00019270
+#define sub_0001F030 sub_0001F070
+#define __imp__sub_0001F030 __imp__sub_0001F070
 #define sub_0001FD40 sub_0001FD80
 #define __imp__sub_0001FD40 __imp__sub_0001FD80
 #define sub_000205A0 sub_000205E0
@@ -242,6 +245,18 @@ constexpr uint32_t TC_ADDR(uint32_t usa) {
 #define __imp__sub_00025910 __imp__sub_00025950
 #define sub_00029A40 sub_00029A80
 #define __imp__sub_00029A40 __imp__sub_00029A80
+#define sub_0002A7B0 sub_0002A7F0
+#define __imp__sub_0002A7B0 __imp__sub_0002A7F0
+#define sub_0002AAF0 sub_0002AB30
+#define __imp__sub_0002AAF0 __imp__sub_0002AB30
+#define sub_0001FCA0 sub_0001FCE0
+#define __imp__sub_0001FCA0 __imp__sub_0001FCE0
+#define sub_00027380 sub_000273C0
+#define __imp__sub_00027380 __imp__sub_000273C0
+#define sub_000225B0 sub_000225F0
+#define __imp__sub_000225B0 __imp__sub_000225F0
+#define sub_0002CFC0 sub_0002D010
+#define __imp__sub_0002CFC0 __imp__sub_0002D010
 #define sub_0002E200 sub_0002E240
 #define __imp__sub_0002E200 __imp__sub_0002E240
 #define sub_00058D90 sub_00058DB0

@@ -61,14 +61,24 @@
 // own chase camera comes back.
 //
 // TCNYC_MOUSE_STICK=1 restores the old right-stick path.
+//
+// The pad's own right-stick response is replaced here as well. The look
+// controllers read the two signed stick bytes through sub_0001F030 and then
+// cube them; while one of those controllers runs, that accessor returns a
+// pre-shaped sample from common/controller_look.h (one radial dead zone, a
+// quadratic curve and the optional aim scale). Original leaves the accessor
+// untouched. The mouse's direct path and keyboard/mouse fallback are excluded.
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 
+#include "common/controller_look.h"
 #include "core/input.h"
+#include "core/log.h"
 #include "level_generation.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
@@ -93,6 +103,10 @@ constexpr uint32_t kPlayer = TC_ADDR(0x37D284); // [0x37D284] -> local player pa
 constexpr uint32_t kLockTarget = 0xB4; // player + 0xB4 -> locked pawn
 constexpr uint32_t kInvertX = 0xFEF;   // game + 0xFEF
 constexpr uint32_t kInvertY = 0xFEE;   // game + 0xFEE
+// The input manager holds the pad axes as signed bytes at +0x70. The look
+// controllers read them through sub_0001F030, which normalises by 128.
+constexpr uint32_t kInputState = TC_ADDR(0x4204EC); // [0x4204EC] -> input state
+constexpr uint32_t kStickAxes = 0x70;               // state + 0x70/0x71: right stick x/y
 
 constexpr uint8_t kModeVehicle = 13;
 
@@ -295,6 +309,143 @@ void RestorePitch(uint8_t *base, uint32_t controller, uint32_t old_min, uint32_t
     std::memcpy(base + controller + 0x24, &old_max, sizeof(old_max));
 }
 
+namespace cl = game::controller_look;
+using cl::GameCurve;
+
+// Which cubic the look controller about to run applies to its stick sample.
+// The response mapping is only active inside a gameplay look controller, so
+// movement, menus and the mouse's fallback stick keep their original feel.
+struct LookMapping {
+    bool active = false;
+    GameCurve curve = GameCurve::RadialCubic;
+};
+thread_local LookMapping t_look_mapping;
+
+struct ScopedLookMapping {
+    LookMapping previous;
+    ScopedLookMapping(GameCurve curve, bool gameplay) : previous(t_look_mapping) {
+        const uint32_t response =
+            std::atomic_ref(input::g_controller_aim_response).load(std::memory_order_relaxed);
+        const bool mouse_stick = input::MouseLookStickActive();
+        t_look_mapping = {gameplay && response == 0 && !mouse_stick, curve};
+        // LOGR: release and dev builds both define NDEBUG, which drops info lines.
+        static std::atomic<int> active_logged{0}, skipped_logged{0};
+        if (t_look_mapping.active) {
+            if (active_logged.fetch_add(1, std::memory_order_relaxed) < 1)
+                LOGR("controller look: right-stick curve active (%s cubic)",
+                     curve == GameCurve::RadialCubic ? "radial" : "per-axis");
+        } else if (skipped_logged.fetch_add(1, std::memory_order_relaxed) < 3) {
+            LOGR("controller look: right-stick curve skipped (gameplay %d, response %u, mouse stick %d)",
+                 int(gameplay), response, int(mouse_stick));
+        }
+    }
+    ~ScopedLookMapping() { t_look_mapping = previous; }
+    ScopedLookMapping(const ScopedLookMapping &) = delete;
+    ScopedLookMapping &operator=(const ScopedLookMapping &) = delete;
+};
+
+// A look step's own pitch change, kept against a recompute from a pinned camera.
+//
+// Several camera updates run a look step (the stick moves 0x348A80) and then
+// recompute the pitch from where the camera actually is: sub_0001FCA0,
+// sub_000225B0 and sub_0002CFC0 set 0x348A80 to -atan2(height, distance) from
+// the camera position at 0x348A60 to its look point at 0x3489E0. Looking hard
+// up swings the camera down behind the player until the ground stops it, so the
+// recomputed pitch is pinned. Pushing the stick back down then moves the pitch
+// in the look step, the recompute puts the pinned value straight back, and the
+// camera position only creeps after it: the view sticks at the top for seconds
+// (in the L2 view until L2 is released). When the stick moved the pitch back
+// toward the middle of the controller's range and the recompute would pull it
+// away again, keep the look step's pitch. Pushing further into the pin, and
+// every frame without stick movement, is unchanged.
+struct LookStep {
+    bool valid = false;
+    float before = 0, after = 0, middle = 0;
+    uint64_t at_us = 0;  // when the look step ran
+    uint32_t kept = 0;   // recomputes overridden since
+};
+thread_local LookStep t_look_step;
+thread_local int t_camera_update_depth = 0;
+
+uint64_t NowUs() {
+    return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count());
+}
+
+// One camera update (the shared per-frame update or a controller's own). A look
+// step's record lasts until the outermost update ends.
+struct CameraUpdateScope {
+    CameraUpdateScope() {
+        if (t_camera_update_depth++ == 0) t_look_step = {};
+    }
+    ~CameraUpdateScope() {
+        if (--t_camera_update_depth == 0) t_look_step = {};
+    }
+    CameraUpdateScope(const CameraUpdateScope &) = delete;
+    CameraUpdateScope &operator=(const CameraUpdateScope &) = delete;
+};
+
+void RecordLookStep(uint8_t *base, uint32_t controller, float before) {
+    if (!mem::IsCommitted(controller + 0x20) || !mem::IsCommitted(controller + 0x24)) return;
+    t_look_step.valid = true;
+    t_look_step.before = before;
+    t_look_step.after = RdF(base, kPitch);
+    t_look_step.middle = (RdF(base, controller + 0x20) + RdF(base, controller + 0x24)) * 0.5f;
+    t_look_step.at_us = NowUs();
+    t_look_step.kept = 0;
+}
+
+// After a pitch recompute. Outside a hooked camera update the record is only
+// trusted for the same update (a few milliseconds), never a later frame's.
+void KeepStickPitch(uint8_t *base) {
+    if (!t_look_step.valid) return;
+    if (t_camera_update_depth == 0 && NowUs() - t_look_step.at_us > 4000) {
+        t_look_step = {};
+        return;
+    }
+    const float delta = t_look_step.after - t_look_step.before;
+    const float pitch = RdF(base, kPitch);
+    const bool undoes_stick = (pitch - t_look_step.after) * delta < 0;
+    const bool toward_middle =
+        std::fabs(t_look_step.after - t_look_step.middle) < std::fabs(t_look_step.before - t_look_step.middle);
+    if (delta != 0 && undoes_stick && toward_middle) {
+        std::memcpy(base + kPitch, &t_look_step.after, sizeof(t_look_step.after));
+        t_look_step.kept++;
+    }
+}
+
+// The pre-shaped value to return for one right-stick axis. Read both axes so
+// the dead zone and curve stay radial; the guest then applies its own cubic.
+float MappedStickAxis(uint8_t *base, uint32_t axis) {
+    const uint32_t state = mem::IsCommitted(kInputState) ? X86_MEM32(kInputState) : 0;
+    if (!state || !mem::IsCommitted(state + kStickAxes + 1)) return 0;
+    const float x = float(int8_t(X86_MEM8(state + kStickAxes))) / cl::kStickFullScale;
+    const float y = float(int8_t(X86_MEM8(state + kStickAxes + 1))) / cl::kStickFullScale;
+    const uint32_t percent = std::clamp(
+        std::atomic_ref(input::g_controller_aim_sensitivity_percent).load(std::memory_order_relaxed),
+        cl::kMinSensitivityPercent, cl::kMaxSensitivityPercent);
+    const cl::Stick shaped =
+        cl::Feed({x, y}, t_look_mapping.curve, cl::kRadialDeadzone, float(percent) * 0.01f);
+    return axis == 0 ? shaped.x : shaped.y;
+}
+
+// sub_0001F030 is the look controllers' stick accessor. While a mapped
+// controller is running, replace axes 0 and 1 with the shaped sample before
+// its cubic. Any other caller and the Original response go through unchanged.
+X86_EXTERN_FUNC(__imp__sub_0001F030);
+X86_FUNC(sub_0001F030) {
+    if (t_look_mapping.active) {
+        const uint32_t axis = X86_MEM32(ctx.esp + 4);
+        if (axis == 0 || axis == 1) {
+            x87_push(ctx, double(MappedStickAxis(base, axis)));
+            ctx.esp += 4;  // the original ends in a plain ret; its callers remove the two arguments
+            return;
+        }
+    }
+    __imp__sub_0001F030(ctx, base);
+}
+
 using GuestFunc = void (*)(X86Context &, uint8_t *);
 
 // Some camera paths run a look controller's own input step without going
@@ -302,12 +453,18 @@ using GuestFunc = void (*)(X86Context &, uint8_t *);
 // there when the shared update did not, but never consume the delta twice.
 // The requested heading is put back after the controller's own target pass,
 // except while a lock-on target is active, where the game's snap wins.
-void RunControllerAim(X86Context &ctx, uint8_t *base, GuestFunc original) {
+void RunControllerAim(X86Context &ctx, uint8_t *base, GuestFunc original, GameCurve curve) {
     const uint32_t controller = ctx.ecx;
-    const uint32_t camera = input::g_direct_mouse_aim ? ActiveGameplayCamera(base, controller) : 0;
+    const uint32_t camera = ActiveGameplayCamera(base, controller);
+    // The response mapping follows this controller's own stick read. It is
+    // active for gameplay pad look only, never for the mouse's fallback stick
+    // or another camera that shares the controller method.
+    ScopedLookMapping mapping(curve, camera != 0);
     const bool requested = AimRequested(controller);
     if (!camera || !input::g_direct_mouse_aim || Rd8(base, camera + kMode) == kModeVehicle) {
+        const float before = RdF(base, kPitch);
         original(ctx, base);
+        RecordLookStep(base, controller, before);
         return;
     }
 
@@ -328,7 +485,9 @@ void RunControllerAim(X86Context &ctx, uint8_t *base, GuestFunc original) {
         if (mouse_aim) base[kAutoCenter] = 0;
     }
 
+    const float before = RdF(base, kPitch);
     original(ctx, base);
+    RecordLookStep(base, controller, before);
     RestoreRequestedAim(base, controller);
 
     if (!requested) {
@@ -348,6 +507,7 @@ void RunControllerAim(X86Context &ctx, uint8_t *base, GuestFunc original) {
 // the requested yaw there, after their own target/transition calculations.
 X86_EXTERN_FUNC(__imp__sub_0002E200);
 X86_FUNC(sub_0002E200) {
+    CameraUpdateScope scope;
     const uint32_t camera = ctx.ecx;
     const uint32_t controller = camera ? Rd(base, camera + kActive) : 0;
     const uint8_t mode = camera ? Rd8(base, camera + kMode) : 0;
@@ -457,13 +617,62 @@ X86_FUNC(sub_0001FD40) {
 // heading back after the controller's target/lock-on pass, which would
 // otherwise leave the view on the target while the mouse is moving.
 X86_EXTERN_FUNC(__imp__sub_000205A0);
-X86_FUNC(sub_000205A0) { RunControllerAim(ctx, base, __imp__sub_000205A0); }
+X86_FUNC(sub_000205A0) { RunControllerAim(ctx, base, __imp__sub_000205A0, GameCurve::RadialCubic); }
 
 X86_EXTERN_FUNC(__imp__sub_00029A40);
-X86_FUNC(sub_00029A40) { RunControllerAim(ctx, base, __imp__sub_00029A40); }
+X86_FUNC(sub_00029A40) { RunControllerAim(ctx, base, __imp__sub_00029A40, GameCurve::RadialCubic); }
 
 X86_EXTERN_FUNC(__imp__sub_00025910);
-X86_FUNC(sub_00025910) { RunControllerAim(ctx, base, __imp__sub_00025910); }
+X86_FUNC(sub_00025910) { RunControllerAim(ctx, base, __imp__sub_00025910, GameCurve::PerAxisCubic); }
+
+// The look controller used while L2 is held. Its stick step matches
+// sub_000205A0 (axes 0 and 1, magnitude cubed). Only the right-stick response
+// and the pinned-pitch fix apply here; the mouse paths above are unchanged.
+X86_EXTERN_FUNC(__imp__sub_0002A7B0);
+X86_FUNC(sub_0002A7B0) {
+    const uint32_t controller = ctx.ecx;
+    ScopedLookMapping mapping(GameCurve::RadialCubic, ActiveGameplayCamera(base, controller) != 0);
+    const float before = RdF(base, kPitch);
+    __imp__sub_0002A7B0(ctx, base);
+    RecordLookStep(base, controller, before);
+}
+
+// Another look step with the same radial cubic (axes 0 and 1, magnitude cubed,
+// then the controller's own pitch clamp at +0x20/+0x24).
+X86_EXTERN_FUNC(__imp__sub_00027380);
+X86_FUNC(sub_00027380) {
+    const uint32_t controller = ctx.ecx;
+    ScopedLookMapping mapping(GameCurve::RadialCubic, ActiveGameplayCamera(base, controller) != 0);
+    const float before = RdF(base, kPitch);
+    __imp__sub_00027380(ctx, base);
+    RecordLookStep(base, controller, before);
+}
+
+// The L2 view's update: its look step, then the recompute from the camera.
+X86_EXTERN_FUNC(__imp__sub_0002AAF0);
+X86_FUNC(sub_0002AAF0) {
+    CameraUpdateScope scope;
+    __imp__sub_0002AAF0(ctx, base);
+}
+
+// The pitch recomputes from the camera position.
+X86_EXTERN_FUNC(__imp__sub_0001FCA0);
+X86_FUNC(sub_0001FCA0) {
+    __imp__sub_0001FCA0(ctx, base);
+    KeepStickPitch(base);
+}
+
+X86_EXTERN_FUNC(__imp__sub_000225B0);
+X86_FUNC(sub_000225B0) {
+    __imp__sub_000225B0(ctx, base);
+    KeepStickPitch(base);
+}
+
+X86_EXTERN_FUNC(__imp__sub_0002CFC0);
+X86_FUNC(sub_0002CFC0) {
+    __imp__sub_0002CFC0(ctx, base);
+    KeepStickPitch(base);
+}
 
 // The blend from the car to the on-foot camera after leaving a vehicle (about 2.5 s). While 0x348988 is set, the
 // on-foot controller's update (0x28C50) asks this routine first and, when it returns true, skips its whole look and
