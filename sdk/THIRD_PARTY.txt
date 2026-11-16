@@ -219,3 +219,14 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
+
+dr_mp3 v0.7.5, dr_flac v0.13.5 and dr_wav v0.14.7 (dr_libs commit f12e197fd462e4c22873fbd70d11b1d2f2c1dc3c, https://github.com/mackron/dr_libs)
+
+Public domain or MIT No Attribution, at your choice. Copyright 2023 David Reid.
+Based on minimp3 (https://github.com/lieff/minimp3), released under CC0 1.0.
+Vendored at sdk/third_party/audio/dr_mp3.h, dr_flac.h and dr_wav.h; the full statements are at the end of each file.
+
+stb_vorbis (stb commit 9600522de53973336fa033a289858a4354cbb04c, https://github.com/nothings/stb)
+
+Public domain or MIT License, at your choice. Copyright (c) 2017 Sean Barrett.
+Vendored at sdk/third_party/audio/stb_vorbis.c; the full statements are at the end of that file.

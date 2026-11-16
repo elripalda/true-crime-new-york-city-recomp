@@ -96,7 +96,42 @@ void ReportAudioRefill(uint32_t voice, int64_t completion_ms, int64_t submission
     if (!found) LOGI("audio trace: refill %08X: no guest refill calls captured", voice);
 }
 } // namespace game
+
 #endif
+
+namespace game {
+uint32_t LastMusicTrack();  // extra_songs.cpp
+namespace {
+thread_local uint32_t t_radio_track;  // the Music Player song being started on this thread
+}
+uint32_t RadioOverrideTrack() { return t_radio_track; }
+}
+
+X86_EXTERN_FUNC(__imp__sub_0025DE90);
+X86_FUNC(sub_0025DE90) {
+    const uint32_t caller = X86_MEM32(ctx.esp);
+    const uint32_t track = X86_MEM32(ctx.esp + 4);
+    const uint32_t flags = X86_MEM32(ctx.esp + 8);
+#if TCNYC_DEV_TOOLS
+    static const bool trace = [] {
+        const char* flag = std::getenv("TCNYC_TEST_RADIO_TRACE");
+        return flag && std::strcmp(flag, "1") == 0;
+    }();
+    if (trace) {
+        LOGR("radio trace: caller %08X stream %08X track %u flags %u",
+             caller, ctx.ecx, track, flags);
+    }
+#endif
+    // The Music Player previews a selection, restarts a song, or starts radio playback here.
+    // Other callers start scripted music and can use the same song IDs.
+    const bool music_player = TCNYC_PAL
+        ? caller == 0x79AF1 || caller == 0x79B5A || caller == 0x7ACD4 || caller == 0x7AF86
+        : caller == 0x799D1 || caller == 0x79A3A || caller == 0x7ABB4 || caller == 0x7AE66;
+    const uint32_t previous = game::t_radio_track;
+    game::t_radio_track = music_player && flags == 0 && track >= 6000 && track <= game::LastMusicTrack() ? track : 0;
+    __imp__sub_0025DE90(ctx, base);
+    game::t_radio_track = previous;
+}
 
 X86_EXTERN_FUNC(__imp__sub_0025DA90);
 X86_FUNC(sub_0025DA90) {
