@@ -1,5 +1,18 @@
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(tcnyc_rep_stos_test "${TCNYC_REPO}/tests/rep_stos.cpp")
+    target_include_directories(tcnyc_rep_stos_test PRIVATE "${TCNYC_REPO}/sdk/runtime")
+    add_test(NAME rep_stos COMMAND tcnyc_rep_stos_test)
+
+    add_executable(tcnyc_guest_format_test "${TCNYC_REPO}/tests/guest_format.cpp")
+    target_include_directories(tcnyc_guest_format_test PRIVATE "${TCNYC_REPO}/sdk/runtime")
+    add_test(NAME guest_format COMMAND tcnyc_guest_format_test)
+
+    add_executable(tcnyc_crash_log_test "${TCNYC_REPO}/tests/crash_log.cpp")
+    target_include_directories(tcnyc_crash_log_test PRIVATE "${TCNYC_REPO}/sdk/runtime")
+    add_test(NAME crash_log COMMAND tcnyc_crash_log_test)
+    set_tests_properties(crash_log PROPERTIES TIMEOUT 5)
+
     add_executable(tcnyc_release_test "${TCNYC_REPO}/tests/release_metadata.cpp" "${TCNYC_REPO}/launcher/updater.cpp")
     target_include_directories(tcnyc_release_test PRIVATE "${TCNYC_REPO}/launcher")
     target_link_libraries(tcnyc_release_test PRIVATE ${TCNYC_TEST_SDL})

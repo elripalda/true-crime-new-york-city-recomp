@@ -1,6 +1,7 @@
 #include "core/log.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -15,6 +16,8 @@ namespace fs = std::filesystem;
 namespace logx {
 
 static std::mutex g_mutex;
+// The thread inside the logger's lock: a crash on that thread must not wait for it.
+static std::atomic<std::thread::id> g_owner{};
 static std::atomic<bool> g_crash_mode{false};
 static FILE* g_file = nullptr;
 static fs::path g_file_path;
@@ -22,6 +25,20 @@ static std::string g_path;
 static auto g_start = std::chrono::steady_clock::now();
 
 constexpr int kKeep = 30;
+
+// g_mutex, with its owner recorded for the crash path
+struct Held {
+    Held() {
+        g_mutex.lock();
+        g_owner.store(std::this_thread::get_id(), std::memory_order_relaxed);
+    }
+    ~Held() {
+        g_owner.store(std::thread::id(), std::memory_order_relaxed);
+        g_mutex.unlock();
+    }
+    Held(const Held&) = delete;
+    Held& operator=(const Held&) = delete;
+};
 
 // Opens the log without narrowing the install path through the ANSI code page.
 static FILE* OpenLog(const fs::path& path, bool append) {
@@ -42,7 +59,7 @@ static int RunNumber(const fs::path& file, const std::string& prefix) {
 }
 
 void Init(const fs::path& dir, const std::string& prefix, bool append) {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    Held lock;
     std::error_code ec;
     fs::create_directories(dir, ec);
     if (!kVerbose) {
@@ -91,18 +108,37 @@ void Write(Level lv, const char* fmt, ...) {
         std::fwrite(line, 1, size_t(n), stderr);
     };
     if (g_crash_mode.load(std::memory_order_relaxed)) {
-        std::unique_lock<std::mutex> lock(g_mutex, std::try_to_lock);
-        // A fault inside the logger itself already holds g_mutex: still write the
-        // line to stderr instead of deadlocking the crash filter.
-        emit(lock.owns_lock());
+        // A fault inside the logger itself already holds g_mutex on this thread: write the
+        // line to stderr only instead of deadlocking the crash filter. Another thread
+        // holding it releases it in a moment, so wait briefly and keep the line in the file.
+        if (g_owner.load(std::memory_order_relaxed) == std::this_thread::get_id()) {
+            emit(false);
+            return;
+        }
+        bool got = g_mutex.try_lock();
+        for (int i = 0; i < 250 && !got; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            got = g_mutex.try_lock();
+        }
+        if (!got) {
+            emit(false);
+            return;
+        }
+        g_owner.store(std::this_thread::get_id(), std::memory_order_relaxed);
+        emit(true);
+        g_owner.store(std::thread::id(), std::memory_order_relaxed);
+        g_mutex.unlock();
     } else {
-        std::lock_guard<std::mutex> lock(g_mutex);
+        Held lock;
         emit(true);
     }
 }
 
 void Flush() {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    // Crash messages flush as they are written. The faulting thread may
+    // already own the logger mutex, so skip the ordinary shutdown flush.
+    if (g_crash_mode.load(std::memory_order_relaxed)) return;
+    Held lock;
     if (g_file) std::fflush(g_file);
 }
 

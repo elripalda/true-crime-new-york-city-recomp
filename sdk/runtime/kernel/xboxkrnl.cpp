@@ -7,6 +7,7 @@
 #include "app/app.h"
 #include "kernel/crypto.h"
 #include "kernel/exports.h"
+#include "kernel/guest_format.h"
 #include "xbe/xbe.h"
 
 namespace kernel {
@@ -1149,78 +1150,19 @@ KERNEL_EXPORT(312, RtlUnwind, 4) {
 
 KERNEL_EXPORT(26, ExRaiseException, 1) { return kimpl_RtlRaiseException(ctx, a); }
 
-static std::string FormatGuest(X86Context& ctx, uint32_t fmt_va, uint32_t args_va, bool trim = true) {
-    std::string fmt = ReadCString(fmt_va), out;
-    uint32_t ap = args_va;
-    for (size_t i = 0; i < fmt.size(); i++) {
-        if (fmt[i] != '%') {
-            out += fmt[i];
-            continue;
-        }
-        std::string spec = "%";
-        i++;
-        while (i < fmt.size() && std::strchr("-+ #0123456789.*lhI", fmt[i])) spec += fmt[i++];
-        if (i >= fmt.size()) break;
-        char c = fmt[i];
-        char buf[512];
-        if (c == '%') {
-            out += '%';
-            continue;
-        }
-        if (c == 's') {
-            // %.*s: the precision is an int argument before the string pointer.
-            int precision = -1;
-            if (spec.find('*') != std::string::npos) {
-                precision = int32_t(R32(ap));
-                ap += 4;
-            }
-            std::string text = ReadCString(R32(ap), 256);
-            ap += 4;
-            if (precision >= 0 && text.size() > size_t(precision)) text.resize(size_t(precision));
-            out += text;
-            continue;
-        }
-        if (c == 'f' || c == 'g' || c == 'e') {
-            double d;
-            std::memcpy(&d, HostPtr(ap), 8);
-            ap += 8;
-            std::snprintf(buf, sizeof(buf), (spec + c).c_str(), d);
-            out += buf;
-            continue;
-        }
-        // %I64d/%I64u/%I64x take a 64-bit guest argument. Strip the I/l/h markers
-        // and ask snprintf for a long long.
-        const bool int64 = spec.find("I64") != std::string::npos;
-        std::string clean;
-        for (char ch : spec)
-            if (ch != 'l' && ch != 'h' && ch != 'I' && !(int64 && (ch == '6' || ch == '4'))) clean += ch;
-        // Only conversions that consume the guest's 32-bit argument. %n and
-        // arbitrary snprintf conversions would write through guest pointers.
-        if (!std::strchr("diouxXc", c) && c != 'p') {
-            out += '%';
-            continue;
-        }
-        if (int64) {
-            const uint64_t v = uint64_t(R32(ap)) | uint64_t(R32(ap + 4)) << 32;
-            ap += 8;
-            const bool signed_value = c == 'd' || c == 'i';
-            std::snprintf(buf, sizeof(buf), (clean + (signed_value ? "ll" : "ll") + c).c_str(),
-                          signed_value ? static_cast<long long>(static_cast<int64_t>(v))
-                                       : static_cast<unsigned long long>(v));
-            out += buf;
-            continue;
-        }
-        std::snprintf(buf, sizeof(buf), (clean + (c == 'p' ? 'x' : c)).c_str(), R32(ap));
-        ap += 4;
-        out += buf;
-    }
-    (void)ctx;
+static std::string FormatGuest(uint32_t fmt_va, uint32_t args_va, bool trim = true) {
+    auto next_word = [&] {
+        const uint32_t word = R32(args_va);
+        args_va += 4;
+        return word;
+    };
+    std::string out = FormatGuestText(ReadCString(fmt_va), next_word, ReadCString);
     while (trim && !out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back();
     return out;
 }
 
 static void DbgPrintEntry(X86Context& ctx, uint8_t*) {
-    LOGI("DbgPrint: %s", FormatGuest(ctx, R32(ctx.esp + 4), ctx.esp + 8).c_str());
+    LOGI("DbgPrint: %s", FormatGuest(R32(ctx.esp + 4), ctx.esp + 8).c_str());
     ctx.eax = 0;
     ctx.esp += 4;  // cdecl
 }
@@ -1229,13 +1171,13 @@ static const bool kreg_DbgPrint = (RegisterExport(8, "DbgPrint", DbgPrintEntry),
 // cdecl: RtlSprintf(buffer, format, ...), RtlSnprintf(buffer, count, format, ...); a result longer than count
 // fills count bytes unterminated and returns -1
 static void SprintfEntry(X86Context& ctx, uint8_t*) {
-    std::string s = FormatGuest(ctx, R32(ctx.esp + 8), ctx.esp + 12, false);
+    std::string s = FormatGuest(R32(ctx.esp + 8), ctx.esp + 12, false);
     std::memcpy(HostPtr(R32(ctx.esp + 4)), s.c_str(), s.size() + 1);
     ctx.eax = uint32_t(s.size());
     ctx.esp += 4;
 }
 static void SnprintfEntry(X86Context& ctx, uint8_t*) {
-    std::string s = FormatGuest(ctx, R32(ctx.esp + 12), ctx.esp + 16, false);
+    std::string s = FormatGuest(R32(ctx.esp + 12), ctx.esp + 16, false);
     uint32_t count = R32(ctx.esp + 8);
     uint32_t n = std::min<uint32_t>(uint32_t(s.size()) + 1, count);
     std::memcpy(HostPtr(R32(ctx.esp + 4)), s.c_str(), n);

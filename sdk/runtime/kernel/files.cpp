@@ -54,8 +54,9 @@ FILE* OpenHostFile(const fs::path& path, const char* mode) {
     DWORD access = GENERIC_READ;
     DWORD disposition = OPEN_EXISTING;
     int flags = _O_RDONLY | _O_BINARY;
-    if (std::strcmp(mode, "r+b") == 0) {
+    if (std::strcmp(mode, "r+b") == 0 || std::strcmp(mode, "w+b") == 0) {
         access = GENERIC_READ | GENERIC_WRITE;
+        if (mode[0] == 'w') disposition = CREATE_ALWAYS;
         flags = _O_RDWR | _O_BINARY;
     } else if (std::strcmp(mode, "wb") == 0) {
         access = GENERIC_WRITE;

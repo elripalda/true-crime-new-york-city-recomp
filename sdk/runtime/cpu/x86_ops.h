@@ -263,24 +263,6 @@ inline void x86_rep_stos(X86Context& ctx, uint8_t* base, uint32_t w) {
         ctx.ecx = 0;
         return;
     }
-    if (!ctx.df && (w == 2 || w == 4)) {
-        // The common case: a forward fill. Write two elements at a time with
-        // memcpy so unaligned destinations stay safe.
-        const uint64_t pair = w == 4 ? (uint64_t(ctx.eax) << 32 | ctx.eax)
-                                     : (uint64_t(uint32_t(ctx.eax & 0xFFFFu) * 0x10001u) << 32 |
-                                        uint32_t(ctx.eax & 0xFFFFu) * 0x10001u);
-        uint8_t* out = base + ctx.edi;
-        uint32_t left = n;
-        while (left >= 2) {
-            std::memcpy(out, &pair, 8);
-            out += 8;
-            left -= 2;
-        }
-        if (left) std::memcpy(out, &pair, w);
-        ctx.edi += n * w;
-        ctx.ecx = 0;
-        return;
-    }
     int32_t d = ctx.df ? -int32_t(w) : int32_t(w);
     uint32_t v = ctx.eax;
     for (; n; n--) {
