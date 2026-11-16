@@ -26,6 +26,8 @@
 #include "app/app.h"
 #include "common/graphics_menu.h"
 #include "core/log.h"
+#include "controller_rows.h"
+#include "core/input.h"
 #include "display_rows.h"
 #include "city_grid.h"
 #include "gpu/backend.h"
@@ -61,6 +63,11 @@ constexpr uint32_t kMainTab = 0, kOptionsTab = 4, kTopBarFocus = 0;
 constexpr uint32_t kColourSelected = 0x80808080, kColourNormal = 0x60606060; // as the game's rows
 constexpr uint32_t kColourDisabled = 0x40404040;
 constexpr uint32_t kInputEvent = 9;
+
+// The Controller tab (Options tab 0): its rows come from the same getter, by port.
+constexpr uint32_t kControllerPage = 0x0F;
+constexpr uint32_t kControllerText = 0x043E9964;   // + row: the row's text
+constexpr uint32_t kControllerColour = 0xCAA49974; // + row: the row's text colour
 
 bool Tracing() {
     static const bool on = std::getenv("XBE_TRACE_OPTIONS_PAGE") != nullptr;
@@ -343,6 +350,122 @@ constexpr uint32_t kShellInputReady = TC_ADDR(0x003EE31A), kShellDialogOpen = TC
 constexpr uint32_t kShellAlternateBack = 0x800;
 uint32_t g_shell_exit_owner = 0;
 
+
+// ---- Options > Controller: aim rows after the game's five (controller_rows.h) ----
+
+namespace ctl = game::controller_rows;
+
+// the logical row shown in the tab's top slot; menu thread only
+uint32_t g_ctl_first = 0;
+
+bool OnControllerTab(uint8_t *base, uint32_t self) {
+    return self && X86_MEM32(self + kTopTab) == kOptionsTab && X86_MEM32(self + kPage) == kControllerPage;
+}
+
+ctl::Values ControllerValues() {
+    ctl::Values v;
+    v.response = std::atomic_ref(input::g_controller_aim_response).load(std::memory_order_relaxed);
+    v.stick = std::atomic_ref(input::g_controller_aim_sensitivity_percent).load(std::memory_order_relaxed);
+    v.mouse = std::atomic_ref(input::g_mouse_sensitivity_percent).load(std::memory_order_relaxed);
+    v.vertical = std::atomic_ref(input::g_mouse_vertical_sensitivity_percent).load(std::memory_order_relaxed);
+    return v;
+}
+
+void ApplyControllerValues(const ctl::Values &v) {
+    std::atomic_ref(input::g_controller_aim_response).store(v.response, std::memory_order_relaxed);
+    std::atomic_ref(input::g_controller_aim_sensitivity_percent).store(v.stick, std::memory_order_relaxed);
+    std::atomic_ref(input::g_mouse_sensitivity_percent).store(v.mouse, std::memory_order_relaxed);
+    std::atomic_ref(input::g_mouse_vertical_sensitivity_percent).store(v.vertical, std::memory_order_relaxed);
+    MarkSave();  // written once the steps settle, as the Display tab's rows
+}
+
+// guest buffers for the added rows' texts
+uint32_t ControllerTextBuffer(ctl::Option option) {
+    static const uint32_t buffers = mem::AllocSystem(uint32_t(ctl::Option::Count) * uint32_t(ctl::kTextBytes), 16);
+    return buffers ? buffers + uint32_t(option) * uint32_t(ctl::kTextBytes) : 0;
+}
+
+// The getter's answer for a Controller tab row port; false lets the game answer.
+bool ControllerRowPort(X86Context &ctx, uint8_t *base, uint32_t self, uint32_t out, uint32_t port,
+                       void (*original)(X86Context &, uint8_t *)) {
+    if (X86_MEM32(self + kFocus) != kRowListFocus) g_ctl_first = 0;  // the cursor left the rows
+    const bool text = port >= kControllerText && port < kControllerText + ctl::kShownRows;
+    const bool colour = port >= kControllerColour && port < kControllerColour + ctl::kShownRows;
+    if (!out || (!text && !colour)) return false;
+    const uint32_t slot = port - (text ? kControllerText : kControllerColour);
+    const uint32_t row = g_ctl_first + slot;
+    if (row >= ctl::kRowCount) return false;
+    const ctl::Values v = ControllerValues();
+    if (colour) {
+        if (ctl::Native(row) && g_ctl_first == 0) return false;  // unscrolled: the game's own colours
+        const bool lit = slot == X86_MEM32(self + kRow) && X86_MEM32(self + kFocus) == kRowListFocus;
+        const bool disabled = !ctl::Native(row) && !ctl::Enabled(v, ctl::OptionAt(row));
+        X86_MEM32(out) = disabled ? kColourDisabled : lit ? kColourSelected : kColourNormal;
+        ::kernel::Return(ctx, 0, 2);
+        return true;
+    }
+    if (ctl::Native(row)) {
+        if (row == slot) return false;
+        // a native row shown in another slot: ask the game for that row's own text
+        const uint32_t arg = ctx.esp + 8;
+        X86_MEM32(arg) = kControllerText + row;
+        original(ctx, base);
+        X86_MEM32(arg) = port;
+        return true;
+    }
+    const ctl::Option option = ctl::OptionAt(row);
+    const uint32_t buffer = ControllerTextBuffer(option);
+    if (!buffer) {
+        LOG_FIRST(1, "Controller tab: no guest memory for the aim rows");
+        return false;
+    }
+    char label[ctl::kTextBytes];
+    ctl::Text(v, option, label);
+    std::memcpy(base + buffer, label, std::strlen(label) + 1);
+    X86_MEM32(out) = buffer;
+    ::kernel::Return(ctx, 0, 2);
+    return true;
+}
+
+// The dispatcher's row-list input on the Controller tab; false lets the game take it unchanged.
+bool ControllerRowInput(X86Context &ctx, uint8_t *base, uint32_t self, uint32_t input,
+                        void (*original)(X86Context &, uint8_t *)) {
+    const uint32_t row = g_ctl_first + X86_MEM32(self + kRow);
+    const ctl::Step step = ctl::Input(row, input);
+    if (step.handled) {
+        g_ctl_first = ctl::Scroll(step.row, g_ctl_first);
+        X86_MEM32(self + kRow) = step.row - g_ctl_first;
+        if (step.change) {
+            ctl::Values v = ControllerValues();
+            if (ctl::Change(v, ctl::OptionAt(step.row), step.change)) ApplyControllerValues(v);
+        } else {
+            FlushSettings();  // navigation: the steps have settled
+        }
+        ::kernel::Return(ctx, 0, 3);
+        return true;
+    }
+    if (step.leave) {
+        // The game has no rows past its five: hand Back over from its first row, unscrolled.
+        if (!ctl::Native(row)) X86_MEM32(self + kRow) = 0;
+        else X86_MEM32(self + kRow) = row;
+        g_ctl_first = 0;
+        FlushSettings();
+        return false;
+    }
+    if (g_ctl_first == 0) return false;  // unscrolled: the row field already is the logical row
+    // a native row while scrolled: the game acts on its row field, so give it the logical row
+    X86_MEM32(self + kRow) = row;
+    original(ctx, base);
+    if (OnControllerTab(base, self) && X86_MEM32(self + kFocus) == kRowListFocus) {
+        const uint32_t now = X86_MEM32(self + kRow);
+        g_ctl_first = ctl::Scroll(now, g_ctl_first);
+        X86_MEM32(self + kRow) = now - g_ctl_first;
+    } else {
+        g_ctl_first = 0;
+    }
+    return true;
+}
+
 } // namespace
 
 X86_EXTERN_FUNC(__imp__sub_000AD5C0);
@@ -449,6 +572,8 @@ X86_FUNC(sub_000C7B80) {
     MaybeSave(); // the row getter runs every frame while the tab is open
     const uint32_t self = ctx.ecx, out = X86_MEM32(ctx.esp + 4), port = X86_MEM32(ctx.esp + 8);
     const bool exiting = self && self == g_exit.owner;
+    if (!exiting && OnControllerTab(base, self) && ControllerRowPort(ctx, base, self, out, port, __imp__sub_000C7B80))
+        return;
     const Page row_page = exiting ? Page::Exit : g_page;
     const bool outer_detail = game::city_grid::OuterDetailAvailable();
     const uint32_t rows = RowCount(row_page, outer_detail);
@@ -554,6 +679,11 @@ X86_FUNC(sub_000CB400) {
                  focus, input);
         }
     }
+    if (self && event == kInputEvent && OnControllerTab(base, self) && X86_MEM32(self + kFocus) == kRowListFocus &&
+        ControllerRowInput(ctx, base, self, input, __imp__sub_000CB400))
+        return;
+    if (event == kInputEvent && OnControllerTab(base, self) && X86_MEM32(self + kFocus) != kRowListFocus)
+        FlushSettings();  // left the rows: save what the steps changed
     if (self && event == kInputEvent && page == kDisplayPage && X86_MEM32(self + kFocus) == kRowListFocus) {
         const bool outer_detail = game::city_grid::OuterDetailAvailable();
         const Step step = Input(g_page, g_first + X86_MEM32(self + kRow), input, outer_detail);

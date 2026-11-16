@@ -61,6 +61,24 @@ inline constexpr uint32_t kUpscalers[] = {0, 1, kFsr3, kDlss};
 #else
 inline constexpr uint32_t kUpscalers[] = {0, 1, kFsr3};  // FSR 3.1 through AMD's open Vulkan backend
 #endif
+// Controller aim response: 0 is the port's radial dead zone + quadratic curve,
+// 1 keeps the original Xbox per-axis dead zone and cubic.
+inline constexpr uint32_t kControllerAimResponses[] = {0, 1};
+inline const char *ControllerAimResponseName(uint32_t response) {
+    static const char *const names[] = {"Refined", "Original"};
+    return names[response < 2 ? response : 0];
+}
+// Applied after the curve. 100 keeps the original full-stick turn speed; higher
+// values let players who still find full-stick turns slow raise it.
+inline constexpr uint32_t kControllerAimSensitivities[] = {
+    100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200,
+    220, 240, 260, 280, 300, 325, 350, 375, 400};
+// Mouse look speed and vertical speed relative to it, in percent (settings
+// mouse_sensitivity_percent / mouse_vertical_sensitivity_percent, 10 to 400).
+inline constexpr uint32_t kMinMouseSensitivityPercent = 10, kMaxMouseSensitivityPercent = 400;
+inline constexpr uint32_t kMouseSensitivities[] = {
+    10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150,
+    175, 200, 225, 250, 300, 350, 400};
 inline constexpr uint32_t kBloomStrengths[] = {50, 100, 150, 200, 300, 400};  // percent of the original
 inline constexpr uint32_t kShadowLevels[] = {0, 1, 2};  // shadow resolution and softness: off or original, then two steps
 inline constexpr uint32_t kSharpenPercents[] = {0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100};

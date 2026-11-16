@@ -11,6 +11,7 @@
 
 #include "app/app.h"
 #include "game/city_grid.h"
+#include "controller_look.h"
 #include "core/log.h"
 #include "graphics_choices.h"
 #include "keycode_map.h"
@@ -114,6 +115,10 @@ enum class Row {
     TextureReplacement,
     TextureDumping,
     DumpFormat,
+    ControllerAimResponse,
+    ControllerAimSensitivity,
+    MouseSensitivity,
+    MouseVerticalSensitivity,
     Controls,
     Defaults,
     Close,
@@ -159,6 +164,10 @@ constexpr Row kRows[] = {Row::DisplayMode,
                          Row::TextureReplacement,
                          Row::TextureDumping,
                          Row::DumpFormat,
+                         Row::ControllerAimResponse,
+                         Row::ControllerAimSensitivity,
+                         Row::MouseSensitivity,
+                         Row::MouseVerticalSensitivity,
                          Row::Controls,
                          Row::Defaults,
                          Row::Close};
@@ -482,6 +491,10 @@ namespace {
 
 void RestoreDefaults() {
     RestoreGraphicsDefaults();
+    std::atomic_ref(input::g_controller_aim_response).store(0, std::memory_order_relaxed);
+    std::atomic_ref(input::g_controller_aim_sensitivity_percent).store(100, std::memory_order_relaxed);
+    std::atomic_ref(input::g_mouse_sensitivity_percent).store(100, std::memory_order_relaxed);
+    std::atomic_ref(input::g_mouse_vertical_sensitivity_percent).store(100, std::memory_order_relaxed);
     const app::Settings d;
     g_menu.mode = d.display_mode; // display changes still wait for Apply
     g_menu.resolution = {d.width, d.height};
@@ -518,6 +531,10 @@ Kind KindOf(Row row) {
     case Row::HdrPaperWhite:
     case Row::HdrPeak:
     case Row::HdrHighlights:
+    case Row::ControllerAimResponse:
+    case Row::ControllerAimSensitivity:
+    case Row::MouseSensitivity:
+    case Row::MouseVerticalSensitivity:
         return Kind::Choice;
     case Row::Smaa:
     case Row::Taa:
@@ -543,6 +560,8 @@ bool Enabled(Row row) {
     if (row == Row::DumpFormat) return app::Get().dump_textures;
     if (row == Row::Upscaler) return app::Get().render_percent <= 100;
     if (row == Row::BloomStrength) return app::Get().bloom;
+    if (row == Row::ControllerAimSensitivity)
+        return std::atomic_ref(input::g_controller_aim_response).load(std::memory_order_relaxed) == 0;
     if (row == Row::CityOuterDetail) return game::city_grid::OuterDetailAvailable();
 #ifndef _WIN32
     if (row == Row::LowLatency) return false;  // Direct3D 12 only
@@ -638,6 +657,14 @@ const char *Label(Row row) {
         return "Texture dumping";
     case Row::DumpFormat:
         return "Dump format";
+    case Row::ControllerAimResponse:
+        return "Controller aim response";
+    case Row::ControllerAimSensitivity:
+        return "Controller aim sensitivity";
+    case Row::MouseSensitivity:
+        return "Mouse sensitivity";
+    case Row::MouseVerticalSensitivity:
+        return "Mouse vertical sensitivity";
     case Row::Controls:
         return "Controls...";
     case Row::Defaults:
@@ -659,6 +686,10 @@ const char *Section(Row row) {
         return "HDR output";
     case Row::TextureReplacement:
         return "Textures";
+    case Row::ControllerAimResponse:
+        return "Controller aim";
+    case Row::MouseSensitivity:
+        return "Mouse aim";
     case Row::Controls:
         return "CONTROLS";
     case Row::Defaults:
@@ -800,6 +831,18 @@ const char *Help(Row row) {
                "loading while on.";
     case Row::DumpFormat:
         return "File format for dumped textures.";
+    case Row::ControllerAimResponse:
+        return "Refined uses one 15% dead zone for the whole stick, then a quadratic curve: a diagonal push "
+               "turns the camera as far as a straight push at the same deflection. Original keeps the Xbox "
+               "per-axis dead zone and cubic response.";
+    case Row::ControllerAimSensitivity:
+        return "Scales controller turn speed after the refined curve. 100% keeps the original full-stick "
+               "turn speed; higher values help if full-stick turns still feel slow.";
+    case Row::MouseSensitivity:
+        return "How far the camera turns per mouse movement. 100% matches the PC version's default.";
+    case Row::MouseVerticalSensitivity:
+        return "Up and down speed as a share of the mouse sensitivity. 100% turns up and down as fast as left "
+               "and right.";
     case Row::Controls:
         return "Rebind the keyboard, mouse and controller. The button prompts follow your choices.";
     case Row::Defaults:
@@ -886,6 +929,25 @@ std::string Value(Row row) {
         return text;
     case Row::DumpFormat:
         return s.texture_dump_format ? "DDS" : "PNG";
+    case Row::ControllerAimResponse:
+        return choices::ControllerAimResponseName(
+            std::atomic_ref(input::g_controller_aim_response).load(std::memory_order_relaxed));
+    case Row::ControllerAimSensitivity:
+        std::snprintf(text, sizeof(text), "%u%%",
+                      std::clamp(std::atomic_ref(input::g_controller_aim_sensitivity_percent)
+                                     .load(std::memory_order_relaxed),
+                                 controller_look::kMinSensitivityPercent,
+                                 controller_look::kMaxSensitivityPercent));
+        return text;
+    case Row::MouseSensitivity:
+    case Row::MouseVerticalSensitivity:
+        std::snprintf(text, sizeof(text), "%u%%",
+                      std::clamp(std::atomic_ref(row == Row::MouseSensitivity
+                                                     ? input::g_mouse_sensitivity_percent
+                                                     : input::g_mouse_vertical_sensitivity_percent)
+                                     .load(std::memory_order_relaxed),
+                                 choices::kMinMouseSensitivityPercent, choices::kMaxMouseSensitivityPercent));
+        return text;
     case Row::Msaa: {
         const auto samples = app::MsaaSamples();
         return samples ? std::to_string(samples) + "x" : "Off";
@@ -1129,6 +1191,36 @@ bool Change(Row row, int direction) {
     case Row::DumpFormat:
         changed = set(s.texture_dump_format, direction > 0 ? 1u : 0u);
         break;
+    case Row::ControllerAimResponse: {
+        const uint32_t current =
+            std::atomic_ref(input::g_controller_aim_response).load(std::memory_order_relaxed);
+        const uint32_t next = choices::Step(choices::kControllerAimResponses, current, direction);
+        changed = next != current;
+        if (changed) std::atomic_ref(input::g_controller_aim_response).store(next, std::memory_order_relaxed);
+        break;
+    }
+    case Row::ControllerAimSensitivity: {
+        const uint32_t current = std::clamp(
+            std::atomic_ref(input::g_controller_aim_sensitivity_percent).load(std::memory_order_relaxed),
+            controller_look::kMinSensitivityPercent, controller_look::kMaxSensitivityPercent);
+        const uint32_t next = choices::Step(choices::kControllerAimSensitivities, current, direction);
+        changed = next != current;
+        if (changed)
+            std::atomic_ref(input::g_controller_aim_sensitivity_percent).store(next, std::memory_order_relaxed);
+        break;
+    }
+    case Row::MouseSensitivity:
+    case Row::MouseVerticalSensitivity: {
+        uint32_t &setting = row == Row::MouseSensitivity ? input::g_mouse_sensitivity_percent
+                                                         : input::g_mouse_vertical_sensitivity_percent;
+        const uint32_t current =
+            std::clamp(std::atomic_ref(setting).load(std::memory_order_relaxed), choices::kMinMouseSensitivityPercent,
+                       choices::kMaxMouseSensitivityPercent);
+        const uint32_t next = choices::Step(choices::kMouseSensitivities, current, direction);
+        changed = next != current;
+        if (changed) std::atomic_ref(setting).store(next, std::memory_order_relaxed);
+        break;
+    }
     case Row::HdrPaperWhite:
         changed = set(s.hdr_paper_white, choices::Step(choices::kHdrPaperWhiteNits, s.hdr_paper_white, direction));
         break;

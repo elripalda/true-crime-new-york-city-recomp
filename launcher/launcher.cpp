@@ -512,6 +512,52 @@ struct Controls {
         constexpr struct { const char *title; int first, last; } groups[] = {
             {"KEYBOARD: MOVEMENT", 0, 3}, {"KEYBOARD: ON FOOT", 4, 7},
             {"KEYBOARD: DRIVING", 8, 11}, {"KEYBOARD: EVERYWHERE", 12, 18}};
+        // Aim: the controller's right-stick response and speed, and the mouse's speeds. Each one is its
+        // own settings.toml key, written when the choice changes.
+        const auto percent = [](uint32_t v) { return std::to_string(v) + "%"; };
+        const auto aim_choice = [&](const char *label, const char *key, uint32_t &value,
+                                    std::span<const uint32_t> options, auto name, uint32_t low, uint32_t high,
+                                    bool enabled) {
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("%s", label);
+            ImGui::SetNextItemWidth(-1);
+            ImGui::PushID(key);
+            ImGui::BeginDisabled(!enabled);
+            const uint32_t shown = std::clamp(value, low, high);
+            if (ImGui::BeginCombo("##aim", name(shown).c_str())) {
+                for (const uint32_t option : options) {
+                    if (ImGui::Selectable(name(option).c_str(), shown == option)) {
+                        value = option;
+                        edits.insert_or_assign(key, int64_t(option));
+                    }
+                    if (shown == option) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::EndDisabled();
+            ImGui::PopID();
+        };
+        if (Graphics::Section("AIM")) {
+            aim_choice("Controller aim response", "controller_aim_response", input::g_controller_aim_response,
+                       kControllerAimResponses,
+                       [](uint32_t v) { return std::string(ControllerAimResponseName(v)); }, 0, 1, true);
+            aim_choice("Controller aim sensitivity", "controller_aim_sensitivity_percent",
+                       input::g_controller_aim_sensitivity_percent, kControllerAimSensitivities, percent,
+                       kControllerAimSensitivities[0],
+                       kControllerAimSensitivities[std::size(kControllerAimSensitivities) - 1],
+                       input::g_controller_aim_response == 0);
+            ImGui::TableNextColumn();  // the third column stays empty: controller on one line, mouse on the next
+            aim_choice("Mouse sensitivity", "mouse_sensitivity_percent", input::g_mouse_sensitivity_percent,
+                       kMouseSensitivities, percent, kMinMouseSensitivityPercent,
+                       kMaxMouseSensitivityPercent, true);
+            aim_choice("Mouse vertical sensitivity", "mouse_vertical_sensitivity_percent",
+                       input::g_mouse_vertical_sensitivity_percent, kMouseSensitivities, percent,
+                       kMinMouseSensitivityPercent, kMaxMouseSensitivityPercent, true);
+            ImGui::EndTable();
+            ImGui::TextDisabled("Refined controller aim: one dead zone for the whole stick and a smoother curve. "
+                                "Sensitivity applies to Refined only.");
+        }
+
         ImGui::TextDisabled("Click a slot, then press the key or mouse button. Delete clears it, Escape cancels, "
                             "right-click clears. Enter, the arrows and Escape always work in menus.");
         for (const auto &group : groups) {
