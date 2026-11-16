@@ -18,6 +18,8 @@ void TestOuter(uint8_t *base, X86Context &ctx, uint32_t city, uint32_t manager);
 // Phase 3b: load the 16 outer tiles around the centre and draw their cells after the game's nine.
 void DriveRing(uint8_t *base, X86Context &ctx, uint32_t city, uint32_t manager);
 void DrawRing(uint8_t *base, X86Context &ctx, uint32_t camera);
+// Clears every ring cell and link when the setting goes back to Normal.
+void ShutdownRing(uint8_t *base, X86Context &ctx, uint32_t city);
 // The game is about to move a centre cell; unload the store cells before it can free a shared object.
 void OnGameMove(uint8_t *base, X86Context &ctx, uint32_t city, uint32_t game_object, int32_t target_x,
                 int32_t target_y);

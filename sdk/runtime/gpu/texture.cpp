@@ -609,6 +609,7 @@ bool CopySurfaceMemory(const Surface& src, const Surface& dst, uint32_t count, u
 // declarations
 
 static uint32_t TypeSize(uint32_t t) {
+    if (t == 0x72) return 12;  // D3DVSDT_FLOAT2H: three packed floats, as vertex.cpp
     uint32_t kind = t & 15, count = (t >> 4) & 15;
     switch (kind) {
         case 0: return 4;                // D3DCOLOR

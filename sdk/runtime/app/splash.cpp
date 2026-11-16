@@ -29,6 +29,11 @@ namespace {
 
 constexpr auto kMinimum = std::chrono::seconds(1);
 
+std::string Utf8(const std::filesystem::path& path) {
+    const auto bytes = path.u8string();
+    return {bytes.begin(), bytes.end()};
+}
+
 HWND g_splash = nullptr;
 std::atomic<bool> g_waiting{false};
 std::chrono::steady_clock::time_point g_until;
@@ -55,7 +60,7 @@ bool Read(const std::filesystem::path& path, std::vector<uint32_t>& pixels, UINT
         hr = converter->CopyPixels(nullptr, w * 4, UINT(pixels.size() * 4), reinterpret_cast<BYTE*>(pixels.data()));
     }
     if (FAILED(hr) || !w || !h) {
-        LOGW("splash: %s could not be read (%08X)", path.string().c_str(), unsigned(hr));
+        LOGW("splash: %s could not be read (%08X)", Utf8(path).c_str(), unsigned(hr));
         return false;
     }
     return true;
@@ -113,7 +118,7 @@ bool OpenSplash() {
     SetWindowPos(g_splash, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
     g_until = std::chrono::steady_clock::now() + kMinimum;
     g_waiting = true;
-    LOGI("splash: %s, %ux%u", path.string().c_str(), w, h);
+    LOGI("splash: %s, %ux%u", Utf8(path).c_str(), w, h);
     return true;
 }
 

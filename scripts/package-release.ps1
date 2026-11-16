@@ -208,6 +208,16 @@ try {
 # packaging itself cannot make the tree look dirty.
 $version = (Get-Content -Raw -LiteralPath (Join-Path $root 'launcher/VERSION')).Trim()
 if (!$version) { throw 'launcher/VERSION is empty.' }
+# A release package must come from the tag it names: UPDATE-PROTOCOL carries
+# VERSION and the updater refuses an archive whose release tag disagrees.
+if ($env:TCNYC_ALLOW_UNTAGGED -ne '1') {
+    $releaseTag = "v$version"
+    $headTag = (git -C $root describe --tags --exact-match HEAD 2>$null | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $headTag -ne $releaseTag) {
+        if (!$headTag) { $headTag = 'untagged' }
+        throw "HEAD is $headTag, expected the release tag $releaseTag. Tag the release commit, or set TCNYC_ALLOW_UNTAGGED=1 for a local test package."
+    }
+}
 try { $git = (git -C $root rev-parse --short HEAD 2>$null) } catch { $git = $null }
 if (!$git) { $git = 'unknown' }
 else {
@@ -220,6 +230,7 @@ try {
     try {
         Add-ReleaseDirectory 'assets/'
         Add-ReleaseDirectory 'LICENSES/'
+        Add-ReleaseDirectory 'music/'  # the default custom music folder, empty
         Add-ReleaseFile $exe 'TrueCrimeNYC.exe'
         Add-ReleaseFile (Join-Path $root 'README.md') 'README.md'
         Add-ReleaseFile (Join-Path $root 'README-LINUX.md') 'README-LINUX.md'

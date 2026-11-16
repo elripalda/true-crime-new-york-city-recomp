@@ -83,7 +83,7 @@ fs::path ExecutablePath() {
 
 bool Protected(std::string_view name) {
     constexpr std::string_view keep[] = {"settings.toml", "settings-pal.toml", "launcher.toml",
-        "launcher-pal.toml", "assets", "assets-pal", "textures", "logs", "update", "shader-cache", "crashdumps"};
+        "launcher-pal.toml", "assets", "assets-pal", "textures", "music", "logs", "update", "shader-cache", "crashdumps"};
     return std::ranges::find(keep, name) != std::end(keep) ||
            (name.starts_with("hdd") && std::ranges::all_of(name.substr(3), [](char c) {
                return c >= '0' && c <= '9';
@@ -251,18 +251,32 @@ std::wstring Quote(std::wstring_view value) {
     return quoted + L'"';
 }
 
-bool Spawn(const fs::path& tool, const std::vector<std::string>& args, PROCESS_INFORMATION& process, DWORD flags) {
+bool Spawn(const fs::path& tool, const std::vector<std::string>& args, PROCESS_INFORMATION& process, DWORD flags,
+           HANDLE output = INVALID_HANDLE_VALUE) {
     std::wstring command = Quote(tool.native());
     for (const auto& arg : args) command += L" " + Quote(PathFromUtf8(arg).native());
     STARTUPINFOW startup{sizeof(startup)};
-    return CreateProcessW(tool.c_str(), command.data(), nullptr, nullptr, FALSE, flags, nullptr, nullptr, &startup, &process);
+    if (output != INVALID_HANDLE_VALUE) {
+        startup.dwFlags = STARTF_USESTDHANDLES;
+        startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+        startup.hStdOutput = output;
+        startup.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    }
+    return CreateProcessW(tool.c_str(), command.data(), nullptr, nullptr, output != INVALID_HANDLE_VALUE, flags,
+                          nullptr, nullptr, &startup, &process);
 }
 #else
-bool Spawn(const fs::path& tool, const std::vector<std::string>& args, pid_t& pid) {
+bool Spawn(const fs::path& tool, const std::vector<std::string>& args, pid_t& pid, const fs::path& output = {}) {
     std::vector<char*> argv{const_cast<char*>(tool.c_str())};
     for (const auto& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
     argv.push_back(nullptr);
-    return posix_spawn(&pid, tool.c_str(), nullptr, nullptr, argv.data(), environ) == 0;
+    if (output.empty()) return posix_spawn(&pid, tool.c_str(), nullptr, nullptr, argv.data(), environ) == 0;
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, output.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    const int result = posix_spawn(&pid, tool.c_str(), &actions, nullptr, argv.data(), environ);
+    posix_spawn_file_actions_destroy(&actions);
+    return result == 0;
 }
 #endif
 
@@ -304,13 +318,23 @@ fs::path SystemTool(std::string_view name) {
 }
 
 bool RunTool(std::string_view name, const std::vector<std::string>& args, const std::atomic<bool>& cancel,
-             const auto& tick) {
+             const auto& tick, const fs::path* captured = nullptr) {
     if (cancel) return false;
     const auto timeout = Clock::now() + 10min;
     const auto tool = SystemTool(name);
+    CheckedStatus(captured ? *captured : fs::path{});
 #ifdef _WIN32
     PROCESS_INFORMATION process{};
-    if (!Spawn(tool, args, process, CREATE_NO_WINDOW)) return false;
+    HANDLE output = INVALID_HANDLE_VALUE;
+    if (captured) {
+        SECURITY_ATTRIBUTES inherit{sizeof(inherit), nullptr, TRUE};
+        output = CreateFileW(captured->c_str(), GENERIC_WRITE, FILE_SHARE_READ, &inherit, CREATE_ALWAYS,
+                             FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (output == INVALID_HANDLE_VALUE) return false;
+    }
+    const bool started = Spawn(tool, args, process, CREATE_NO_WINDOW, output);
+    if (output != INVALID_HANDLE_VALUE) CloseHandle(output);
+    if (!started) return false;
     CloseHandle(process.hThread);
     DWORD code = 1;
     for (;;) {
@@ -330,7 +354,7 @@ bool RunTool(std::string_view name, const std::vector<std::string>& args, const 
     return code == 0 && !cancel;
 #else
     pid_t pid = 0;
-    if (!Spawn(tool, args, pid)) return false;
+    if (!Spawn(tool, args, pid, captured ? *captured : fs::path{})) return false;
     int status = 0;
     for (;;) {
         const pid_t waited = waitpid(pid, &status, WNOHANG);
@@ -347,11 +371,54 @@ bool RunTool(std::string_view name, const std::vector<std::string>& args, const 
 #endif
 }
 
+// Validates the whole archive before tar extracts anything: every member must
+// be a regular file or a directory, and every name must be a safe relative path
+// with no absolute, "." or ".." component. A symlink followed by a file would
+// otherwise be able to write outside the unpack directory before the package
+// inspection sees it.
+void ValidateArchive(const fs::path& archive, const fs::path& dir, const std::atomic<bool>& cancel) {
+    const auto names = dir / "archive-names.txt";
+    const auto types = dir / "archive-types.txt";
+    struct Cleanup {
+        fs::path names, types;
+        ~Cleanup() {
+            std::error_code ec;
+            fs::remove(names, ec);
+            fs::remove(types, ec);
+        }
+    } cleanup{names, types};
+    if (!RunTool("tar", {"-tf", Utf8(archive)}, cancel, [] {}, &names))
+        throw std::runtime_error("Could not read the update archive.");
+    const auto listing = ReadFile(names, 8 << 20);
+    std::istringstream name_lines(listing);
+    uint32_t members = 0;
+    for (std::string line; std::getline(name_lines, line);) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        while (line.size() > 1 && line.back() == '/') line.pop_back();
+        if (line.empty()) continue;
+        if (!SafeRelative(PathFromUtf8(line)))
+            throw std::runtime_error("The update archive contains an unsafe filename.");
+        members++;
+    }
+    if (!members) throw std::runtime_error("The update archive is empty.");
+    if (!RunTool("tar", {"-tvf", Utf8(archive)}, cancel, [] {}, &types))
+        throw std::runtime_error("Could not read the update archive.");
+    const auto details = ReadFile(types, 32 << 20);
+    std::istringstream type_lines(details);
+    for (std::string line; std::getline(type_lines, line);) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) continue;
+        if (line[0] != '-' && line[0] != 'd')
+            throw std::runtime_error("The update archive contains a link or special file.");
+    }
+}
+
 bool Fetch(const std::string& url, const fs::path& out, uint64_t limit,
            const std::atomic<bool>& cancel, const auto& tick) {
     CheckedStatus(out);
     return RunTool("curl", {"-q", "-fsSL", "--proto", "=https", "--proto-redir", "=https", "--retry", "2",
-                            "--connect-timeout", "10", "--max-time", "240", "--max-filesize", std::to_string(limit),
+                            "--retry-all-errors", "--connect-timeout", "10", "--max-time", "1800",
+                            "--max-filesize", std::to_string(limit), "-C", "-",
                             "-A", "TrueCrimeNYC-Launcher", "-o", Utf8(out), "--", url}, cancel, tick);
 }
 
@@ -528,20 +595,24 @@ std::vector<PackageFile> InspectPackage(const fs::path& root, const fs::path& st
     return result;
 }
 
-void EnsureDirectories(const fs::path& root, const fs::path& relative) {
+void EnsureDirectories(const fs::path& root, const fs::path& relative, std::vector<fs::path>* created = nullptr) {
     auto dir = root;
     for (const auto& component : relative) {
         if (component.empty()) continue;
         const auto next = dir / component;
         CheckedStatus(next);
-        if (fs::create_directory(next)) SyncDirectory(dir);
+        if (fs::create_directory(next)) {
+            if (created) created->push_back(next);
+            SyncDirectory(dir);
+        }
         dir = next;
     }
 }
 
-void PublishFile(const fs::path& source, const fs::path& root, const fs::path& relative, const fs::path& temp) {
+void PublishFile(const fs::path& source, const fs::path& root, const fs::path& relative, const fs::path& temp,
+                 std::vector<fs::path>* created = nullptr) {
     CheckTarget(root, relative);
-    EnsureDirectories(root, relative.parent_path());
+    EnsureDirectories(root, relative.parent_path(), created);
     fs::copy_file(source, temp);
     SyncFile(temp);
     CheckTarget(root, relative);
@@ -592,28 +663,80 @@ void ApplyPackage(const fs::path& root) {
     if (fs::exists(CheckedStatus(update / "active"))) Rollback(root);
     const auto release = ReadFile(update / "pending", 128);
     if (release != TCNYC_VERSION) throw std::runtime_error("The installer does not match the staged update version.");
-    const auto files = InspectPackage(root, staged, release);
-    RemoveTree(update, "backup");
-    fs::create_directory(update / "backup");
-    std::ostringstream journal;
-    for (const auto& file : files) {
-        journal << file.existed << '\t' << Utf8(file.relative) << '\n';
-        if (!file.existed) continue;
-        EnsureDirectories(update / "backup", file.relative.parent_path());
-        const auto backup = update / "backup" / file.relative;
-        fs::copy_file(root / file.relative, backup);
-        SyncFile(backup);
-        SyncDirectory(backup.parent_path());
-    }
-    const auto temp = update / "publishing";
-    if (fs::is_regular_file(CheckedStatus(temp))) fs::remove(temp);
-    PublishText(update / "active", journal.str());
+    // Files the previous package installed, so ones removed from this package can go.
+    std::set<std::string> previous;
     try {
-        for (const auto& file : files) PublishFile(staged / file.relative, root, file.relative, temp);
+        std::istringstream manifest(ReadFile(update / "installed", 1 << 20));
+        for (std::string line; std::getline(manifest, line);) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (!line.empty()) previous.insert(line);
+        }
+    } catch (const std::exception&) {
+    }
+    bool journal = false;
+    std::vector<fs::path> created_directories;
+    try {
+        const auto files = InspectPackage(root, staged, release);
+        RemoveTree(update, "backup");
+        fs::create_directory(update / "backup");
+        std::ostringstream journal_text;
+        for (const auto& file : files) {
+            journal_text << file.existed << '\t' << Utf8(file.relative) << '\n';
+            if (!file.existed) continue;
+            EnsureDirectories(update / "backup", file.relative.parent_path());
+            const auto backup = update / "backup" / file.relative;
+            fs::copy_file(root / file.relative, backup);
+            SyncFile(backup);
+            SyncDirectory(backup.parent_path());
+        }
+        const auto temp = update / "publishing";
+        if (fs::is_regular_file(CheckedStatus(temp))) fs::remove(temp);
+        PublishText(update / "active", journal_text.str());
+        journal = true;
+        for (const auto& file : files) PublishFile(staged / file.relative, root, file.relative, temp, &created_directories);
         Replace(update / "active", update / "committed");
+        // A successfully committed package can now remove what the previous
+        // one installed and this one no longer contains.
+        try {
+            std::set<std::string> current;
+            std::ostringstream installed;
+            for (const auto& file : files) {
+                const std::string name = Utf8(file.relative);
+                current.insert(name);
+                installed << name << '\n';
+            }
+            for (const auto& name : previous) {
+                if (current.count(name)) continue;
+                const fs::path relative = PathFromUtf8(name);
+                if (!SafeRelative(relative) || Protected(AsciiLower(Utf8(*relative.begin())))) continue;
+                std::error_code ec;
+                if (fs::is_regular_file(CheckTarget(root, relative)) && fs::remove(root / relative, ec))
+                    SyncDirectory((root / relative).parent_path());
+            }
+            PublishText(update / "installed", installed.str());
+        } catch (const std::exception& failure) {
+            std::fprintf(stderr, "update: could not record or prune the package files: %s\n", failure.what());
+        }
     } catch (...) {
-        // Preserve the journal and backups if any part of restoration fails.
-        Rollback(root);
+        // A failure after the journal starts is rolled back. A failure before it (a
+        // missing or invalid package) must also clear pending/staged, or every
+        // launch offers the same update and fails the same way.
+        if (journal) {
+            // Preserve the journal and backups if any part of restoration fails.
+            Rollback(root);
+            // Directories this apply created may now be empty; remove those.
+            for (auto it = created_directories.rbegin(); it != created_directories.rend(); ++it) {
+                std::error_code ec;
+                fs::remove(*it, ec);
+            }
+        } else {
+            std::error_code ec;
+            fs::remove_all(update / "staged", ec);
+            fs::remove_all(update / "backup", ec);
+            fs::remove(update / "pending", ec);
+            fs::remove(update / "unpacked", ec);
+            SyncDirectory(update);
+        }
         throw;
     }
 }
@@ -752,47 +875,72 @@ bool Updater::UseStagedRelease(const fs::path& root) {
     return true;
 }
 
+bool Updater::AdoptStaged() {
+#ifdef TCNYC_PAL
+    return false;
+#endif
+    try {
+        const auto root = BaseDir();
+        InstallLock lock(root);
+        return UseStagedRelease(root);
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
 void Updater::DoCheck() {
     const auto root = BaseDir();
     InstallLock lock(root);
     if (UseStagedRelease(root)) return;
     const auto json = root / "update" / "latest.json";
-    if (fs::is_regular_file(CheckedStatus(json))) fs::remove(json);
     const auto current = ParseVersion(Current());
-    const std::string url = "https://api.github.com/repos/" + std::string(kRepo) + "/releases?per_page=20";
-    if (!current || !Fetch(url, json, 2 << 20, cancel_, [] {})) {
+    if (!current) {
         state_ = State::Idle;
         return;
     }
-    const auto releases = ReleaseJsonParser(ReadFile(json, 2 << 20)).Parse();
     std::optional<Version> best;
     std::string best_tag, archive_url, checksum_url;
     uint64_t size = 0;
-    for (const auto& release : releases.elements) {
-        if (release["draft"].True()) continue;
-        const std::string tag(release["tag_name"].String());
-        const auto version = ParseVersion(tag);
-        if (!version || !OlderVersion(*current, *version) || (best && !OlderVersion(*best, *version))) continue;
-        if (current->prerelease.empty() && (release["prerelease"].True() || !version->prerelease.empty())) continue;
-        const std::string base = "https://github.com/" + std::string(kRepo) + "/releases/download/" + tag + "/";
-        const std::string checksum_name = std::string(kAsset) + ".sha256";
-        std::string archive, checksum;
-        uint64_t bytes = 0;
-        for (const auto& asset : release["assets"].elements) {
-            const auto name = asset["name"].String(), download = asset["browser_download_url"].String();
-            if (name == kAsset && download == base + kAsset) {
-                archive = download;
-                bytes = asset["size"].Size();
-            } else if (name == checksum_name && download == base + checksum_name) {
-                checksum = download;
-            }
+    bool read_any = false;
+    // Read up to five pages (100 releases), newest first, so a release pushed
+    // off the first page is still offered.
+    for (uint32_t page = 1; page <= 5; ++page) {
+        if (fs::is_regular_file(CheckedStatus(json))) fs::remove(json);
+        const std::string url = "https://api.github.com/repos/" + std::string(kRepo) +
+                                "/releases?per_page=20&page=" + std::to_string(page);
+        if (!Fetch(url, json, 2 << 20, cancel_, [] {})) {
+            if (!read_any) throw std::runtime_error("Could not check for updates. Check your connection.");
+            break;  // keep what the earlier pages found
         }
-        if (archive.empty() || checksum.empty() || !bytes || bytes > kArchiveLimit) continue;
-        best = version;
-        best_tag = tag.starts_with('v') ? tag.substr(1) : tag;
-        archive_url = std::move(archive);
-        checksum_url = std::move(checksum);
-        size = bytes;
+        read_any = true;
+        const auto releases = ReleaseJsonParser(ReadFile(json, 2 << 20)).Parse();
+        for (const auto& release : releases.elements) {
+            if (release["draft"].True()) continue;
+            const std::string tag(release["tag_name"].String());
+            const auto version = ParseVersion(tag);
+            if (!version || !OlderVersion(*current, *version) || (best && !OlderVersion(*best, *version))) continue;
+            if (current->prerelease.empty() && (release["prerelease"].True() || !version->prerelease.empty())) continue;
+            const std::string base = "https://github.com/" + std::string(kRepo) + "/releases/download/" + tag + "/";
+            const std::string checksum_name = std::string(kAsset) + ".sha256";
+            std::string archive, checksum;
+            uint64_t bytes = 0;
+            for (const auto& asset : release["assets"].elements) {
+                const auto name = asset["name"].String(), download = asset["browser_download_url"].String();
+                if (name == kAsset && download == base + kAsset) {
+                    archive = download;
+                    bytes = asset["size"].Size();
+                } else if (name == checksum_name && download == base + checksum_name) {
+                    checksum = download;
+                }
+            }
+            if (archive.empty() || checksum.empty() || !bytes || bytes > kArchiveLimit) continue;
+            best = version;
+            best_tag = tag.starts_with('v') ? tag.substr(1) : tag;
+            archive_url = std::move(archive);
+            checksum_url = std::move(checksum);
+            size = bytes;
+        }
+        if (releases.elements.size() < 20) break;  // the last page
     }
     {
         std::lock_guard lock(mutex_);
@@ -832,8 +980,17 @@ void Updater::DoDownload() {
     const auto unpacked = dir / "unpacked";
     RemoveTree(dir, "unpacked");
     fs::create_directory(unpacked);
-    if (!RunTool("tar", {"-xf", Utf8(archive), "-C", Utf8(unpacked)}, cancel_, [] {}))
+    ValidateArchive(archive, dir, cancel_);
+    if (!RunTool("tar", {"-xf", Utf8(archive), "-C", Utf8(unpacked), "--no-same-owner", "--no-same-permissions"},
+                 cancel_, [] {})) {
+        std::error_code ec;
+        fs::remove(dir / "archive-names.txt", ec);
+        fs::remove(dir / "archive-types.txt", ec);
         throw std::runtime_error("Could not unpack the update.");
+    }
+    std::error_code listing_ec;
+    fs::remove(dir / "archive-names.txt", listing_ec);
+    fs::remove(dir / "archive-types.txt", listing_ec);
     auto package = unpacked;
     auto it = fs::directory_iterator(unpacked);
     if (it != fs::directory_iterator()) {
@@ -899,9 +1056,15 @@ std::optional<int> Updater::HandleStartup(std::string_view argument) {
         if (!active && !committed) return std::nullopt;
         InstallLock lock(root);
         if (fs::exists(CheckedStatus(update / "active"))) {
-            if (!StartInstaller(root, "--recover-update="))
-                throw std::runtime_error("Could not start the update recovery process.");
-            return 0;
+            // The staged executable is what would run the recovery. If it is gone,
+            // restore the live files here instead of refusing to start the game.
+            if (!fs::is_regular_file(CheckedStatus(update / "staged" / kExecutable))) {
+                Rollback(root);
+            } else {
+                if (!StartInstaller(root, "--recover-update="))
+                    throw std::runtime_error("Could not start the update recovery process.");
+                return 0;
+            }
         }
         if (fs::exists(CheckedStatus(update / "committed"))) {
             RemoveTree(update, "backup");
@@ -913,7 +1076,8 @@ std::optional<int> Updater::HandleStartup(std::string_view argument) {
         }
         return std::nullopt;
     } catch (const std::exception& failure) {
-        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "True Crime NYC update", failure.what(), nullptr);
+        if (!std::getenv("TCNYC_UPDATER_NO_DIALOG"))
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "True Crime NYC update", failure.what(), nullptr);
         return 1;
     }
 }

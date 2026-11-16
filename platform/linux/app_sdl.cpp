@@ -67,8 +67,16 @@ bool ApplyWindowMode(DisplayMode mode, uint32_t width, uint32_t height) {
         ok &= SDL_SetWindowBordered(g_window, true);
         if (width && height) ok &= SDL_SetWindowSize(g_window, int(width), int(height));
         if (fullscreen) {
+            // Desktop fullscreen: SDL_GetClosestFullscreenDisplayMode(0, 0) picks a
+            // near-square low-resolution mode on X11. Ask for the desktop size.
+            uint32_t mode_w = width, mode_h = height;
+            if (!mode_w || !mode_h) {
+                const Mode desktop = Desktop();
+                mode_w = desktop.width;
+                mode_h = desktop.height;
+            }
             SDL_DisplayMode closest{};
-            ok &= SDL_GetClosestFullscreenDisplayMode(SDL_GetPrimaryDisplay(), int(width), int(height), 0.0f,
+            ok &= SDL_GetClosestFullscreenDisplayMode(SDL_GetPrimaryDisplay(), int(mode_w), int(mode_h), 0.0f,
                                                       true, &closest) &&
                   SDL_SetWindowFullscreenMode(g_window, &closest);
             ok &= SDL_SetWindowFullscreen(g_window, true);

@@ -13,6 +13,7 @@
 #include "game/city_grid.h"
 #include "core/log.h"
 #include "graphics_choices.h"
+#include "keycode_map.h"
 #include "gpu/backend.h"
 #include "menu_input.h"
 
@@ -132,10 +133,8 @@ constexpr Row kRows[] = {Row::DisplayMode,
                          Row::TrafficDensity,
                          Row::TrafficDistance,
                          // Row::CityRange: hidden; the ring code stays, the setting stays at the game's 3 x 3.
-#ifdef _WIN32
                          Row::CityInnerDetail,
                          Row::CityOuterDetail,
-#endif
                          Row::Anisotropic,
                          Row::Msaa,
                          Row::Smaa,
@@ -224,22 +223,7 @@ void CommitControls() {
 }
 
 // ImGui's keys as SDL keycodes (input::KeyBinding), for the ones a binding can use
-uint32_t KeycodeOf(ImGuiKey key) {
-    if (key >= ImGuiKey_A && key <= ImGuiKey_Z) return 'a' + (key - ImGuiKey_A);
-    if (key >= ImGuiKey_0 && key <= ImGuiKey_9) return '0' + (key - ImGuiKey_0);
-    if (key >= ImGuiKey_F1 && key <= ImGuiKey_F12) return 0x4000003Au + uint32_t(key - ImGuiKey_F1);  // SDLK_F1..
-    switch (key) {
-    case ImGuiKey_Space: return ' ';
-    case ImGuiKey_Tab: return '\t';
-    case ImGuiKey_LeftCtrl: return 0x400000E0u;
-    case ImGuiKey_LeftShift: return 0x400000E1u;
-    case ImGuiKey_LeftAlt: return 0x400000E2u;
-    case ImGuiKey_RightCtrl: return 0x400000E4u;
-    case ImGuiKey_RightShift: return 0x400000E5u;
-    case ImGuiKey_RightAlt: return 0x400000E6u;
-    default: return 0;
-    }
-}
+uint32_t KeycodeOf(ImGuiKey key) { return common::keys::SdlKeycode(int(key)); }
 
 // a capture in progress: true while it owns the input
 bool CaptureControls() {
@@ -408,6 +392,7 @@ void SaveOnExit() {
     saved = true;
     g_menu.apply_pending = false;
     g_menu.dirty = !app::Save();
+    app::FlushSettings();  // the process is exiting: do not leave the publish behind
 }
 #endif
 

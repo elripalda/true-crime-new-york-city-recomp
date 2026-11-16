@@ -195,8 +195,15 @@ inline uint32_t sse_cmp(float a, float b, int pred) {
     return r ? 0xFFFFFFFFu : 0u;
 }
 
-inline int32_t sse_cvt(float v) {
-    float r = std::nearbyint(v);
+inline int32_t sse_cvt(float v, uint32_t mxcsr = 0) {
+    // MXCSR RC bits 13-14: 0 nearest, 1 down, 2 up, 3 truncate.
+    float r;
+    switch ((mxcsr >> 13) & 3) {
+        case 1: r = std::floor(v); break;
+        case 2: r = std::ceil(v); break;
+        case 3: r = std::trunc(v); break;
+        default: r = std::nearbyint(v); break;
+    }
     if (!(r >= -2147483648.0f && r < 2147483648.0f)) return INT32_MIN;
     return int32_t(r);
 }
@@ -253,6 +260,24 @@ inline void x86_rep_stos(X86Context& ctx, uint8_t* base, uint32_t w) {
     if (!ctx.df && w == 1) {
         std::memset(base + ctx.edi, uint8_t(ctx.eax), n);
         ctx.edi += n;
+        ctx.ecx = 0;
+        return;
+    }
+    if (!ctx.df && (w == 2 || w == 4)) {
+        // The common case: a forward fill. Write two elements at a time with
+        // memcpy so unaligned destinations stay safe.
+        const uint64_t pair = w == 4 ? (uint64_t(ctx.eax) << 32 | ctx.eax)
+                                     : (uint64_t(uint32_t(ctx.eax & 0xFFFFu) * 0x10001u) << 32 |
+                                        uint32_t(ctx.eax & 0xFFFFu) * 0x10001u);
+        uint8_t* out = base + ctx.edi;
+        uint32_t left = n;
+        while (left >= 2) {
+            std::memcpy(out, &pair, 8);
+            out += 8;
+            left -= 2;
+        }
+        if (left) std::memcpy(out, &pair, w);
+        ctx.edi += n * w;
         ctx.ecx = 0;
         return;
     }

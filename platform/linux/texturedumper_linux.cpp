@@ -514,7 +514,12 @@ void Load(uint64_t key, const fs::path& path, uint32_t revision) {
         LOGE("texture pack: %s did not load", path.string().c_str());
     }
     std::lock_guard l(g.lock);
-    if (revision != g.revision) return;
+    if (revision != g.revision) {
+        // A rescan replaced the file list while this load ran. Forget the request
+        // so the next Take asks again instead of reporting Loading forever.
+        g.asked.erase(key);
+        return;
+    }
     if (ok) {
         g.loaded[key] = std::move(img);
     } else {

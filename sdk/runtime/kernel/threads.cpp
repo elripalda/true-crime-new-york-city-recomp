@@ -115,13 +115,19 @@ void NameHostThread(const char* name) {
 #endif
 }
 
+// The entry closure is deleted explicitly before ExitThread: ExitThread and
+// pthread_exit do not unwind C++ locals, so the unique_ptr in the entry never runs.
+thread_local std::function<void()>* t_host_closure = nullptr;
+
 // recompiled code nests host frames as deep as the guest's calls, give it room
 bool Spawn(std::function<void()> fn) {
     auto* f = new std::function<void()>(std::move(fn));
 #ifdef _WIN32
     auto entry = [](void* p) -> DWORD {
         std::unique_ptr<std::function<void()>> g(static_cast<std::function<void()>*>(p));
+        t_host_closure = static_cast<std::function<void()>*>(p);
         (*g)();
+        t_host_closure = nullptr;
         return 0;
     };
     HANDLE h = ::CreateThread(nullptr, 64u << 20, entry, f, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
@@ -137,7 +143,9 @@ bool Spawn(std::function<void()> fn) {
     pthread_t th;
     const int rc = pthread_create(&th, &attr, [](void* p) -> void* {
         std::unique_ptr<std::function<void()>> g(static_cast<std::function<void()>*>(p));
+        t_host_closure = static_cast<std::function<void()>*>(p);
         (*g)();
+        t_host_closure = nullptr;
         return nullptr;
     }, f);
     if (rc != 0) {
@@ -420,8 +428,16 @@ void ExitThread(uint32_t code) {
     }
     t_current.reset();
 #ifdef _WIN32
+    if (t_host_closure) {
+        delete t_host_closure;
+        t_host_closure = nullptr;
+    }
     ::ExitThread(code);
 #else
+    if (t_host_closure) {
+        delete t_host_closure;
+        t_host_closure = nullptr;
+    }
     pthread_exit(nullptr);
 #endif
 }

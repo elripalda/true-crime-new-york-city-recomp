@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstdint>
+#include <mutex>
 
 #include "app/app.h"
 #include "common/graphics_choices.h"
@@ -79,10 +80,14 @@ X86_FUNC(sub_00017BE0) {
 namespace {
 int g_range_depth = 0;
 float g_base_near = 0.0f, g_base_far = 0.0f;
+// Spawn and despawn can run on different game threads. The shared guest
+// constants and the recursion bookkeeping are only safe while one handler at a
+// time owns them; a recursive lock lets the handlers nest on the same thread.
+std::recursive_mutex g_range_lock;
 
 class RangeScale {
 public:
-    RangeScale(uint8_t *base, float scale) : base_(base) {
+    RangeScale(uint8_t *base, float scale) : base_(base), lock_(g_range_lock) {
         if (g_range_depth++ == 0) {
             g_base_near = X86_MEMF32(TC_ADDR(0x2E3500));
             g_base_far = X86_MEMF32(TC_ADDR(0x2E3504));
@@ -104,6 +109,7 @@ public:
 private:
     uint8_t *base_;
     float prev_near_, prev_far_;
+    std::unique_lock<std::recursive_mutex> lock_;
 };
 } // namespace
 

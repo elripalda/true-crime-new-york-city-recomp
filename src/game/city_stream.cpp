@@ -733,7 +733,8 @@ X86_FUNC(sub_00142CE0) {
     LogPortalSlots();
     FillRingPortalSlots();
     { void InstallTileDrawProbe(); InstallTileDrawProbe(); }
-    if (std::getenv("XBE_CITY_DRAWPROBE") && city && game::city_grid::Ready()) {
+    static const bool drawprobe = std::getenv("XBE_CITY_DRAWPROBE") != nullptr;
+    if (drawprobe && city && game::city_grid::Ready()) {
         // Scene list at city + 0x6B48 (walked by 0x144250 -> 0x13F400): who owns its nodes?
         static auto last = std::chrono::steady_clock::now();
         if (std::chrono::steady_clock::now() - last > std::chrono::seconds(5)) {
@@ -1285,9 +1286,9 @@ void QuadDrawProbe(X86Context &ctx, uint32_t, uint32_t count, uint32_t tex0) {
 }
 } // namespace
 void InstallTileDrawProbe() {
-    const char *v = std::getenv("XBE_CITY_DRAWPROBE");
-    if (!v || ::XbeDrawProbe()) return;
-    ::XbeDrawProbe() = std::strcmp(v, "quads") == 0 ? QuadDrawProbe : TileDrawProbe;
+    static const char* const probe = std::getenv("XBE_CITY_DRAWPROBE");
+    if (!probe || ::XbeDrawProbe()) return;
+    ::XbeDrawProbe() = std::strcmp(probe, "quads") == 0 ? QuadDrawProbe : TileDrawProbe;
 }
 
 bool g_ring_instances_done = false;

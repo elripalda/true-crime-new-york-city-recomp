@@ -712,20 +712,31 @@ void RetainVertexAttributes(State& s, uint32_t start, uint32_t count, const uint
     VertexShader fvf;
     const VertexShader* layout = PickLayout(s, fvf);
     if (!layout) return;
-    uint32_t vertex = start + count - 1;
+    // The backend clamps the draw to the readable index range before it
+    // assembles anything; this diagnostic must do the same, or it reads the
+    // last index and a vertex the draw itself dropped.
+    if (ip && !ClampIndexCount(ip, count)) return;
+    int64_t vertex;
     if (ip) {
         uint16_t index;
         std::memcpy(&index, ip + size_t(count - 1) * 2, 2);
-        vertex = index + s.base_vertex;
+        vertex = int64_t(index) + int64_t(std::bit_cast<int32_t>(s.base_vertex));
+    } else {
+        vertex = int64_t(start) + int64_t(count) - 1;
     }
+    if (vertex < 0 || uint64_t(vertex) > kMaxBufferBytes) return;
     for (int r = 0; r < 16; ++r) {
         const auto& in = layout->inputs[size_t(r)];
         if (in.stream < 0 || !in.type || in.type == kTypeNone) continue;
         const auto& stream = s.streams[size_t(in.stream)];
         if (!stream.vb) continue;
+        const uint32_t stride = StrideOf(s, *layout, in);
+        const uint64_t elem = TypeBytes(in.type);
+        if (!stride || in.offset > stride || elem > stride - in.offset ||
+            !BufferReadable(BufferOf(stream.vb), uint64_t(vertex) * stride + in.offset, elem)) continue;
         uint32_t data = mem::VirtualFromPhysical(kernel::R32(stream.vb + kResData));
         const auto* src = static_cast<const uint8_t*>(kernel::HostPtr(data + in.offset));
-        Convert(in.type, src + size_t(vertex) * StrideOf(s, *layout, in), s.vdef[r]);
+        Convert(in.type, src + size_t(vertex) * stride, s.vdef[r]);
     }
 }
 

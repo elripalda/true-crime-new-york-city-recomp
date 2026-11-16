@@ -63,7 +63,7 @@ void Load() {
     Settings& s = Get();
     toml::table t;
     try {
-        t = toml::parse_file(SettingsPath().string());
+        t = toml::parse_file(SettingsPath().u8string());
     } catch (...) {
         LOGR("Settings: no readable file at %s, using defaults", SettingsPath().string().c_str());
         g_saved_settings = Table();
@@ -84,20 +84,17 @@ void Load() {
     s.vsync = t["vsync"].value_or(s.vsync);
     s.low_latency = t["low_latency"].value_or(s.low_latency);
     s.taa = t["taa"].value_or(s.taa);
-    // 0 bilinear, 1 FSR 1, 2 FSR 3.1, 3 DLSS; FSR 4.1 (4, Windows only) from a copied settings file is FSR 3.1 here
+    // 0 bilinear, 1 FSR 1, 2 FSR 3.1, 3 DLSS; without DLSS (3) uses FSR 3.1; FSR 4.1 (4, Windows only) is FSR 3.1 here
     s.upscaler = uint32_t(std::clamp<int64_t>(t["upscaler"].value_or(int64_t(s.upscaler)), 0, 4));
     if (s.upscaler == 4) s.upscaler = 2;
+#ifndef TCNYC_HAVE_DLSS
+    if (s.upscaler == 3) s.upscaler = 2;
+#endif
     s.sharpening = uint32_t(std::clamp<int64_t>(t["sharpening"].value_or(int64_t(s.sharpening)), 0, 100));
     s.aniso = t["anisotropic_filtering"].value_or(s.aniso);
     // as settings.cpp: a file without the key keeps the built-in default (Settings::msaa); older
     // files stored msaa = true for 4x
-    const auto msaa = t["msaa"];
-    if (!msaa) {
-        SetMsaaSamples(Settings{}.msaa);
-    } else {
-        const auto samples = msaa.value_or(msaa.value_or(false) ? 4u : 0u);
-        SetMsaaSamples(samples == 2 || samples == 4 || samples == 8 ? samples : 0);
-    }
+    SetMsaaSamples(MsaaSamplesFromTable(t, Settings{}.msaa));
     s.smaa = t["smaa"].value_or(s.smaa);
     s.bloom = t["bloom"].value_or(s.bloom);
     s.bloom_strength = uint32_t(std::clamp<int64_t>(t["bloom_strength"].value_or(int64_t(s.bloom_strength)), 50, 400));
@@ -105,6 +102,14 @@ void Load() {
     s.shadow_softness = uint32_t(std::clamp<int64_t>(t["shadow_softness"].value_or(int64_t(s.shadow_softness)), 0, 2));
     s.dof = t["dof"].value_or(s.dof);
     LoadOcclusionSettings(s, t);
+    // read by the city ring on the game thread (city_grid.cpp)
+    std::atomic_ref(s.city_range).store(0, std::memory_order_relaxed);
+    std::atomic_ref(s.city_inner_detail).store(
+        uint32_t(std::clamp<int64_t>(t["city_inner_detail"].value_or(int64_t(s.city_inner_detail)), 1, 3)),
+        std::memory_order_relaxed);
+    std::atomic_ref(s.city_outer_detail).store(
+        uint32_t(std::clamp<int64_t>(t["city_outer_detail"].value_or(int64_t(s.city_outer_detail)), 0, 3)),
+        std::memory_order_relaxed);
     s.building_seam_fix = t["building_seam_fix"].value_or(s.building_seam_fix);
     // the LOD hooks read it on the game thread (lod.cpp)
     std::atomic_ref(s.object_detail)
@@ -143,6 +148,7 @@ void Load() {
             flag.store(t[o.key].value_or(flag.load(std::memory_order_relaxed)), std::memory_order_relaxed);
         } else {
             *o.value = t[o.key].value_or(*o.value);
+            if (std::strcmp(o.key, "fov_percent") == 0) *o.value = std::clamp(*o.value, 50u, 200u);
         }
     }
     if (kGame.load) kGame.load(&t);
@@ -202,6 +208,11 @@ toml::table Table() {
 
 } // namespace
 
+void FullSettingsTable(toml::table& out) {
+    SettingsLock guard;
+    out = Table();
+}
+
 bool Save() {
     try {
         const std::lock_guard save_guard(g_save_lock);
@@ -213,7 +224,7 @@ bool Save() {
             changes = ChangedSettings(g_saved_settings, current);
         }
         if (!std::filesystem::exists(path)) changes = current;
-        MergeSettingsTable(path, changes, &current);
+        PublishSettingsAsync(path, changes, current);
         {
             SettingsLock guard;
             g_saved_settings = std::move(current);

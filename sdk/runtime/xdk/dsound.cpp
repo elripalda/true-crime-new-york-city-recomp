@@ -192,6 +192,9 @@ struct Done {
 };
 
 std::recursive_mutex g_lock;
+// Guest completion callbacks must not run on the pump thread and DirectSoundDoWork at the
+// same time after a stall. Recursive: a callback may call back into DirectSound.
+std::recursive_mutex g_callback_lock;
 std::map<uint32_t, Voice> g_voices;
 float g_listener[3] = {}, g_front[3] = {0, 0, 1}, g_top[3] = {0, 1, 0};
 // Completed packets' callbacks, run as the XDK runs them: in DirectSoundDoWork on the title's thread, so they never
@@ -775,7 +778,10 @@ void Start() {
                 if (NowMs() - g_pumped < kPumpMs) continue;
                 TakeCallbacks(done);
             }
-            Run(ctx, done);
+            {
+                std::lock_guard<std::recursive_mutex> run(g_callback_lock);
+                Run(ctx, done);
+            }
         }
     });
 }
@@ -788,6 +794,13 @@ void ReadFormat(Voice& v, uint32_t wfx) {
     v.rate = R32(wfx + 4);
     v.align = std::max<uint16_t>(R16(wfx + 12), 1);
     v.bits = R16(wfx + 14);
+    // nBlockAlign is guest data: cap it and keep PCM frames at least one sample per channel.
+    if (v.tag == 1) {
+        const uint32_t frame = std::max<uint32_t>(v.channels * ((v.bits + 7) / 8), 1);
+        if (v.align < frame || v.align > 256) v.align = uint16_t(std::min<uint32_t>(frame, 256));
+    } else if (v.align > 4096) {
+        v.align = 4096;
+    }
     if (v.tag != 1 && v.tag != 0x69) LOG_FIRST(8, "dsound: format tag %X not supported", v.tag);
 }
 
@@ -820,6 +833,7 @@ uint32_t NewBuffer(uint32_t desc, uint32_t out) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     Start();
     uint32_t obj = mem::AllocSystem(0x40);
+    if (!obj) return 0x8007000E;  // E_OUTOFMEMORY
     std::memset(HostPtr(obj), 0, 0x40);
     Voice& v = g_voices[obj];
     v.obj = obj;
@@ -909,6 +923,7 @@ HLE_STDCALL(DirectSoundCreate, 3) {
     if (!g_ds) {
         AuditExports();
         g_ds = mem::AllocSystem(0x40);
+        if (!g_ds) return 0x8007000E;  // E_OUTOFMEMORY
         std::memset(HostPtr(g_ds), 0, 0x40);
     }
     W32(a[1], g_ds);
@@ -973,7 +988,10 @@ HLE_STDCALL(DirectSoundDoWork, 0) {
         std::lock_guard<std::recursive_mutex> lock(g_lock);
         TakeCallbacks(done);
     }
-    Run(ctx, done);
+    {
+        std::lock_guard<std::recursive_mutex> run(g_callback_lock);
+        Run(ctx, done);
+    }
     return 0;
 }
 // starts together every voice played or unpaused with the synch playback flag
@@ -1001,6 +1019,7 @@ static uint32_t EffectsDesc(const std::vector<uint8_t>& img, const char* name, u
     uint32_t count = std::min<uint32_t>(u32(t), 64);
     LOGI("dsound: effects image %s, %u effects", name, count);
     uint32_t desc = mem::AllocSystem(8 + std::max(count, 1u) * 32);
+    if (!desc) return 0;
     W32(desc, count);
     W32(desc + 4, u32(t + 4));
     std::vector<Segment> states;
@@ -1010,6 +1029,10 @@ static uint32_t EffectsDesc(const std::vector<uint8_t>& img, const char* name, u
         for (int k = 0; k < 4; k++) {
             uint32_t size = u32(m + k * 8 + 4);
             uint32_t seg = mem::AllocSystem(std::max(size, 0x40u));
+            if (!seg) {
+                mem::FreeSystem(desc);
+                return 0;
+            }
             std::memset(HostPtr(seg), 0, std::max(size, 0x40u));
             uint32_t at = u32(m + k * 8);
             bool inside = at <= img.size() && size <= img.size() - at;
@@ -1279,6 +1302,7 @@ HLE_STDCALL(DirectSoundCreateStream, 2) {
     Start();
     uint32_t desc = a[0];
     uint32_t obj = mem::AllocSystem(0x80);
+    if (!obj) return 0x8007000E;  // E_OUTOFMEMORY
     std::memset(HostPtr(obj), 0, 0x80);
     W32(obj + XDK_CDirectSoundStream_Vtable, kStreamVtable);
     W32(obj + XDK_CDirectSoundStream_Vtable2, kStreamVtable2);

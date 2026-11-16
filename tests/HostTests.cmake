@@ -6,7 +6,7 @@ if(BUILD_TESTING)
     add_test(NAME release_metadata COMMAND tcnyc_release_test)
 
     add_executable(tcnyc_settings_test "${TCNYC_REPO}/tests/settings_merge.cpp"
-        "${TCNYC_REPO}/sdk/runtime/app/settings_store.cpp")
+        "${TCNYC_REPO}/sdk/runtime/app/settings_store.cpp" "${TCNYC_REPO}/sdk/runtime/core/log.cpp")
     target_include_directories(tcnyc_settings_test PRIVATE "${TCNYC_REPO}/sdk/runtime")
     if(WIN32)
         target_link_libraries(tcnyc_settings_test PRIVATE tomlplusplus::tomlplusplus)

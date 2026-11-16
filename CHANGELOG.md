@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.9.2.4 - Beta 4 (2026-11-16)
+
 ### Controls
 - Rebind the keyboard, mouse and controller from a new Controls tab in the launcher or the Controls page
   of the in-game menu (F10). Keyboard actions take up to four keys, with separate on-foot and driving
@@ -14,12 +16,13 @@
 ### Audio
 - Custom music: songs in a folder you choose replace the Music Player's, by song number
   (`6000.mp3`, `6001.ogg`, `6002.flac`, ...). MP3, OGG Vorbis, FLAC and WAV are decoded by the port, so no
-  conversion is needed. Set the folder in the launcher or as `music_folder` in `settings.toml`.
+  conversion is needed. Songs go in the new `music` folder beside the game; another folder can be chosen on
+  the launcher's Music tab or as `music_folder` in `settings.toml`. Updates never touch the music folder.
 - Other songs in that folder are added to the Music Player as new, already-owned songs (up to 35),
   named from the file (`Band - Title.mp3`).
 
 ### Launcher
-- A Custom Music folder field with a folder picker.
+- A Music tab: explains custom songs, opens the music folder, and can point the game at another one.
 - Redesigned in the game's night-city look, with every graphics option grouped into sections.
 - Checks GitHub for a newer release and can download, verify (SHA-256) and install it, then restart.
   Settings, game files and textures are never touched. Turn it off on the Play tab.
@@ -60,6 +63,36 @@
 - Traffic distance (F10 and launcher): Original, 1.5x (default) or 2x spawn range for ambient cars. It spreads the cars Traffic density allows over a wider area, so raise density with it.
 - Object detail now applies to moving cars as well; parked cars that have not been touched keep the game's
   own detail (they only carry low-detail textures until woken).
+
+### Fixes
+- Updates are validated before extraction: symbolic links, special files and traversal names are refused, and
+  tar runs with `--no-same-owner --no-same-permissions`. A failed install no longer leaves a pending update
+  that every launch retries, and an active journal without its staged installer rolls back in-process.
+- The updater reads up to five release pages, reports a failed check instead of "up to date", resumes large
+  downloads, and makes an already-staged release visible when update checks are off. Files removed from a
+  newer package are deleted, and directories created by a failed install are removed.
+- Ambient occlusion works on D3D12: the reversed-depth prepass clears to the far value, and the AO depth
+  target no longer leaves the draw's GREATER test with nothing to pass.
+- Vulkan: MSAA scene attachments keep their contents across pass reopens, borrowed depth uses its depth view,
+  and a multisampled target's feedback copy resolves into a separate image instead of reading its own resolve
+  target.
+- The car lamp fix is limited to the car types it was meant for, and reads the object only after the caller
+  check. Full-opacity car paint keeps its depth writes.
+- Input: Return, Backspace and the arrow keys can no longer be bound (they always drive menus). Duplicate
+  controller sources are repaired, sources without a glyph clear their prompt, and the launcher promotes a
+  new key to the prompt slot. The in-game editor accepts every key the launcher does.
+- Settings: a legacy `msaa = true` still means 4x, saves publish on a worker instead of holding the UI lock,
+  the launcher keeps unknown keys, and Linux reads the field of view and city detail settings and remaps
+  DLSS to FSR 3.1 when DLSS is not built in.
+- Files: renames share delete, `ReplaceIfExists` and directory/file mismatches are honored, missing CD-ROM
+  files report not-found, and volume queries stay inside the caller's buffer.
+- Kernel: timer DPCs set `Inserted`, wait-all no longer spends a pulse, huge timeouts are clamped, and
+  `MEM_RELEASE` validates its base. Crash dumps avoid logger deadlocks and recursion.
+- Larger character caches and the city grid store allocate from the top of user space, away from the game's
+  heap. The last-vertex diagnostic clamps its index and checks the stream bound.
+- Non-ASCII install paths work for config parsing, logs, crash dumps and the splash screen.
+- Recompiler: `FNSAVE`/`FRSTOR` keep the x87 register stack, `push seg`/`push imm16` use the 32-bit form,
+  and `cvtss2si` follows MXCSR rounding.
 
 ## 0.9.2.0 — Beta 3 (2026-11-12)
 

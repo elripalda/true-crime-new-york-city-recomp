@@ -27,7 +27,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: %s <game folder> [--instance N]\n", argv[0]);
         return 2;
     }
-    logx::Init((app::ExeDir() / "logs").string(), app::kGame.log);
+    logx::Init(app::ExeDir() / "logs", app::kGame.log);
     app::Load();
     if (app::kGame.init) app::kGame.init();
     if (app::kGame.window) app::kGame.window(nullptr);

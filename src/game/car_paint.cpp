@@ -5,9 +5,8 @@
 //
 // The mesh draw 0x23DC60 sends car bodies through its paint path (0x23E6CE..0x23E800): one of the paint pixel
 // shaders from the table at 0x4E6B00, blend ONE, SRC_ALPHA (the blend cache at 0x4C6380 holds 0x10302), output
-// alpha (1 - material alpha * texture alpha) * (1 - reflection). Paint materials carry blend type 0xC0
-// ([material] & 0xC0), which the routine draws as translucent: before the draw at 0x23F2F6, 0x23F2CC turns depth
-// writes off.
+// alpha (1 - material alpha * texture alpha) * (1 - reflection). The old translucent-material test ([material]
+// & 0xC0) is no longer used: the blend cache and the material's opacity byte are the observed discriminators.
 //
 // Rusted beaters (BEATER_GUIDO, BEATER_PALOMINO, ...) paint their whole body with such a material: the rust
 // texture, alpha 241-255, with material opacity 255 ([material+7]). Close up the body is split into a dozen parts

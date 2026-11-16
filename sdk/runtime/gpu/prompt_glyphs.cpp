@@ -36,12 +36,20 @@ void RemapControllerGlyphs(std::vector<uint8_t>& px, uint32_t pitch) {
     const std::vector<uint8_t> original = px;
     for (const auto& binding : bindings) {
         const int target = int(binding.target);
+        if (target >= input::kPadBindingCount) continue;
         int from = -1;  // the slot whose default source is this binding's source
         for (const auto& d : defaults)
             if (d.source == binding.source) from = int(d.target);
-        if (from < 0 || from == target || target >= input::kPadBindingCount) continue;
-        const Slot& src = kSlots[from];
         const Slot& dst = kSlots[target];
+        if (from < 0) {
+            // A paddle, touchpad or other input the game's atlas has no glyph for:
+            // clear the slot rather than leave the old button's glyph on screen.
+            for (int y = 0; y < dst.h; ++y)
+                std::fill_n(px.data() + (dst.y + y) * pitch + dst.x * 4, dst.w * 4, 0);
+            continue;
+        }
+        if (from == target) continue;
+        const Slot& src = kSlots[from];
         for (int y = 0; y < dst.h; ++y)
             std::fill_n(px.data() + (dst.y + y) * pitch + dst.x * 4, dst.w * 4, 0);
         const int w = std::min(src.w, dst.w), h = std::min(src.h, dst.h);

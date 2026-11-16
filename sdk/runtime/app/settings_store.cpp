@@ -1,11 +1,14 @@
 #include "app/settings_store.h"
 #include "app/app.h"
+#include "core/log.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <deque>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -149,6 +152,15 @@ void LoadOcclusionSettings(Settings& settings, const toml::table& table) {
     if (settings.ao) settings.ao = settings.ao_quality;
 }
 
+uint32_t MsaaSamplesFromTable(const toml::table& table, uint32_t fallback) {
+    const auto msaa = table["msaa"];
+    if (!msaa) return fallback;
+    // A boolean is the legacy `msaa = true` for 4x, not the integer 1.
+    if (msaa.is_boolean()) return msaa.value_or(false) ? 4u : 0u;
+    const auto samples = msaa.value_or(int64_t(0));
+    return samples == 2 || samples == 4 || samples == 8 ? uint32_t(samples) : 0u;
+}
+
 toml::table ReadSettingsTable(const fs::path& path) {
     if (!fs::exists(path)) return {};
     std::ifstream in(path, std::ios::binary);
@@ -198,5 +210,85 @@ void MergeSettingsTable(const fs::path& path, const toml::table& edits, const to
     text << table << '\n';
     Publish(absolute, text.str());
 }
+
+namespace {
+
+// One publisher thread, jobs in order. The UI thread only builds the table and
+// queues it; waiting for another process to release the settings lock there
+// froze the frame and held UiLock.
+struct SettingsPublisher {
+    struct Job {
+        fs::path path;
+        toml::table edits;
+        toml::table full;
+    };
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<Job> jobs;
+    bool busy = false;
+    bool stop = false;
+    std::thread worker;
+
+    SettingsPublisher() : worker([this] { Run(); }) {}
+    ~SettingsPublisher() {
+        {
+            std::lock_guard lock(mutex);
+            stop = true;
+        }
+        cv.notify_all();
+        if (worker.joinable()) worker.join();
+    }
+
+    void Run() {
+        for (;;) {
+            Job job;
+            {
+                std::unique_lock lock(mutex);
+                cv.wait(lock, [this] { return stop || !jobs.empty(); });
+                if (stop && jobs.empty()) return;
+                job = std::move(jobs.front());
+                jobs.pop_front();
+                busy = true;
+            }
+            try {
+                MergeSettingsTable(job.path, job.edits, &job.full);
+            } catch (const std::exception& failure) {
+                LOGE("Settings: %s", failure.what());
+            }
+            {
+                std::lock_guard lock(mutex);
+                busy = false;
+            }
+            cv.notify_all();
+        }
+    }
+
+    void Push(Job job) {
+        {
+            std::lock_guard lock(mutex);
+            jobs.push_back(std::move(job));
+        }
+        cv.notify_one();
+    }
+
+    void Flush() {
+        std::unique_lock lock(mutex);
+        cv.wait(lock, [this] { return jobs.empty() && !busy; });
+    }
+};
+
+SettingsPublisher& Publisher() {
+    static SettingsPublisher publisher;
+    return publisher;
+}
+
+}  // namespace
+
+void PublishSettingsAsync(fs::path path, toml::table edits, toml::table full) {
+    if (edits.empty()) return;
+    Publisher().Push({std::move(path), std::move(edits), std::move(full)});
+}
+
+void FlushSettings() { Publisher().Flush(); }
 
 } // namespace app

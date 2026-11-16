@@ -171,7 +171,8 @@ X86_FUNC(sub_0029F547) {
     const size_t want = buffer ? max_size / bytes_per_frame : 0;
     size_t got = 0;
     if (want) {
-        self.scratch.resize(want * self.decoder->channels);
+        const size_t need = want * self.decoder->channels;
+        if (self.scratch.size() < need) self.scratch.resize(need);
         // A decoder may return short reads before the end; fill the packet.
         while (got < want) {
             const size_t n = self.decoder->Read(self.scratch.data() + got * self.decoder->channels, want - got);

@@ -1,10 +1,12 @@
 """Exercise the updater using temporary installs and a local download fixture."""
 
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -26,16 +28,7 @@ def expect(condition, message):
         raise AssertionError(message)
 
 
-def bundle(source, parent, name):
-    archive = parent / f"{name}-{ASSET}"
-    if WINDOWS:
-        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zipped:
-            for path in source.rglob("*"):
-                if path.is_file():
-                    zipped.write(path, path.relative_to(source).as_posix())
-    else:
-        with tarfile.open(archive, "w:gz") as tar:
-            tar.add(source, arcname="release")
+def publish_bundle(archive):
     release = archive.with_suffix(".json")
     release.write_text(json.dumps([{"assets": [
         {"size": archive.stat().st_size, "uploader": {"name": "fixture"},
@@ -47,11 +40,61 @@ def bundle(source, parent, name):
     return archive
 
 
+def bundle(source, parent, name):
+    archive = parent / f"{name}-{ASSET}"
+    if WINDOWS:
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zipped:
+            for path in source.rglob("*"):
+                if path.is_file():
+                    zipped.write(path, path.relative_to(source).as_posix())
+    else:
+        with tarfile.open(archive, "w:gz") as tar:
+            tar.add(source, arcname="release")
+    return publish_bundle(archive)
+
+
+def malicious_bundle(source, parent, name, kind):
+    """A valid-looking package plus one symlink or traversal member."""
+    archive = parent / f"{name}-{ASSET}"
+    if WINDOWS:
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zipped:
+            for path in source.rglob("*"):
+                if path.is_file():
+                    zipped.write(path, path.relative_to(source).as_posix())
+            if kind == "symlink":
+                link = zipfile.ZipInfo("link")
+                link.create_system = 3
+                link.external_attr = (stat.S_IFLNK | 0o777) << 16
+                zipped.writestr(link, "../../outside")
+                zipped.writestr("link/evil.txt", "owned")
+            else:
+                zipped.writestr("../outside.txt", "owned")
+    else:
+        with tarfile.open(archive, "w:gz") as tar:
+            tar.add(source, arcname="release")
+            if kind == "symlink":
+                link = tarfile.TarInfo("release/link")
+                link.type = tarfile.SYMTYPE
+                link.linkname = "../../outside"
+                tar.addfile(link)
+                data = b"owned"
+                entry = tarfile.TarInfo("release/link/evil.txt")
+                entry.size = len(data)
+                tar.addfile(entry, io.BytesIO(data))
+            else:
+                data = b"owned"
+                entry = tarfile.TarInfo("../outside.txt")
+                entry.size = len(data)
+                tar.addfile(entry, io.BytesIO(data))
+    return publish_bundle(archive)
+
+
 def run(exe, argument, archive, result):
     env = dict(os.environ, TCNYC_UPDATE_TEST_VERSION="1.0.0",
                TCNYC_FIXTURE_RESTARTED=str(result), TCNYC_FIXTURE_ARCHIVE=str(archive),
                TCNYC_FIXTURE_CHECKSUM=str(archive.with_suffix(".sha256")),
-               TCNYC_FIXTURE_RELEASE=str(archive.with_suffix(".json")))
+               TCNYC_FIXTURE_RELEASE=str(archive.with_suffix(".json")),
+               TCNYC_UPDATER_NO_DIALOG="1")
     return subprocess.run([exe, argument], env=env, timeout=18, capture_output=True, text=True)
 
 
@@ -89,6 +132,9 @@ shutil.copyfile(os.environ["TCNYC_FIXTURE_" + key], args[args.index("-o") + 1])
         (payload / "UPDATE-PROTOCOL").write_bytes(b"tcnyc-update-1\n1.0.1\n")
         (payload / "BUILD.txt").write_bytes(b"replacement")
         (payload / "lib" / "libshaderc.so.1").write_bytes(b"fixture")
+        (payload / "locked.txt").write_bytes(b"replacement")
+        (payload / "lockdir").mkdir()
+        (payload / "lockdir" / "file").write_bytes(b"replacement")
         if WINDOWS:
             for name in ("clang.exe", "lld-link.exe", "xbe_recomp.exe", "TrueCrimeNYC.lib", "config/game.toml"):
                 path = payload / "compiler" / name
@@ -103,6 +149,8 @@ shutil.copyfile(os.environ["TCNYC_FIXTURE_" + key], args[args.index("-o") + 1])
         bad_checksum.with_suffix(".sha256").write_text("0" * 64, encoding="ascii")
         (payload / "BUILD.txt").write_bytes(b"modified after manifest")
         bad_manifest = bundle(payload, temp, "bad-manifest")
+        symlink_archive = malicious_bundle(payload, temp, "symlink", "symlink")
+        traversal_archive = malicious_bundle(payload, temp, "traversal", "traversal")
         (temp / "empty").mkdir()
         empty = bundle(temp / "empty", temp, "empty")
 
@@ -127,11 +175,28 @@ shutil.copyfile(os.environ["TCNYC_FIXTURE_" + key], args[args.index("-o") + 1])
                "HDD2" not in [path.name for path in root.iterdir()], "A protected save path was changed.")
         expect(not (root / "update" / "committed").exists(), "Replacement startup did not acknowledge the commit.")
 
-        for name, archive in (("empty", empty), ("bad checksum", bad_checksum), ("bad manifest", bad_manifest)):
+        for name, archive, reasons in (
+                ("empty", empty, ("archive is empty", "An update file is missing")),
+                ("bad checksum", bad_checksum, ("did not match its published size or checksum",)),
+                ("bad manifest", bad_manifest, ("does not match the update manifest",))):
             root = install(name)
             check = run(root / EXE, "--stage", archive, root / "restarted")
             expect(check.returncode != 0 and (root / "BUILD.txt").read_bytes() == b"initial",
                    f"The {name} package changed the install.")
+            expect(any(reason in check.stderr for reason in reasons),
+                   f"The {name} package failed for the wrong reason: {check.stderr.strip()}")
+
+        # A symlink member and a traversal member must be refused before tar
+        # extracts anything, so neither can write outside update/unpacked.
+        for name, archive, reason in (("symlink archive", symlink_archive, "link or special file"),
+                                      ("traversal archive", traversal_archive, "unsafe filename")):
+            root = install(name)
+            check = run(root / EXE, "--stage", archive, root / "restarted")
+            expect(check.returncode != 0 and (root / "BUILD.txt").read_bytes() == b"initial",
+                   f"The {name} was accepted.")
+            expect(reason in check.stderr, f"The {name} failed for the wrong reason: {check.stderr.strip()}")
+            expect(not (root / "outside").exists() and not (root / "update" / "outside.txt").exists(),
+                   f"The {name} wrote outside the unpack directory.")
 
         root = install("linked install")
         outside = temp / "outside"
@@ -144,6 +209,9 @@ shutil.copyfile(os.environ["TCNYC_FIXTURE_" + key], args[args.index("-o") + 1])
         else:
             check = run(root / EXE, "--stage", valid, root / "restarted")
             expect(check.returncode != 0 and not list(outside.iterdir()), "Updater accepted a linked destination.")
+            expect("symbolic link" in check.stderr or "reparse point" in check.stderr or
+                   "unsupported filesystem entry" in check.stderr,
+                   f"The linked install failed for the wrong reason: {check.stderr.strip()}")
 
         root = install("locked install")
         (root / "update").mkdir()
@@ -152,6 +220,8 @@ shutil.copyfile(os.environ["TCNYC_FIXTURE_" + key], args[args.index("-o") + 1])
                 fcntl.flock(lock, fcntl.LOCK_EX)
             check = run(root / EXE, "--stage", valid, root / "restarted")
             expect(check.returncode != 0, "Two updaters acquired the install lock.")
+            expect("Another launcher" in check.stderr,
+                   f"The locked install failed for the wrong reason: {check.stderr.strip()}")
 
         root = install("interrupted install")
         update = root / "update"
@@ -170,6 +240,62 @@ shutil.copyfile(os.environ["TCNYC_FIXTURE_" + key], args[args.index("-o") + 1])
         wait_for(result, "old")
         expect((root / "BUILD.txt").read_bytes() == b"initial" and not (root / "added.txt").exists(),
                "Recovery left a partial install.")
+
+        # An active journal without its staged installer must roll back in-process
+        # instead of refusing to start the game.
+        root = install("active without staged")
+        update = root / "update"
+        (update / "staged").mkdir(parents=True)
+        (update / "backup").mkdir()
+        shutil.copyfile(root / "BUILD.txt", update / "backup" / "BUILD.txt")
+        (root / "BUILD.txt").write_bytes(b"partial update")
+        (update / "active").write_text("1\tBUILD.txt\n", encoding="ascii", newline="\n")
+        result = root / "restarted"
+        check = run(root / EXE, "", valid, result)
+        expect(check.returncode == 0, f"A missing staged installer blocked startup: {check.stderr.strip()}")
+        wait_for(result, "old")
+        expect((root / "BUILD.txt").read_bytes() == b"initial" and not (update / "active").exists(),
+               "The in-process rollback did not restore the install.")
+
+        # A package that fails inspection before the journal must clear
+        # pending/staged so every launch does not offer the same broken update.
+        root = install("broken staged")
+        check = run(root / EXE, "--stage", valid, root / "restarted")
+        expect(check.returncode == 0, check.stderr)
+        (root / "update" / "staged" / "BUILD.txt").unlink()
+        check = run(root / EXE, "--exercise", valid, root / "restarted")
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and (root / "update" / "pending").exists():
+            time.sleep(0.05)
+        expect(not (root / "update" / "pending").exists(),
+               "A failed apply left the update pending for every later launch.")
+        expect((root / "BUILD.txt").read_bytes() == b"initial",
+               "A failed apply changed the live installation.")
+
+        # A failure partway through publication (an unwritable destination) must
+        # roll the already-published files back. Linux root can write through the
+        # permission bit, so the case is covered on Windows and unprivileged Linux.
+        if WINDOWS or os.geteuid() != 0:
+            root = install("partway apply")
+            check = run(root / EXE, "--stage", valid, root / "restarted")
+            expect(check.returncode == 0, check.stderr)
+            if WINDOWS:
+                locked = root / "locked.txt"
+                locked.write_bytes(b"original")
+                os.chmod(locked, stat.S_IREAD)
+            else:
+                locked = root / "lockdir"
+                locked.mkdir()
+                os.chmod(locked, 0o555)
+            check = run(root / "update" / "staged" / EXE, "--apply-update=999999", valid, root / "restarted")
+            expect(check.returncode != 0, "A package that cannot be published reported success.")
+            if WINDOWS:
+                expect(locked.read_bytes() == b"original", "A failed apply did not restore the replaced file.")
+                os.chmod(locked, stat.S_IWRITE)
+            else:
+                expect(not (locked / "file").exists(), "A failed apply left a partially published file.")
+                os.chmod(locked, 0o755)
+            expect(not (root / "update" / "committed").exists(), "A failed apply committed the update.")
 
 
 if __name__ == "__main__":

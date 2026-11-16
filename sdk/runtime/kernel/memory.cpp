@@ -389,6 +389,9 @@ uint32_t FreeVirtual(uint32_t& base, uint32_t& size, uint32_t type) {
     Reservation* r = FindReservation(base, &start);
     if (!r) return 0xC000009F;  // STATUS_MEMORY_NOT_ALLOCATED
     if (type & kMemRelease) {
+        // MEM_RELEASE frees the whole reservation and requires its base; a size,
+        // when given, must be the reservation's own size.
+        if (base != start || (size && size != r->size)) return 0xC000000D;  // STATUS_INVALID_PARAMETER
         uint32_t sz = r->size;
         Decommit(start, sz);
         g_reserved.erase(start);
@@ -471,7 +474,7 @@ void ContigChain(uint32_t out[4]) {
 } // namespace
 
 uint32_t AllocContiguous(uint32_t size, uint32_t lowest, uint32_t highest, uint32_t align) {
-    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    std::unique_lock<std::recursive_mutex> lock(g_lock);
     LayoutChanged();
     EnsureRanges();
     if (size > 0xFFFFFFFFu - (kPage - 1)) return 0;
@@ -492,7 +495,6 @@ uint32_t AllocContiguous(uint32_t size, uint32_t lowest, uint32_t highest, uint3
         g_contig.Free(a, &freed);
         return 0;
     }
-    std::memset(g_base + a, 0, size);
     if (ContigTrace()) {
         ContigRec r{size, {}};
         ContigChain(r.chain);
@@ -501,6 +503,10 @@ uint32_t AllocContiguous(uint32_t size, uint32_t lowest, uint32_t highest, uint3
     if (CityTrace() && size >= 0x4000)
         LOGR("citymem: alloc %u KB at %08X, %llu KB in use", size >> 10, a,
              static_cast<unsigned long long>(g_contig.Used() >> 10));
+    lock.unlock();
+    // Zero outside the global lock: a large city store memset used to stop every
+    // other guest allocation for its duration.
+    std::memset(g_base + a, 0, size);
     return a;
 }
 

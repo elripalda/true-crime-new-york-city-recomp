@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <a href="../../releases/latest"><img alt="Latest release" src="https://img.shields.io/badge/release-v0.9.2--beta.3-blue"></a>
+  <a href="../../releases/latest"><img alt="Latest release" src="https://img.shields.io/badge/release-v0.9.2--beta.4-blue"></a>
   <img alt="Windows and Linux" src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-2ea44f">
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-green"></a>
   <img alt="Beta" src="https://img.shields.io/badge/status-beta-orange">
@@ -122,8 +122,8 @@ The 3D scene renders in higher-precision (FP16) colour on D3D12 and Vulkan when 
 
 - **Boot splash:** place `splash.png` or `splash.bmp` beside the executable.
 - **Texture replacement:** see the [Linux guide](README-LINUX.md#texture-packs) for the shared folder and naming scheme. Windows uses the same layout.
-- **Custom music:** pick a folder in the launcher (Graphics tab, Custom Music) or set `music_folder` in
-  `settings.toml`. A file named after a Music Player song (`6000` to `6092`, as `.mp3`, `.ogg`, `.flac`, `.wav` or `.wma`)
+- **Custom music:** drop songs into the `music` folder beside the game. To use another folder, pick it on the
+  launcher's Music tab or set `music_folder` in `settings.toml`. A file named after a Music Player song (`6000` to `6092`, as `.mp3`, `.ogg`, `.flac`, `.wav` or `.wma`)
   plays in its place; songs you don't replace stay as they are. MP3, OGG, FLAC and WAV are decoded by the port;
   surround files play in stereo. Any other audio file in the folder is added to the
   Music Player as a new song, already owned (up to 35). Name files `Band - Title.mp3` to show both.
@@ -174,7 +174,7 @@ Everything in the F10 menu is saved to `settings.toml`: beside the executable on
 | `mouse_sensitivity_percent` | `100` | Mouse look speed, 10 to 400. |
 | `mouse_vertical_sensitivity_percent` | `100` | Vertical speed relative to horizontal, 10 to 400. |
 | `direct_mouse_aim` | `true` | The mouse turns the camera directly; `false` feeds it to the right stick instead. |
-| `music_folder` | `""` | Folder of replacement Music Player songs (see Customization); relative paths start beside the executable. |
+| `music_folder` | `""` | Folder of custom songs (see Customization); empty uses `music` beside the executable, relative paths start there too. |
 | `prompt_style` | `0` | Button prompts: 0 automatic, 1 original Xbox, 2 Xbox, 3 PlayStation, 4 Steam Deck. |
 | `[controls.keyboard]` | today's layout | Keys per action, e.g. `jump = ["Space", "G"]`; mouse buttons are `MouseLeft`, `MouseMiddle`, `MouseRight`, `Mouse4`, `Mouse5`. |
 | `[controls.controller]` | standard layout | The physical button for each console input, e.g. `A = "a"` (SDL names). |

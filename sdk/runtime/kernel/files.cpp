@@ -14,7 +14,19 @@
 #include <sys/stat.h>
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <fcntl.h>
 #include <io.h>
+// windows.h maps these Win32 API names to their W variants; the kernel exports
+// below are the guest's own functions.
+#undef CreateSymbolicLink
+#undef DeleteSymbolicLink
 #else
 #include <unistd.h>
 #endif
@@ -35,13 +47,36 @@ std::filesystem::path ExtraSongPath(uint32_t track);
 namespace kernel {
 
 // Opens a host path without narrowing it through the active ANSI code page.
+// CreateFileW with FILE_SHARE_DELETE lets a guest rename a save while a handle
+// (or the CRT stream behind it) is still open; _wfopen does not share delete.
 FILE* OpenHostFile(const fs::path& path, const char* mode) {
 #ifdef _WIN32
-    wchar_t wide[8];
-    size_t i = 0;
-    for (; mode[i] && i + 1 < sizeof(wide) / sizeof(wide[0]); i++) wide[i] = wchar_t(uint8_t(mode[i]));
-    wide[i] = 0;
-    return _wfopen(path.c_str(), wide);
+    DWORD access = GENERIC_READ;
+    DWORD disposition = OPEN_EXISTING;
+    int flags = _O_RDONLY | _O_BINARY;
+    if (std::strcmp(mode, "r+b") == 0) {
+        access = GENERIC_READ | GENERIC_WRITE;
+        flags = _O_RDWR | _O_BINARY;
+    } else if (std::strcmp(mode, "wb") == 0) {
+        access = GENERIC_WRITE;
+        disposition = CREATE_ALWAYS;
+        flags = _O_WRONLY | _O_BINARY;
+    } else if (std::strcmp(mode, "ab") == 0) {
+        access = GENERIC_WRITE;
+        disposition = OPEN_ALWAYS;
+        flags = _O_WRONLY | _O_APPEND | _O_BINARY;
+    }
+    HANDLE handle = CreateFileW(path.c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                disposition, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return nullptr;
+    const int fd = _open_osfhandle(reinterpret_cast<intptr_t>(handle), flags);
+    if (fd < 0) {
+        ::CloseHandle(handle);
+        return nullptr;
+    }
+    FILE* fp = _fdopen(fd, mode);
+    if (!fp) _close(fd);
+    return fp;
 #else
     return std::fopen(path.string().c_str(), mode);
 #endif
@@ -85,7 +120,19 @@ fs::path MatchCase(const fs::path& dir, const std::vector<std::string>& parts, b
     fs::path cache_key = dir;
     for (const std::string& part : parts) cache_key /= part;
     if (cache) {
-        if (auto hit = g_resolved.find(cache_key); hit != g_resolved.end()) return hit->second;
+        if (auto hit = g_resolved.find(cache_key); hit != g_resolved.end()) {
+            // R10: the destination may have been replaced by a symlink or junction
+            // since it was cached. Revalidate both the containment and that the path
+            // still names the same existing file before trusting the hit.
+            std::error_code ec;
+            const fs::path root = fs::weakly_canonical(dir, ec);
+            if (!ec) {
+                const fs::path resolved = fs::weakly_canonical(hit->second, ec);
+                if (!ec && resolved == hit->second && Within(root, resolved) && fs::exists(resolved, ec) && !ec)
+                    return hit->second;
+            }
+            g_resolved.erase(hit);
+        }
     }
     fs::path cur = dir;
     size_t depth = 0;
@@ -451,7 +498,7 @@ Target Resolve(const std::string& xbox_path, uint32_t root_handle) {
         if (const Disc* disc = MountedDisc()) return {{}, true, disc->Find(parts), true};
         return {MatchCase(best->second, parts, true), false, nullptr, true};
     }
-    return {MatchCase(best->second, parts, false)};
+    return {MatchCase(best->second, parts, true)};
 }
 
 // the disc image is read only: nothing on it is created, replaced or written
@@ -625,7 +672,6 @@ bool ReadGameFile(const std::string& xbox_path, std::vector<uint8_t>& out) {
 
 KERNEL_EXPORT(190, NtCreateFile, 9) {
     uint32_t handle_out = a[0], access = a[1], attrs = a[2], iosb = a[3], disposition = a[7], options = a[8];
-    (void)access;
     uint32_t root;
     std::string name = ObjectName(attrs, &root);
     Target t = Resolve(name, root);
@@ -642,11 +688,19 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
     bool exists = fs::exists(host, ec);
     bool is_dir = exists && fs::is_directory(host, ec);
     // CDROM0 is read-only media, including when its files are extracted.
-    if (t.read_only && (!exists || (disposition != 1 && disposition != 3) || (options & 0x1000))) {
+    if (t.read_only && !exists) {
+        IoStatus(iosb, kObjectNameNotFound, 5);
+        return kObjectNameNotFound;
+    }
+    if (t.read_only && ((disposition != 1 && disposition != 3) || (options & 0x1000))) {
         IoStatus(iosb, kAccessDenied, 0);
         return kAccessDenied;
     }
     bool want_dir = options & 1;
+    if (want_dir && exists && !is_dir) {
+        IoStatus(iosb, kNotADirectory, 0);
+        return kNotADirectory;
+    }
     uint32_t info = 1;  // FILE_OPENED
     if (want_dir || is_dir) {
         if (!exists) {
@@ -655,6 +709,10 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
                 return kObjectNameNotFound;
             }
             fs::create_directories(host, ec);
+            if (ec && !fs::is_directory(host, ec)) {
+                IoStatus(iosb, kAccessDenied, 0);
+                return kAccessDenied;
+            }
             info = 2;
         } else if (disposition == 2) {
             IoStatus(iosb, kObjectNameCollision, 4);
@@ -675,6 +733,9 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
         return kSuccess;
     }
     const char* mode = nullptr;
+    // A read-only desired access must not ask the host for write permission: a
+    // read-only asset would otherwise fail its first open.
+    const bool read_request = (access & 0x40000000u) == 0 && (access & 0x2u) == 0;
     switch (disposition) {
         case 0:  // supersede
         case 5:  // overwrite if
@@ -687,7 +748,7 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
                 IoStatus(iosb, kObjectNameNotFound, 5);
                 return kObjectNameNotFound;
             }
-            mode = "r+b";
+            mode = read_request ? "rb" : "r+b";
             break;
         case 2:  // create
             if (exists) {
@@ -698,7 +759,7 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
             info = 2;
             break;
         case 3:  // open if
-            mode = exists ? "r+b" : "w+b";
+            mode = !exists ? "w+b" : read_request ? "rb" : "r+b";
             info = exists ? 1 : 2;
             break;
         case 4:  // overwrite
@@ -718,7 +779,11 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
         return kObjectPathNotFound;
     }
     FILE* fp = OpenHostFile(host, mode);
-    if (!fp && std::string(mode) == "r+b") fp = OpenHostFile(host, "rb");  // read only media
+    bool writable = std::strchr(mode, '+') != nullptr;
+    if (!fp && std::string(mode) == "r+b") {  // read only media
+        fp = OpenHostFile(host, "rb");
+        writable = false;
+    }
     if (!fp) {
         LOGW("NtCreateFile: cannot open %s", host.string().c_str());
         IoStatus(iosb, kAccessDenied, 0);
@@ -728,7 +793,7 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
     f->host = host;
     f->xbox = Normalize(name);
     f->fp = fp;
-    f->writable = std::strchr(mode, '+') != nullptr;
+    f->writable = writable && fp != nullptr;
     f->read_only = t.read_only;
     f->delete_on_close = options & 0x1000;  // FILE_DELETE_ON_CLOSE
 #if TCNYC_DEV_TOOLS
@@ -743,7 +808,7 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
 
 KERNEL_EXPORT(202, NtOpenFile, 6) {
     // same as create with FILE_OPEN
-    uint32_t handle_out = a[0], attrs = a[2], iosb = a[3], options = a[5];
+    uint32_t handle_out = a[0], access = a[1], attrs = a[2], iosb = a[3], options = a[5];
     uint32_t root;
     std::string name = ObjectName(attrs, &root);
     Target t = Resolve(name, root);
@@ -753,8 +818,9 @@ KERNEL_EXPORT(202, NtOpenFile, 6) {
     std::error_code ec;
     if (host.empty() || !fs::exists(host, ec)) {
         LOG_FIRST(200, "missing %s", name.c_str());
-        IoStatus(iosb, kObjectNameNotFound, 5);
-        return host.empty() ? kObjectPathNotFound : kObjectNameNotFound;
+        const uint32_t status = host.empty() ? kObjectPathNotFound : kObjectNameNotFound;
+        IoStatus(iosb, status, host.empty() ? 0 : 5);
+        return status;
     }
     auto f = std::make_shared<File>();
     f->host = host;
@@ -762,9 +828,14 @@ KERNEL_EXPORT(202, NtOpenFile, 6) {
     f->dir = fs::is_directory(host, ec);
     f->read_only = t.read_only;
     if (!f->dir) {
-        f->fp = OpenHostFile(host, t.read_only ? "rb" : "r+b");
-        f->writable = !t.read_only && f->fp != nullptr;
-        if (!f->fp && !t.read_only) f->fp = OpenHostFile(host, "rb");
+        const bool read_request = (access & 0x40000000u) == 0 && (access & 0x2u) == 0;
+        bool write = !t.read_only && !read_request;
+        f->fp = OpenHostFile(host, write ? "r+b" : "rb");
+        if (!f->fp && write) {
+            f->fp = OpenHostFile(host, "rb");
+            write = false;
+        }
+        f->writable = write && f->fp != nullptr;
         if (!f->fp) return kAccessDenied;
     }
 #if TCNYC_DEV_TOOLS
@@ -958,6 +1029,8 @@ KERNEL_EXPORT(226, NtSetInformationFile, 5) {
             fs::path host = resolved.host;
             if (host.empty()) return kObjectPathNotFound;
             if (!PathUnchanged(f->host) || !PathUnchanged(host)) return kAccessDenied;
+            // ReplaceIfExists: without it, an existing target is a collision.
+            if (!G<uint8_t>(in) && fs::exists(host)) return kObjectNameCollision;
             if (f->fp && std::fflush(f->fp) != 0) return kDiskFull;
             fs::rename(f->host, host, ec);
             if (ec) return kAccessDenied;
@@ -977,8 +1050,19 @@ KERNEL_EXPORT(226, NtSetInformationFile, 5) {
 // fills a volume information class into out; returns the status and the byte count written
 static uint32_t QueryVolume(uint32_t out, uint32_t len, uint32_t cls, uint32_t& bytes, const char* who) {
     bytes = 0;
-    if (len && !GuestWritable(out, len)) return kAccessViolation;
-    std::memset(HostPtr(out), 0, len);
+    uint32_t need = 0;
+    switch (cls) {
+        case 3: need = 0x18; break;  // FileFsSizeInformation
+        case 7: need = 0x20; break;  // FileFsFullSizeInformation
+        case 1: need = 0x18; break;  // FileFsVolumeInformation
+        case 5: need = 16; break;    // FileFsAttributeInformation
+        default:
+            LOG_FIRST(8, "%s: class %u", who, cls);
+            return kInvalidParameter;
+    }
+    if (len < need) return kBufferTooSmall;
+    if (!GuestWritable(out, need)) return kAccessViolation;
+    std::memset(HostPtr(out), 0, need);
     switch (cls) {
         case 3:  // FileFsSizeInformation: 16 GiB total, 8 GiB free in 16 KiB units
             W64(out, 0x100000);

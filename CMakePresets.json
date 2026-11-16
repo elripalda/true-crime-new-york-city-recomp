@@ -18,6 +18,8 @@
         },
         {"name": "debug", "displayName": "Debug", "inherits": "base",
          "cacheVariables": {"CMAKE_BUILD_TYPE": "Debug"}},
+        {"name": "tests", "displayName": "Host tests only", "inherits": "base",
+         "cacheVariables": {"CMAKE_BUILD_TYPE": "Release", "TCNYC_TESTS_ONLY": "ON"}},
         {"name": "release", "displayName": "Release", "inherits": "base",
          "cacheVariables": {"CMAKE_BUILD_TYPE": "Release"}},
         {"name": "relwithdebinfo", "displayName": "RelWithDebInfo", "inherits": "base",
@@ -31,6 +33,7 @@
     ],
     "buildPresets": [
         {"name": "debug", "configurePreset": "debug"},
+        {"name": "tests", "configurePreset": "tests"},
         {"name": "release", "configurePreset": "release"},
         {"name": "relwithdebinfo", "configurePreset": "relwithdebinfo"},
         {"name": "dev", "configurePreset": "dev"},

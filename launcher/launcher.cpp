@@ -101,7 +101,9 @@ struct Graphics {
 
     void Save() {
         if (edits.empty()) return;
-        app::MergeSettingsTable(app::SettingsPath(), edits);
+        toml::table full;
+        app::FullSettingsTable(full);
+        app::MergeSettingsTable(app::SettingsPath(), edits, &full);
         edits.clear();
     }
 
@@ -300,21 +302,24 @@ struct Graphics {
             ImGui::EndDisabled();
             ImGui::EndTable();
         }
+    }
 
+    // The Music tab: where replacement and extra songs come from.
+    void DrawMusic() {
         if (Section("CUSTOM MUSIC")) ImGui::EndTable();
-        {
-            std::lock_guard lock(music_picker.mutex);
-            if (!music_picker.path.empty()) {
-                settings.music_folder = std::move(music_picker.path);
-                music_picker.path.clear();
-                edits.insert_or_assign("music_folder", settings.music_folder);
-            }
-        }
-        ImGui::TextDisabled("Files named after a Music Player song (6000 to 6092; mp3, ogg, flac, wav or wma) replace it.");
-        ImGui::SetNextItemWidth(-ImGui::CalcTextSize("Browse...Clear").x - ImGui::GetStyle().ItemSpacing.x * 2 -
-                                ImGui::GetStyle().FramePadding.x * 4);
-        if (ImGui::InputTextWithHint("##music_folder", "Folder with your songs (empty: the game's music)",
-                                     &settings.music_folder))
+        ImGui::TextWrapped("Drop songs into the music folder (mp3, ogg, flac, wav or wma).");
+        ImGui::BulletText("A file named after a Music Player song, 6000 to 6092, replaces that song.");
+        ImGui::BulletText("Any other file is added as a new song on the CUSTOM MUSIC tab (up to 35).");
+        ImGui::BulletText("Name files \"Band - Title.mp3\" to show the band.");
+        ImGui::Spacing();
+
+        if (Section("FOLDER")) ImGui::EndTable();
+        const fs::path default_folder = app::ExeDir() / "music";
+        const bool custom = !settings.music_folder.empty();
+        ImGui::SetNextItemWidth(-ImGui::CalcTextSize("Browse...Open folderUse default").x -
+                                ImGui::GetStyle().ItemSpacing.x * 3 - ImGui::GetStyle().FramePadding.x * 6);
+        const std::string hint = reinterpret_cast<const char *>(default_folder.u8string().c_str());
+        if (ImGui::InputTextWithHint("##music_folder", hint.c_str(), &settings.music_folder))
             edits.insert_or_assign("music_folder", settings.music_folder);
         ImGui::SameLine();
         bool picking;
@@ -328,15 +333,31 @@ struct Graphics {
                 std::lock_guard lock(music_picker.mutex);
                 music_picker.pending = true;
             }
-            SDL_ShowOpenFolderDialog(Picked, &music_picker, window,
-                                     settings.music_folder.empty() ? nullptr : settings.music_folder.c_str(), false);
+            SDL_ShowOpenFolderDialog(Picked, &music_picker, window, custom ? settings.music_folder.c_str() : hint.c_str(),
+                                     false);
         }
         ImGui::EndDisabled();
         ImGui::SameLine();
-        if (ImGui::Button("Clear") && !settings.music_folder.empty()) {
+        if (ImGui::Button("Open folder")) {
+            fs::path folder = custom ? fs::path(reinterpret_cast<const char8_t *>(settings.music_folder.c_str()))
+                                     : default_folder;
+            if (folder.is_relative()) folder = app::ExeDir() / folder;
+            std::error_code ec;
+            fs::create_directories(folder, ec);
+            const std::u8string path = folder.generic_u8string();
+            std::u8string url = u8"file://";
+            if (path.empty() || path.front() != u8'/') url += u8'/';
+            url += path;
+            SDL_OpenURL(reinterpret_cast<const char *>(url.c_str()));
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!custom);
+        if (ImGui::Button("Use default")) {
             settings.music_folder.clear();
             edits.insert_or_assign("music_folder", settings.music_folder);
         }
+        ImGui::EndDisabled();
+        ImGui::TextDisabled(custom ? "Using your own folder." : "Using the music folder beside the game.");
     }
 };
 
@@ -367,10 +388,18 @@ struct Controls {
 
     void SetKey(uint32_t key, toml::table &edits) {
         auto &slots = keys[key_row].keys;
-        if (key) for (auto& binding : slots) if (binding == key) binding = 0;
-        slots[key_slot] = key;
-        // keep the set packed: the first key is the one the prompts show
-        std::stable_partition(std::begin(slots), std::end(slots), [](uint32_t k) { return k != 0; });
+        if (!key) {
+            std::fill(std::begin(slots), std::end(slots), 0u);
+            key_row = -1;
+            Commit(edits);
+            return;
+        }
+        for (auto& binding : slots) if (binding == key) binding = 0;
+        // the new key becomes the main one (the one the prompts show); the others stay
+        const auto end = std::remove(std::begin(slots), std::end(slots), 0u);
+        std::fill(end, std::end(slots), 0u);
+        std::move_backward(std::begin(slots), std::end(slots) - 1, std::end(slots));
+        slots[0] = key;
         key_row = -1;
         Commit(edits);
     }
@@ -765,6 +794,7 @@ bool DrawLauncher(SDL_Window *window, SDL_Renderer *renderer, float scale, fs::p
         }
     };
     Updater updater;
+    updater.AdoptStaged();
     if (check_updates) updater.Check();
 
     Picker picker;
@@ -799,6 +829,22 @@ bool DrawLauncher(SDL_Window *window, SDL_Renderer *renderer, float scale, fs::p
             if (!picker.error.empty()) {
                 notice = std::move(picker.error);
                 picker.error.clear();
+                error = true;
+            }
+        }
+        {
+            // The music folder picker's callback can outlive the tab and the
+            // frame, so its result is collected here, not while drawing.
+            std::lock_guard lock(graphics.music_picker.mutex);
+            picking = picking || graphics.music_picker.pending;
+            if (!graphics.music_picker.path.empty()) {
+                graphics.settings.music_folder = std::move(graphics.music_picker.path);
+                graphics.music_picker.path.clear();
+                graphics.edits.insert_or_assign("music_folder", graphics.settings.music_folder);
+            }
+            if (!graphics.music_picker.error.empty()) {
+                notice = std::move(graphics.music_picker.error);
+                graphics.music_picker.error.clear();
                 error = true;
             }
         }
@@ -933,6 +979,15 @@ bool DrawLauncher(SDL_Window *window, SDL_Renderer *renderer, float scale, fs::p
                 graphics_tab = true;
                 ImGui::BeginChild("graphics scroll", {0, 0}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
                 graphics.Draw();
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("  MUSIC  ")) {
+                ImGui::Spacing();
+                Headline("THE RADIO: MUSIC");
+                graphics_tab = true;
+                ImGui::BeginChild("music scroll", {0, 0}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
+                graphics.DrawMusic();
                 ImGui::EndChild();
                 ImGui::EndTabItem();
             }

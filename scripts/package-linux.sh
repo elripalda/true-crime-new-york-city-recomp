@@ -22,6 +22,17 @@ export SOURCE_DATE_EPOCH=$EPOCH
 BUILD_TIME=$(date -u -d "@$EPOCH" '+%Y-%m-%dT%H:%M:%SZ')
 VERSION=$(tr -d '\r\n' < "$REPO/launcher/VERSION")
 test -n "$VERSION"
+# A release package must come from the tag it names: UPDATE-PROTOCOL carries
+# VERSION and the updater refuses an archive whose release tag disagrees.
+if [ "${TCNYC_ALLOW_UNTAGGED:-0}" != 1 ]; then
+    RELEASE_TAG=v$VERSION
+    HEAD_TAG=$(git -C "$REPO" describe --tags --exact-match HEAD 2>/dev/null || true)
+    if [ "$HEAD_TAG" != "$RELEASE_TAG" ]; then
+        echo "HEAD is ${HEAD_TAG:-untagged}, expected the release tag $RELEASE_TAG." >&2
+        echo "Tag the release commit, or set TCNYC_ALLOW_UNTAGGED=1 for a local test package." >&2
+        exit 1
+    fi
+fi
 
 if [ ! -f "$BUILD/TrueCrimeNYC" ]; then
     echo "Native build not found: $BUILD/TrueCrimeNYC" >&2
@@ -39,7 +50,7 @@ STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 
 PKG="$STAGE/$NAME"
-mkdir -p "$PKG/lib" "$PKG/assets" "$PKG/LICENSES"
+mkdir -p "$PKG/lib" "$PKG/assets" "$PKG/LICENSES" "$PKG/music"  # music: the default custom music folder
 
 # the release binary: no debug tables, the rpath already points at $ORIGIN/lib
 install -m 0755 "$BUILD/TrueCrimeNYC" "$PKG/TrueCrimeNYC"

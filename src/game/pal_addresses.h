@@ -1,4 +1,5 @@
-// Generated for the European (PAL) XBE. Do not edit by hand.
+// Generated for the European (PAL) XBE, except for the manual cases marked below.
+// Keep those manual cases when regenerating the table.
 // Included by src/game/game_addresses.h when TCNYC_PAL is set.
 #pragma once
 #include <cstdint>
@@ -182,7 +183,8 @@ constexpr uint32_t TC_ADDR(uint32_t usa) {
         case 0x004C6380u: return 0x004C6C80u;
         case 0x004D48A4u: return 0x004D51A4u;
         case 0x004D48A8u: return 0x004D51A8u;
-        // added by hand 2026-11-15 (matched by instruction windows against generated/game-pal):
+        // Manual cases: data and guest constants the symbol scanner does not alias.
+        // Keep these when regenerating the table.
         case 0x00018E46u: return 0x00018E86u;  // 0x15420 return in the 0x18C80 spawn check
         case 0x0001C8A0u: return 0x0001C8E0u;
         case 0x0001CE10u: return 0x0001CE50u;

@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <condition_variable>
 #include <random>
 
 #include "app/app.h"
@@ -68,6 +69,7 @@ struct PendingRecv {
 };
 
 std::mutex g_lock;
+std::condition_variable g_pump_cv;
 std::unordered_map<uint32_t, Socket> g_sockets;
 uint32_t g_next_socket = 0x100;
 std::vector<PendingRecv> g_pending;
@@ -309,7 +311,10 @@ void Pump() {
             }
         }
         if (!set.fd_count) {
-            Sleep(1);
+            // No outstanding receive: sleep until a new one is queued instead of
+            // waking every millisecond for the life of the game.
+            std::unique_lock<std::mutex> lock(g_lock);
+            g_pump_cv.wait_for(lock, std::chrono::milliseconds(50));
             continue;
         }
         timeval tv{0, 2000};
@@ -717,6 +722,7 @@ uint32_t RecvOverlapped(uint32_t sock, uint32_t bufs, uint32_t count, uint32_t r
             W32(ovl + kOvlStatus, kOvlPending);
             if (auto o = kernel::FromHandle(R32(ovl + kOvlEvent))) kernel::ResetEvent(*o);
             g_pending.push_back(std::move(p));
+            g_pump_cv.notify_one();
             return Fail(WSA_IO_PENDING);
         }
         if (k.nonblocking) return Fail(err);

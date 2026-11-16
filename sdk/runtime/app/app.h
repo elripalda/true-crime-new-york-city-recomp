@@ -10,6 +10,8 @@ namespace input {
 struct Pad;
 }
 
+#include <toml++/toml.hpp>
+
 // the host side: window, settings
 namespace app {
 
@@ -78,9 +80,13 @@ void SetMsaaSamples(uint32_t samples);
 std::filesystem::path SettingsPath();
 void Load();
 bool Save();
+void FlushSettings();  // waits for the settings publisher (call before exit)
+// the complete settings table, for a launcher save that must not drop unknown keys
+void FullSettingsTable(toml::table& out);
 void LogSettings();  // every setting, as the settings file has them
 void LogSystem();    // the machine and the settings, at a run's start
 void ApplyDisplay();  // any thread
+void InvalidateOutputCache();  // a display mode or monitor change
 bool RequestQuit();  // post a close request to the host event loop
 struct Mode {
     uint32_t width, height;

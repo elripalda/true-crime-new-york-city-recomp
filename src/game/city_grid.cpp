@@ -76,6 +76,10 @@ int SideIndex(int32_t x, int32_t y, int n) {
 
 bool Valid(int32_t x, int32_t y) { return x != kEmpty && y != kEmpty; }
 
+// +0x50 is the loaded tile's 32-bit root pointer, not a flag byte. A pointer
+// whose low byte happens to be zero still means the slot is loaded.
+bool SlotHasRoot(uint8_t *base, uint32_t slot) { return X86_MEM32(slot + 0x50) != 0; }
+
 int32_t SlotX(uint8_t *base, uint32_t manager, int i) {
     return int32_t(X86_MEM32(manager + kGameSlots + uint32_t(i) * kSlotBytes + 0x04));
 }
@@ -169,7 +173,7 @@ void TestOuter(uint8_t *base, X86Context &ctx, uint32_t city, uint32_t manager) 
     uint32_t slot_template = 0, cell_template = 0;
     for (uint32_t i = 0; i < kSlotsCount; ++i) {
         const uint32_t slot = manager + kGameSlots + i * kSlotBytes;
-        if (!X86_MEM8(slot + 0x50) && int32_t(X86_MEM32(slot + 0x04)) == kEmpty) {
+        if (!SlotHasRoot(base, slot) && int32_t(X86_MEM32(slot + 0x04)) == kEmpty) {
             slot_template = slot;
             break;
         }
@@ -190,7 +194,7 @@ void TestOuter(uint8_t *base, X86Context &ctx, uint32_t city, uint32_t manager) 
     bool have = false;
     for (uint32_t i = 0; i < kSlotsCount; ++i) {
         const uint32_t slot = manager + kGameSlots + i * kSlotBytes;
-        if (!X86_MEM8(slot + 0x50)) continue;
+        if (!SlotHasRoot(base, slot)) continue;
         const int32_t x = int32_t(X86_MEM32(slot + 0x04)), y = int32_t(X86_MEM32(slot + 0x08));
         if (!have) {
             min_x = max_x = x;
@@ -247,7 +251,7 @@ bool EnsureTemplates(uint8_t *base, uint32_t city, uint32_t manager) {
     if (!g.slot_template)
         for (uint32_t i = 0; i < kSlotsCount; ++i) {
             const uint32_t slot = manager + kGameSlots + i * kSlotBytes;
-            if (!X86_MEM8(slot + 0x50) && int32_t(X86_MEM32(slot + 0x04)) == kEmpty &&
+            if (!SlotHasRoot(base, slot) && int32_t(X86_MEM32(slot + 0x04)) == kEmpty &&
                 X86_MEM32(slot) != 0) {
                 g.slot_template = slot;
                 break;
@@ -333,8 +337,9 @@ void ClearRingCell(uint8_t *base, X86Context &ctx, uint32_t city, int idx) {
     // node: splice it out ourselves, exactly as 0x13C180 does, so no neighbour keeps a pointer into the store.
     if (const uint32_t next = X86_MEM32(cell + 0x70)) {
         const uint32_t prev = X86_MEM32(cell + 0x74);
-        X86_MEM32(next + 4) = prev;
-        X86_MEM32(prev) = next;
+        // A null neighbour is the list head, not guest address 0.
+        if (next) X86_MEM32(next + 4) = prev;
+        if (prev) X86_MEM32(prev) = next;
     }
     X86_MEM32(cell + 0x80) = 0;
     X86_MEM32(cell + 0x0C) = 0xFFFFFFFFu;
@@ -359,15 +364,16 @@ void OnGameMove(uint8_t *base, X86Context &ctx, uint32_t city, uint32_t game_obj
     const int32_t old_y = int32_t(X86_MEM32(game_object + 0x08));
     const bool old_valid = old_x != kEmpty && old_y != kEmpty;
     const bool new_valid = target_x != kEmpty && target_y != kEmpty;
-    const int32_t new_x = target_x, new_y = target_y + 6;  // target is a slot coordinate; cells are +6
-    const auto now = std::chrono::steady_clock::now();
-    if (now - g.last_move < std::chrono::milliseconds(1)) return;
-    g.last_move = now;
+    // Cells already use draw coordinates; slots and their targets are six tiles
+    // further along y. Applying +6 to a cell missed every ring tile around it.
+    const bool game_cell = game_object >= city + 0x4FA4 && game_object < city + 0x4FA4 + 9 * kCellBytes;
+    const int32_t old_cell_y = old_y + (game_cell ? 0 : 6);
+    const int32_t new_cell_y = target_y + (game_cell ? 0 : 6);
     for (int idx = 0; idx < g.n * g.n && idx < 128; ++idx) {
         if (!g.ring_init[idx]) continue;
         const uint32_t cell = g.cells + uint32_t(idx) * kCellBytes;
         const int32_t cx = int32_t(X86_MEM32(cell + 0x04)), cy = int32_t(X86_MEM32(cell + 0x08));
-        if ((old_valid && cx == old_x && cy == old_y) || (new_valid && cx == new_x && cy == new_y))
+        if ((old_valid && cx == old_x && cy == old_cell_y) || (new_valid && cx == target_x && cy == new_cell_y))
             g.ring_pending[idx] = true;  // unload from the draw boundary, not inside the game's state machine
     }
 }
@@ -428,7 +434,7 @@ void UpdateGameTiles(uint8_t *base, uint32_t city, uint32_t manager) {
             g.game_x[at] = x;
             g.game_y[at] = y + 6;
             g.game_lock[at] = true;
-        } else if (X86_MEM8(slot + 0x50)) {
+        } else if (SlotHasRoot(base, slot)) {
             g.game_lock[at] = true;  // still loaded while the target is cleared
         } else {
             g.game_lock[at] = false;
@@ -473,11 +479,31 @@ bool GameBusy(uint8_t *base, uint32_t city, uint32_t manager) {
     return false;
 }
 
+void ShutdownRing(uint8_t *base, X86Context &ctx, uint32_t city) {
+    int cleared = 0;
+    for (int idx = 0; idx < g.n * g.n && idx < 128; ++idx) {
+        if (!g.ring_init[idx] && !g.ring_cell[idx] && !g.ring_pending[idx]) continue;
+        ClearRingCell(base, ctx, city, idx);
+        ++cleared;
+    }
+    g.ring = false;
+    g.ring_center = false;
+    g.last_radius = 0;
+    g.ring_rr = 0;
+    LOGR("city: ring shut down, %d cell(s) cleared", cleared);
+}
+
 void DriveRing(uint8_t *base, X86Context &ctx, uint32_t city, uint32_t manager) {
     if (!g.orphan_requests.empty()) {  // requests dropped by a city reset (see Init)
         for (const uint32_t req : g.orphan_requests) kernel::CallGuest(ctx, TC_ADDR(0x24BAB0), {req});
         LOGR("city: released %zu ring stream requests left by a city reset", g.orphan_requests.size());
         g.orphan_requests.clear();
+    }
+    if (g.ready && g.ring && !Ring()) {
+        // The City draw distance went back to Normal: remove every ring cell and
+        // link instead of leaving stale ones behind.
+        ShutdownRing(base, ctx, city);
+        return;
     }
     if (!g.ready || !g.ring) return;
     const auto now = std::chrono::steady_clock::now();
@@ -511,7 +537,7 @@ void DriveRing(uint8_t *base, X86Context &ctx, uint32_t city, uint32_t manager) 
     bool have = false;
     for (uint32_t i = 0; i < kSlotsCount; ++i) {
         const uint32_t slot = manager + kGameSlots + i * kSlotBytes;
-        if (!X86_MEM8(slot + 0x50)) continue;
+        if (!SlotHasRoot(base, slot)) continue;
         const int32_t x = int32_t(X86_MEM32(slot + 0x04)), y = int32_t(X86_MEM32(slot + 0x08));
         if (!have) {
             min_x = max_x = x;
@@ -618,15 +644,20 @@ void DrawRing(uint8_t *base, X86Context &ctx, uint32_t camera) {
         if (!X86_MEM8(cell + 0x88)) continue;
         if (X86_MEM32(cell + 0x90) == 0xFFFFFFFFu) continue;
         const uint32_t saved = ctx.ecx;
+        static const bool trace = std::getenv("XBE_CITY_NODEGUARD") != nullptr;
         const uint32_t p70 = X86_MEM32(cell + 0x70), p74 = X86_MEM32(cell + 0x74);
         static uint32_t pre[kCellBytes / 4 + 4];
-        for (uint32_t w = 0; w < kCellBytes / 4; ++w) pre[w] = X86_MEM32(cell + w * 4);
-        const uint32_t guard_before = X86_MEM32(TC_ADDR(0x2EA7E8u)) ^ X86_MEM32(TC_ADDR(0x2EA860u));
+        uint32_t guard_before = 0;
+        if (trace) {
+            for (uint32_t w = 0; w < kCellBytes / 4; ++w) pre[w] = X86_MEM32(cell + w * 4);
+            guard_before = X86_MEM32(TC_ADDR(0x2EA7E8u)) ^ X86_MEM32(TC_ADDR(0x2EA860u));
+        }
         ::g_ring_draw_idx = idx;
         ctx.ecx = cell;
         kernel::CallGuest(ctx, TC_ADDR(0x13C4C0), {camera});
         ::g_ring_draw_idx = -1;
         ctx.ecx = saved;
+        if (!trace) continue;
         char tag[128];
         std::snprintf(tag, sizeof tag, "ringcell %d cell %08X links %08X/%08X -> %08X/%08X arg %08X", idx, cell, p70,
                       p74, X86_MEM32(cell + 0x70), X86_MEM32(cell + 0x74), X86_MEM32(cell + 0x78));
@@ -833,7 +864,7 @@ void MaybeSync(uint8_t *base) {
             int slots = 0, slot_req = 0, cell_req = 0;
             for (int idx = 0; idx < g.n * g.n && idx < 128; ++idx) {
                 const uint32_t s = g.slots + uint32_t(idx) * kSlotBytes, c = g.cells + uint32_t(idx) * kCellBytes;
-                slots += X86_MEM8(s + 0x50) ? 1 : 0;
+                slots += SlotHasRoot(base, s) ? 1 : 0;
                 slot_req += X86_MEM32(s + 0x1C) ? 1 : 0;
                 cell_req += X86_MEM32(c + 0x1C) ? 1 : 0;
             }
@@ -844,7 +875,7 @@ void MaybeSync(uint8_t *base) {
         if (g.cell_test && g.test_slot) {
             const uint32_t slot = g.test_slot, cell = g.test_cell;
             LOGR("city: outer test slot loaded %u xy %d,%d state %u vt %08X cell loaded %u xy %d,%d obj %08X",
-                 X86_MEM8(slot + 0x50), int32_t(X86_MEM32(slot + 0x04)), int32_t(X86_MEM32(slot + 0x08)),
+                 SlotHasRoot(base, slot), int32_t(X86_MEM32(slot + 0x04)), int32_t(X86_MEM32(slot + 0x08)),
                  X86_MEM32(slot + 0x24), X86_MEM32(slot), X86_MEM8(cell + 0x88),
                  int32_t(X86_MEM32(cell + 0x04)), int32_t(X86_MEM32(cell + 0x08)), X86_MEM32(cell + 0x80));
         }

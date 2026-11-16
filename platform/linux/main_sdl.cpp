@@ -58,7 +58,7 @@ int main(int argc, char** argv) {
     // the settings decide the window, so the log and settings load come first
     std::string log_name = app::kGame.log;
     if (app::Instance() > 1) log_name += "-" + std::to_string(app::Instance());
-    logx::Init((app::ExeDir() / "logs").string(), log_name);
+    logx::Init(app::ExeDir() / "logs", log_name);
     app::Load();
     if (app::kGame.init) app::kGame.init();
     app::LogSystem();

@@ -108,7 +108,7 @@ void WriteGuestCrashPages(kernel::Thread& thread, EXCEPTION_POINTERS* e) {
     const std::wstring base = (dir / (std::wstring(L"guest-") + stamp)).wstring();
     auto dump = [&](const wchar_t* suffix, uint32_t va, uint32_t len) {
         const std::filesystem::path p = base + suffix;
-        if (kernel::DumpGuestRegion(va, len, p.string().c_str()))
+        if (kernel::DumpGuestRegion(va, len, p))
             LOGE("  guest dump %ls at %08X (%u bytes)", p.c_str(), va, len);
     };
     if (r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && r->NumberParameters >= 2) {
@@ -140,6 +140,14 @@ void WriteGuestCrashPages(kernel::Thread& thread, EXCEPTION_POINTERS* e) {
 
 // crash dump in CrashDumps beside the exe
 LONG WINAPI WriteCrashDump(EXCEPTION_POINTERS* e) {
+    // A fault while building the dump must not recurse into this filter.
+    static std::atomic<bool> in_dump{false};
+    if (in_dump.exchange(true)) return EXCEPTION_CONTINUE_SEARCH;
+    struct ClearDump {
+        std::atomic<bool>& flag;
+        ~ClearDump() { flag.store(false); }
+    } clear{in_dump};
+    logx::EnterCrashMode();
     // the dump holds no guest memory: the guest registers and return addresses go to the log, key pages to .bin files
     if (kernel::Thread* t = kernel::Current(); e && t && t->ctx) {
         auto* r = e->ExceptionRecord;
@@ -299,6 +307,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         case WM_DISPLAYCHANGE:
             gpu::g_display_changed.store(true, std::memory_order_relaxed);
+            InvalidateOutputCache();
             break;
         case kCaptureMouse:
             g_capture_wanted = wp != 0;
@@ -560,7 +569,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     bool relaunched = std::wcsstr(GetCommandLineW(), L"--relaunched") != nullptr;
     std::string log = app::kGame.log;
     if (app::Instance() > 1) log += "-" + std::to_string(app::Instance());
-    logx::Init((app::ExeDir() / "logs").string(), log, relaunched);
+    logx::Init(app::ExeDir() / "logs", log, relaunched);
     app::Load();
     if (app::kGame.init) app::kGame.init();
     if (relaunched && !logx::kVerbose) LOGR("Relaunched: %s", IMAGE_XBE);

@@ -18,6 +18,8 @@ public:
 
     ~Updater();
     void Check();     // background; quietly back to Idle when offline or already current
+    // Makes an already-staged release visible even when update checks are off.
+    bool AdoptStaged();
     void Download();  // background: download, verify and stage the available release
     void Cancel();
     // Starts the staged installer. The caller then exits so the game files can be replaced.

@@ -87,7 +87,8 @@ X86_FUNC(sub_00293541) {
 // is made 1024 slots longer while it is empty.
 X86_EXTERN_FUNC(__imp__sub_0024C020);
 X86_FUNC(sub_0024C020) {
-    if (std::getenv("XBE_NO_STREAM_RING_FIX")) return __imp__sub_0024C020(ctx, base);
+    static const bool ring_fix_disabled = std::getenv("XBE_NO_STREAM_RING_FIX") != nullptr;
+    if (ring_fix_disabled) return __imp__sub_0024C020(ctx, base);
     auto rv = [&](uint32_t a) { return *reinterpret_cast<volatile uint32_t *>(base + a); };
     auto wv = [&](uint32_t a, uint32_t v) { *reinterpret_cast<volatile uint32_t *>(base + a) = v; };
     constexpr uint32_t kProducer = TC_ADDR(0x4D48A8), kConsumer = TC_ADDR(0x4D48A4), kExtra = 1024, kNode = 12;
@@ -101,6 +102,7 @@ X86_FUNC(sub_0024C020) {
         for (uint32_t n = rv(slot); n && n != slot && size < 100000; n = rv(n))
             size++;
         uint32_t nodes = mem::AllocSystem(kExtra * kNode, 16), old_next = rv(slot);
+        if (!nodes) return __imp__sub_0024C020(ctx, base);  // no room: keep the game's ring
         for (uint32_t i = 0; i < kExtra; i++) {
             uint32_t n = nodes + i * kNode;
             wv(n + 4, 0);
@@ -171,7 +173,8 @@ X86_FUNC(sub_0013C8F0) {
 // watch itself is installed by a helper thread and never changes game state.
 namespace {
 void WatchEffectSlot8IfRequested() {
-    if (!std::getenv("XBE_EFFECT_WATCH") || kernel::GuestWatchActive()) return;
+    static const bool requested = std::getenv("XBE_EFFECT_WATCH") != nullptr;
+    if (!requested || kernel::GuestWatchActive()) return;
     if (!mem::IsCommitted(TC_ADDR(0x37F8FCu))) return;
     const uint32_t renderer = kernel::R32(TC_ADDR(0x37F8FCu));
     if (!renderer || !mem::IsCommitted(renderer + 0x55C0u)) return;

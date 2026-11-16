@@ -148,6 +148,9 @@ int16_t g_hold_rx = 0, g_hold_ry = 0;
 uint64_t g_hold_at = 0;
 // mouse wheel notches waiting to be turned into D-pad taps (weapon select / camera)
 int g_wheel_steps = 0;
+// one wheel notch is a press then a release, so the game cannot merge two into
+// a held D-pad direction
+int g_wheel_phase = 0;
 // raw counts waiting for the camera, taken straight from WM_INPUT so a fast
 // flick is not limited by the right-stick path's small clamp; the camera clears
 // them once per frame
@@ -235,6 +238,7 @@ int KeyCode(uint32_t key) {
     case SDLK_RALT: return VK_RMENU;
     case SDLK_CAPSLOCK: return VK_CAPITAL;
     case SDLK_INSERT: return VK_INSERT;
+    case SDLK_DELETE: return VK_DELETE;
     case SDLK_HOME: return VK_HOME;
     case SDLK_END: return VK_END;
     case SDLK_PAGEUP: return VK_PRIOR;
@@ -463,13 +467,18 @@ bool ReadKeyboardMouse(Pad& pad) {
             pad.ry = g_hold_ry;
         }
         // The PC wheel changes weapon on foot and camera in a vehicle; the pad
-        // reaches both through the D-pad.
-        if (g_wheel_steps > 0) {
+        // reaches both through the D-pad. Alternate press and release polls so
+        // several notches are several taps, not one held direction.
+        if (g_wheel_phase) {
+            g_wheel_phase = 0;
+        } else if (g_wheel_steps > 0) {
             pad.buttons |= uint16_t(1 << 0);
             g_wheel_steps--;
+            g_wheel_phase = 1;
         } else if (g_wheel_steps < 0) {
             pad.buttons |= uint16_t(1 << 1);
             g_wheel_steps++;
+            g_wheel_phase = 1;
         }
     }
     const bool active = pad.lx || pad.ly || mouse_active || pad.buttons ||
@@ -536,6 +545,11 @@ void PadBindings(PadBinding (&out)[kPadBindingCount]) {
 
 bool CanBindKey(uint32_t key) {
     if (key & kMouseKey) return key >= MouseKey(0) && key <= MouseKey(4);
+    // Return, Backspace and the arrows always drive menus. Binding one made the
+    // game action and the menu fire from the same press.
+    if (key == SDLK_RETURN || key == SDLK_BACKSPACE || key == SDLK_UP || key == SDLK_DOWN || key == SDLK_LEFT ||
+        key == SDLK_RIGHT)
+        return false;
     return key && KeyCode(key);
 }
 
@@ -576,6 +590,31 @@ void LoadBindings(const void* toml_table) {
             const int source = PadSourceFromName(*name);
             if (source >= 0) g_pad[i].source = source;
             else LOGR("input: unknown controller input '%s' for %s ignored", name->c_str(), kPadInputNames[i]);
+        }
+    }
+    // A hand-edited file can bind one physical input to two actions. Keep the
+    // first and give the duplicate its default (or another unused input).
+    PadBinding defaults[kPadBindingCount];
+    DefaultPadBindings(defaults);
+    std::vector<int> used;
+    for (int i = 0; i < kPadBindingCount; ++i) {
+        const int source = g_pad[i].source;
+        if (std::find(used.begin(), used.end(), source) == used.end()) {
+            used.push_back(source);
+            continue;
+        }
+        int fallback = defaults[i].source;
+        if (std::find(used.begin(), used.end(), fallback) != used.end()) {
+            fallback = -1;
+            for (const auto& d : defaults)
+                if (std::find(used.begin(), used.end(), d.source) == used.end()) {
+                    fallback = d.source;
+                    break;
+                }
+        }
+        if (fallback >= 0) {
+            g_pad[i].source = fallback;
+            used.push_back(fallback);
         }
     }
 }

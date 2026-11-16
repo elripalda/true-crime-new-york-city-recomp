@@ -292,8 +292,12 @@ void LogGuestFrames(X86Context& ctx, const Thread* thread) {
     if (!frames) LOGE("  frame chain: none");
 }
 
-bool DumpGuestRegion(uint32_t va, uint32_t len, const char* path) {
-    FILE* f = std::fopen(path, "wb");
+bool DumpGuestRegion(uint32_t va, uint32_t len, const std::filesystem::path& path) {
+#ifdef _WIN32
+    FILE* f = _wfopen(path.c_str(), L"wb");
+#else
+    FILE* f = std::fopen(path.c_str(), "wb");
+#endif
     if (!f) return false;
     bool any = false;
     static const uint8_t zeros[mem::kPage] = {};

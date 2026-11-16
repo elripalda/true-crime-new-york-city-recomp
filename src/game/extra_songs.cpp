@@ -179,8 +179,14 @@ void AddExtras(uint32_t manager) {
     const std::vector<Extra>& extras = Extras();
     const uint32_t array = kernel::R32(manager + 4);
     const uint32_t count = kernel::R32(manager + 8);
+    if (array == g_list.copy) {  // already extended
+        g_added = g_list.added;
+        return;
+    }
+    // A later init that does not extend the list must not leave the previous
+    // load's count behind: MarkOwned would mark original songs as owned.
+    g_added = 0;
     if (extras.empty() || !array || !count) return;
-    if (array == g_list.copy) return;  // already extended
     if (array == g_list.source && g_list.copy) {
         kernel::W32(manager + 4, g_list.copy);
         kernel::W32(manager + 8, g_list.total);
@@ -227,7 +233,7 @@ void AddExtras(uint32_t manager) {
 void MarkOwned() {
     const uint32_t player = kernel::R32(kPlayerPointer);
     const uint32_t count = kernel::R32(kSongManager + 8);
-    if (!player || !g_added || count > kSongSlots) return;
+    if (!player || !g_added || count > kSongSlots || count < g_added) return;
     for (uint32_t i = count - g_added; i < count; ++i) {
         const uint32_t slot = player + 0x1058 + i * 4;
         if (R8(slot + 2)) continue;
@@ -253,7 +259,13 @@ fs::path MusicFolder() {
         folder = test;
 #endif
 #endif
-    if (!folder.empty() && folder.is_relative()) folder = app::ExeDir() / folder;
+    // the default: music\ beside the executable, made on first use so it is easy to find
+    if (folder.empty()) {
+        folder = app::ExeDir() / "music";
+        std::error_code ec;
+        fs::create_directories(folder, ec);
+    }
+    if (folder.is_relative()) folder = app::ExeDir() / folder;
     return folder;
 }
 

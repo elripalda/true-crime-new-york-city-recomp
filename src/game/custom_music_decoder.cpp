@@ -150,7 +150,8 @@ public:
         return true;
     }
     size_t Read(int16_t* out, size_t max_frames) override {
-        buffer_.resize(max_frames * source_);
+        const size_t need = max_frames * source_;
+        if (buffer_.size() < need) buffer_.resize(need);
         const size_t n = size_t(drflac_read_pcm_frames_s16(flac_, max_frames, buffer_.data()));
         Fold(buffer_.data(), n, source_, channels);
         std::memcpy(out, buffer_.data(), n * channels * sizeof(int16_t));
@@ -181,7 +182,8 @@ public:
         return true;
     }
     size_t Read(int16_t* out, size_t max_frames) override {
-        buffer_.resize(max_frames * source_);
+        const size_t need = max_frames * source_;
+        if (buffer_.size() < need) buffer_.resize(need);
         const size_t n = size_t(drwav_read_pcm_frames_s16(&wav_, max_frames, buffer_.data()));
         Fold(buffer_.data(), n, source_, channels);
         std::memcpy(out, buffer_.data(), n * channels * sizeof(int16_t));

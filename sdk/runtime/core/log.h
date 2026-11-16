@@ -2,6 +2,7 @@
 #include <atomic>
 #include <cstdarg>
 #include <cstdint>
+#include <filesystem>
 #include <string>
 
 namespace logx {
@@ -10,7 +11,10 @@ namespace logx {
 enum class Level { Debug, Info, Warn, Error, Report };
 
 // release: dir/prefix.log, carried on when append; debug: dir/prefix_NNN.log per run, newest 30 kept
-void Init(const std::string& dir, const std::string& prefix, bool append = false);
+void Init(const std::filesystem::path& dir, const std::string& prefix, bool append = false);
+// The crash filter sets this before logging: Write then uses try_lock, so a fault
+// inside a logger that already holds the mutex still reaches stderr.
+void EnterCrashMode();
 void Write(Level lv, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
 void Flush();
 const std::string& Path();

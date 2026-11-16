@@ -100,10 +100,12 @@ void DrawWithStableLamps(X86Context &ctx, uint8_t *base, uint32_t object) {
     const uint32_t outer = t_lamp_object;
     t_lamp_object = object;
     ApplyStableLamps(base);
+    // The stable mask is deliberately the one restored: the part and glass draws
+    // that follow read the same material flags, and restoring the guest's original
+    // would let their position bits switch the lamps back off mid-car.
     const uint16_t flags = X86_MEM16(kMaterialFlags);
     __imp__sub_0021E1A0(ctx, base);
     t_lamp_object = outer;
-    // the game's flags as the draw found them, with the stable lamp bit: the part draws that follow reuse them
     X86_MEM16(kMaterialFlags) = flags;
 }
 
@@ -168,10 +170,19 @@ X86_FUNC(sub_0021DC00) {
 // sets which object the selectors below 0x21E1A0 belong to while the dynamic-object draw runs
 X86_FUNC(sub_0021E1A0) {
     const uint32_t ret0 = X86_MEM32(ctx.esp);
+    const bool body = ret0 == TC_ADDR(0x13F5CA) || ret0 == TC_ADDR(0x13F7C2);
+    // The distant instance draw passes the car object too. Read it only after the
+    // caller check: [esp+8] is not a valid object pointer on every other path.
+    const bool distant = ret0 == TC_ADDR(0x1388AF);
+    uint32_t obj = 0, vt = 0;
+    if ((body || distant) && mem::IsCommitted(ctx.esp + 8)) {
+        obj = X86_MEM32(ctx.esp + 8);
+        if (obj && mem::IsCommitted(obj)) vt = X86_MEM32(obj);
+    }
     const bool was = t_allowed;
-    const uint32_t obj = X86_MEM32(ctx.esp + 8), vt = X86_MEM32(obj);
-    if (ret0 == TC_ADDR(0x13F5CA) || ret0 == TC_ADDR(0x13F7C2)) {
-        t_allowed = AllowedType(vt);
+    const bool allowed = (body || distant) && AllowedType(vt);
+    if (body) {
+        t_allowed = allowed;
         static const bool trace = std::getenv("XBE_TRACE_VEHICLES") != nullptr;
         if (trace) {  // vtable census of objects drawn by the dynamic-object body draw (execution plan 4.1)
             static uint32_t vts[32] = {}, counts[32] = {}, n = 0, total = 0;
@@ -188,9 +199,9 @@ X86_FUNC(sub_0021E1A0) {
     }
     // The callers that set the lamp bit from a moving value: the two body draws of the dynamic-object draw, and the
     // city instance draw 0x1387F0 for an instance carrying an object (distant traffic cars, model 0x2DA270), whose
-    // bit comes from 0x136E70's test of the instance's +8 against the same night amount. All three pass the car
-    // object, so a car keeps one lamp state as it moves between the near and distant draws.
-    if (ret0 == TC_ADDR(0x13F5CA) || ret0 == TC_ADDR(0x13F7C2) || ret0 == TC_ADDR(0x1388AF))
+    // bit comes from 0x136E70's test of the instance's +8 against the same night amount. Gate on the car type so a
+    // non-car at one of these sites does not get a synthetic lamp threshold.
+    if (allowed)
         DrawWithStableLamps(ctx, base, obj);
     else
         __imp__sub_0021E1A0(ctx, base);
@@ -211,7 +222,8 @@ X86_FUNC(sub_00137C00) {
     }();
     const uint32_t ret = X86_MEM32(ctx.esp);
     __imp__sub_00137C00(ctx, base);
-    if (ret == TC_ADDR(0x00144670) && std::getenv("XBE_INSTANCE_TRACE")) {
+    static const bool trace = std::getenv("XBE_INSTANCE_TRACE") != nullptr;
+    if (ret == TC_ADDR(0x00144670) && trace) {
         static uint32_t calls = 0, small = 0;
         ++calls;
         if (X87_ST(0) < 1.0) ++small;

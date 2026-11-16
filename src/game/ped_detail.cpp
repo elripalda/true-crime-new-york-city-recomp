@@ -263,7 +263,9 @@ bool g_cache_warned = false;
 uint32_t Cache() {
     if (!g_cache) {
         uint32_t at = 0, size = (kCacheSlots + 1) * kSlotBytes;
-        if (mem::AllocateVirtual(at, size, mem::kMemReserve | mem::kMemCommit, 0x04) == 0 && at) {
+        // From the top of user space, as the city grid store is: a low first-fit
+        // address can land in the game's own heap, which later overwrites it.
+        if (mem::AllocateVirtual(at, size, mem::kMemReserve | mem::kMemCommit | mem::kMemTopDown, 0x04) == 0 && at) {
             g_cache = at;
             LOGR("pedestrians: character cache moved to %08X, %u slots", at, kCacheSlots);
         } else {

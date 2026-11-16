@@ -6,6 +6,10 @@
 
 #include "gpu/state.h"
 
+// xdk/d3d8.cpp: true while a draw capture needs the guest caller chain. Without
+// it every draw would walk guest stack frames for a string nobody reads.
+extern std::atomic<bool> g_capture_caller_enabled;
+
 namespace gpu {
 
 // D3DCLEAR flags as the XDK defines them

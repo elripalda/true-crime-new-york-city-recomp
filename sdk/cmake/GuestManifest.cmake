@@ -1,11 +1,22 @@
 # Shared identity for the generated guest translation and its source image.
 function(xbe_generation_inputs result repo config xbe)
-    file(GLOB inputs LIST_DIRECTORIES FALSE
-        "${repo}/config/*.toml"
-        "${repo}/sdk/xdk/*/*.toml"
-        "${repo}/sdk/tools/recomp/*.cpp"
-        "${repo}/sdk/tools/recomp/*.h"
-        "${repo}/sdk/runtime/cpu/freestanding/*")
+    # GenerateGuest.cmake runs this in script mode (-P), where CONFIGURE_DEPENDS is
+    # not allowed. Configure-time callers still get the dependency tracking.
+    if(CMAKE_SCRIPT_MODE_FILE)
+        file(GLOB inputs LIST_DIRECTORIES FALSE
+            "${repo}/config/*.toml"
+            "${repo}/sdk/xdk/*/*.toml"
+            "${repo}/sdk/tools/recomp/*.cpp"
+            "${repo}/sdk/tools/recomp/*.h"
+            "${repo}/sdk/runtime/cpu/freestanding/*")
+    else()
+        file(GLOB inputs LIST_DIRECTORIES FALSE CONFIGURE_DEPENDS
+            "${repo}/config/*.toml"
+            "${repo}/sdk/xdk/*/*.toml"
+            "${repo}/sdk/tools/recomp/*.cpp"
+            "${repo}/sdk/tools/recomp/*.h"
+            "${repo}/sdk/runtime/cpu/freestanding/*")
+    endif()
     list(APPEND inputs "${xbe}" "${repo}/config/${config}"
         "${repo}/sdk/runtime/xbe/xbe.h"
         "${repo}/sdk/runtime/xbe/grid_patch.h"

@@ -1146,7 +1146,8 @@ private:
               float mul = 1, DXGI_FORMAT rtv = kBgra) override {
         Blit(src, fmt, uvrect, BlitOptions{.gamma = gamma, .alpha = alpha, .taps = taps, .mul = mul, .rtv = rtv});
     }
-    void Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect[4], const BlitOptions& o);
+    void Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect[4], const BlitOptions& o,
+              uint32_t slot = UINT32_MAX);
     uint32_t EnsureBlitSamplers();
     void DrawFullScreen(ID3D12PipelineState* pso, D3D12_GPU_VIRTUAL_ADDRESS cb, uint32_t srv_slot,
                         std::optional<uint32_t> sampler_slot = {});
@@ -2499,6 +2500,7 @@ void D3D12Backend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator 
         std::erase_if(scene_depth_, [&](const auto& entry) { return entry.second.target == &it->second; });
     else
         scene_depth_.erase(&it->second);
+    if (motion_rt_ == &it->second) motion_rt_ = nullptr;
     last_scene_rt_ = nullptr;  // the one-entry scene_depth_ cache may name it
     if (bound_rt_ == &it->second || bound_ds_ == &it->second) bound_rt_ = bound_ds_ = nullptr;
     // The command list still references this view index: return it only after the frame's fence.
@@ -2763,9 +2765,9 @@ bool D3D12Backend::DrawDepthCopy(Target& src, Target& dst, ID3D12PipelineState* 
     Transition(depth, state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     Transition(dst.res.Get(), dst.state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     D3D12_CPU_DESCRIPTOR_HANDLE dh = Cpu(dsv_heap_.Get(), dst.view, dsv_inc_);
+    uint32_t slot = AllocSrvSlots(1);  // before the bind: a ring flush starts a new list
     cl_->OMSetRenderTargets(0, nullptr, FALSE, &dh);
     SetFullViewport(dst.w, dst.h);
-    uint32_t slot = AllocSrvSlots(1);
     D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
     sv.Format = multisampled ? DXGI_FORMAT_R32_FLOAT : kDepthRead;
     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -2776,6 +2778,7 @@ bool D3D12Backend::DrawDepthCopy(Target& src, Target& dst, ID3D12PipelineState* 
     if (!cb.res) return false;
     DrawFullScreen(pso, cb.gpu, slot);
     dst.drawn = true;
+    dst.depth_resolved = false;  // the cached depth resolve shows the old surface
     bound_rt_ = bound_ds_ = nullptr;
     return true;
 }
@@ -2859,12 +2862,14 @@ void D3D12Backend::UploadTarget(Target& t, const Surface& s) {
         DecodeLevel(d, 0, 0, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), nullptr, px, pitch);
     }
     ComPtr<ID3D12Resource> tex = CreatePixelTexture(px, pitch, d.width, d.height);
+    // descriptors first: AllocSrvSlots may submit and start a list with no target bound
+    const uint32_t slot = AllocSrvSlots(4);
     Transition(t.res.Get(), t.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
     SetBlitTarget(Cpu(rtv_heap_.Get(), t.view, rtv_inc_), t.w, t.h);
     float uv[4] = {0, 0, 1, 1};
     float mul = 1 / t.range;
     Blit(tex.Get(), kBgra, uv, {.alpha = true, .mul = mul, .rtv = t.fmt, .over = over,
-                             .samples = t.res->GetDesc().SampleDesc.Count});
+                             .samples = t.res->GetDesc().SampleDesc.Count}, slot);
     CurrentFrame().garbage.push_back(tex);
     t.cpu = true;
     if (!over) {
@@ -2932,12 +2937,15 @@ void D3D12Backend::DrawFullScreen(ID3D12PipelineState* pso, D3D12_GPU_VIRTUAL_AD
     Cmd()->DrawInstanced(3, 1, 0, 0);
 }
 
-void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect[4], const BlitOptions& o) {
+void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect[4], const BlitOptions& o,
+                        uint32_t slot) {
     // a multisampled depth is read through a Texture2DMS view, a single-sample one (MSAA off) through the
     // DEPTH_SINGLE variant's Texture2D view
     ID3D12Resource* depth = o.depth;
     const bool depth_single = depth && depth->GetDesc().SampleDesc.Count == 1;
-    uint32_t slot = AllocSrvSlots(4);
+    // Callers that bound a target first reserve the slots before that bind: AllocSrvSlots may
+    // submit and start a new command list, which would lose the target and viewport.
+    if (slot == UINT32_MAX) slot = AllocSrvSlots(4);
     D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
     sv.Format = fmt;
     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -4522,6 +4530,13 @@ void D3D12Backend::LatchPackKey(Tex& tx, const TextureDesc& d, const FormatInfo&
 
 // the pack image for tx's bytes once it has loaded; textures with the same bytes share its GPU copy
 void D3D12Backend::LatchPackImage(Tex& tx) {
+    // The prompt atlas is baked from the bindings when uploaded. A pack image would
+    // replace those pixels and revert every prompt to the original glyphs.
+    if (tx.prompt_gen) {
+        tx.pack_key = 0;
+        tx.swap = nullptr;
+        return;
+    }
     auto it = pack_textures_.find(tx.pack_key);
     if (it == pack_textures_.end()) {
         texturedumper::Image img;
@@ -5625,12 +5640,13 @@ bool D3D12Backend::EnsureQueries() {
 // a draw while the title counts visible pixels gets an occlusion query of its own, kNoQuery otherwise
 uint32_t D3D12Backend::BeginCountedDraw(const State& s) {
     if (!s.simple[kMCountEnable >> 2] || !EnsureQueries()) return kNoQuery;
-    // A slot is free once no pending report or uncleared count still reads it. The ring used to rewind only
-    // when no report was pending at all, which under steady load never happened: it filled, every later
-    // visibility test counted nothing, and the title's light glows (car head and tail lights) blinked off.
+    // A slot is free once no pending report or uncleared count still reads it. Every pending
+    // report holds slots, not just the front one: the front can be empty while a later report
+    // still references a serial, and reusing that slot made car lights and glows blink.
     uint64_t oldest = query_next_;
-    if (!reports_.empty() && !reports_.front().queries.empty()) oldest = reports_.front().queries.front().serial;
-    if (!counted_.empty()) oldest = std::min(oldest, counted_.front().serial);
+    for (const auto& report : reports_)
+        for (const auto& query : report.queries) oldest = std::min(oldest, query.serial);
+    for (const auto& counted : counted_) oldest = std::min(oldest, counted.serial);
     if (query_next_ - oldest >= kQueries) {
         LOG_FIRST(1, "d3d12: occlusion query ring full, a visibility test went uncounted");
         return kNoQuery;
@@ -6278,7 +6294,9 @@ void D3D12Backend::FlushDeferredScene() {
             Transition(ao_dist_.Get(), ao_dist_state_, D3D12_RESOURCE_STATE_RENDER_TARGET);
             // the prepass accumulates across a view's flushes; a scene clear starts it again
             if (std::exchange(ao_depth_clear_, false)) {
-                cl_->ClearDepthStencilView(dh, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0,
+                // Reversed depth: kDepthFar is 0, and the depth test retained from the
+                // draw is GREATER. Clearing to 1.0f left nothing to pass.
+                cl_->ClearDepthStencilView(dh, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, kDepthFar, 0, 0,
                                            nullptr);
                 const float far_dist[4] = {kAoDistClear, 0, 0, 0};
                 cl_->ClearRenderTargetView(distv, far_dist, 0, nullptr);
@@ -6568,11 +6586,12 @@ void D3D12Backend::ClearChannels(Target& t, const float col[4], uint8_t mask, co
         LOG_FIRST(4, "d3d12: channel clear pipeline failed, mask %X", mask);
         return;
     }
-    SetBlitTarget(Cpu(rtv_heap_.Get(), t.view, rtv_inc_), t.w, t.h);
     Alloc cb = Upload(256, 256);
     if (!cb.res) return;
     std::memcpy(cb.cpu, col, 4 * sizeof(float));
-    uint32_t slot = AllocSrvSlots(1);
+    const uint32_t slot = AllocSrvSlots(1);
+    // The upload above cannot submit, but the slot allocation can; bind after it.
+    SetBlitTarget(Cpu(rtv_heap_.Get(), t.view, rtv_inc_), t.w, t.h);
     for (const D3D12_RECT& r : rs) {
         cl_->RSSetScissorRects(1, &r);
         binds_ = {};
@@ -6697,7 +6716,6 @@ void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D1
     Transition(src_res, src_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     Transition(dst_t.res.Get(), dst_t.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
     D3D12_CPU_DESCRIPTOR_HANDLE rh = Cpu(rtv_heap_.Get(), dst_t.view, rtv_inc_);
-    cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
     float src_scale = float(src_t.w) / src_t.gw, src_scale_y = float(src_t.h) / src_t.gh;
     float dst_scale = float(dst_t.w) / dst_t.gw, dst_scale_y = float(dst_t.h) / dst_t.gh;
     bool listed = l.count && l.src_rects;
@@ -6714,6 +6732,9 @@ void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D1
         LONG bottom = std::min(LONG(vp.TopLeftY + vp.Height), LONG(dst_t.h));
         D3D12_RECT scissor{LONG(vp.TopLeftX), LONG(vp.TopLeftY), right, bottom};
         if (scissor.right <= scissor.left || scissor.bottom <= scissor.top) continue;
+        // The slots can flush the ring mid-copy and start a list with no target; rebind after.
+        const uint32_t slot = AllocSrvSlots(4);
+        cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
         cl_->RSSetViewports(1, &vp);
         cl_->RSSetScissorRects(1, &scissor);
         binds_ = {};
@@ -6723,7 +6744,7 @@ void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D1
         float mul = 1 / dst_t.range;
         BlitOptions o{.alpha = true, .taps = taps, .mul = mul, .rtv = dst_t.fmt,
                       .samples = dst_t.res->GetDesc().SampleDesc.Count};
-        Blit(src_res, src_t.fmt, uv, o);
+        Blit(src_res, src_t.fmt, uv, o, slot);
     }
     dst_t.drawn = true;
     bound_rt_ = bound_ds_ = nullptr;
@@ -6737,6 +6758,7 @@ void D3D12Backend::CopyByRegion(const Target& src_t, ID3D12Resource* src_res, D3
     D3D12_TEXTURE_COPY_LOCATION dl{dst_t.res.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
     D3D12_TEXTURE_COPY_LOCATION sl{src_res, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
     float dst_scale = float(dst_t.w) / dst_t.gw, dst_scale_y = float(dst_t.h) / dst_t.gh;
+    float src_scale = float(src_t.w) / src_t.gw, src_scale_y = float(src_t.h) / src_t.gh;
     bool listed = l.count && l.src_rects;
     uint32_t n = listed ? l.count : 1;
     for (uint32_t i = 0; i < n; i++) {
@@ -6745,12 +6767,13 @@ void D3D12Backend::CopyByRegion(const Target& src_t, ID3D12Resource* src_res, D3
         uint32_t dy = 0;
         if (listed) {
             GuestRect r = ReadGuestRect(l.src_rects, i);
-            b.left = ScaleUnsigned(r.left, dst_scale);
-            b.top = ScaleUnsigned(r.top, dst_scale_y);
-            b.right = std::min(ScaleUnsigned(r.right, dst_scale), src_t.w);
-            b.bottom = std::min(ScaleUnsigned(r.bottom, dst_scale_y), src_t.h);
-            dx = b.left;
-            dy = b.top;
+            // The source rectangle is in the source's render-scale space.
+            b.left = std::min(ScaleUnsigned(r.left, src_scale), src_t.w);
+            b.top = std::min(ScaleUnsigned(r.top, src_scale_y), src_t.h);
+            b.right = std::min(ScaleUnsigned(r.right, src_scale), src_t.w);
+            b.bottom = std::min(ScaleUnsigned(r.bottom, src_scale_y), src_t.h);
+            dx = ScaleUnsigned(r.left, dst_scale);
+            dy = ScaleUnsigned(r.top, dst_scale_y);
             if (l.dst_points) {
                 GuestPoint p = ReadGuestPoint(l.dst_points, i);
                 dx = ScaleUnsigned(p.x, dst_scale);
@@ -6929,6 +6952,7 @@ void D3D12Backend::FinishCapture(const Surface& front) {
     }
     fclose(cap_);
     cap_ = nullptr;
+    g_capture_caller_enabled.store(false, std::memory_order_relaxed);
     cap_reports_left_ = 8;  // the reports of the captured frame arrive over the next few submits
     cap_tex_.clear();
     LOGI("d3d12: frame captured to %s", cap_dir_.string().c_str());
@@ -6943,6 +6967,7 @@ void D3D12Backend::StartCapture() {
     cap_dir_ = std::filesystem::weakly_canonical(app::ExeDir() / diag::CaptureDir() / stamp, ec);
     std::filesystem::create_directories(cap_dir_, ec);
     cap_ = _wfopen((cap_dir_ / "frame.txt").c_str(), L"w");
+    g_capture_caller_enabled.store(true, std::memory_order_relaxed);
     cap_i_ = cap_rt_ = 0;
     cap_seen_.clear();
     cap_sh_.clear();
@@ -7041,6 +7066,8 @@ void D3D12Backend::BlitFrame(Target& t, ID3D12Resource* aa) {
         UpscaleAndSharpen(color, color_fmt, uint32_t(o.src_w), uint32_t(o.src_h), uint32_t(o.src_w),
                           uint32_t(o.src_h));
 
+    // descriptors and constants first: a full ring submits and starts a list with no target
+    const uint32_t slot = AllocSrvSlots(4);
     cl_->OMSetRenderTargets(1, &frame_rtv_, FALSE, nullptr);
     D3D12_VIEWPORT vp{(w - vw) / 2, (h - vh) / 2, vw, vh, 0, 1};
     D3D12_RECT scissor{0, 0, LONG(bb_w_), LONG(bb_h_)};
@@ -7054,7 +7081,7 @@ void D3D12Backend::BlitFrame(Target& t, ID3D12Resource* aa) {
         o.peak = float(render_.hdr_peak ? render_.hdr_peak : reported);
         o.highlights = float(render_.hdr_highlights) / 100.0f;
     }
-    Blit(color, color_fmt, uv, o);
+    Blit(color, color_fmt, uv, o, slot);
 }
 
 bool D3D12Backend::EnsureHdrUiTarget() {
@@ -9191,9 +9218,11 @@ ComPtr<ID3D12Resource> D3D12Backend::Shrink(ID3D12Resource* src, D3D12_RESOURCE_
     D3D12_CPU_DESCRIPTOR_HANDLE rh = Cpu(rtv_heap_.Get(), scratch, rtv_inc_);
     dev_->CreateRenderTargetView(down.Get(), nullptr, rh);
     Transition(src, st, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    // descriptors first: a ring flush may start a new list without a target
+    const uint32_t slot = AllocSrvSlots(4);
     SetBlitTarget(rh, w, h);
     float uv[4] = {0, 0, 1, 1};
-    Blit(src, fmt, uv, {.alpha = true, .taps = o.taps, .mul = o.mul});
+    Blit(src, fmt, uv, {.alpha = true, .taps = o.taps, .mul = o.mul}, slot);
     Transition(down.Get(), down_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
     return down;
 }

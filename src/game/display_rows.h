@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <iterator>
 #include <span>
+#include <string>
 
 #include "common/graphics_choices.h"
 
@@ -367,31 +368,34 @@ inline void Text(const Values &v, Option option, char (&text)[kTextBytes]) {
     case Option::BloomStrength:
         std::snprintf(text, kTextBytes, "BLOOM LEVEL %u", v.bloom_strength);
         break;
-    case Option::Upscaler:
-        if (v.upscaler == choices::kFsr3 || v.upscaler == choices::kFsr4 || v.upscaler == choices::kDlss) {
-            const char *name = v.upscaler == choices::kFsr3 ? "FSR 3.1" : v.upscaler == choices::kFsr4 ? "FSR 4.1" : "DLSS";
-            static const char *const kPresets[] = {"PERFORMANCE", "BALANCED", "QUALITY", "NATIVE AA"};
-            const int preset = v.render_percent == 50 ? 0 : v.render_percent == 58 ? 1 : v.render_percent == 67 ? 2
-                               : v.render_percent == 100 ? 3 : -1;
-            const bool fsr = v.upscaler != choices::kDlss;
-            if (fsr && v.fsr_state == kFsrNoDll)
-                std::snprintf(text, kTextBytes, "UPSCALER %s (AMD DLLS MISSING)", name);
-            else if (!fsr && v.dlss_state == kDlssNotBuilt)
-                std::snprintf(text, kTextBytes, "UPSCALER DLSS (NOT BUILT)");
-            else if (!fsr && v.dlss_state == kDlssUnavailable)
-                std::snprintf(text, kTextBytes, "UPSCALER DLSS (UNAVAILABLE)");
-            else if (preset < 0)
-                std::snprintf(text, kTextBytes, "UPSCALER %s NEEDS 50/58/67/100%%", name);
-            else if (v.upscaler == choices::kFsr4 && v.fsr_state == kFsrNo4)
-                std::snprintf(text, kTextBytes, "UPSCALER FSR 4.1 %s (USING 3.1)", kPresets[preset]);
-            else
-                std::snprintf(text, kTextBytes, "UPSCALER %s %s", name, kPresets[preset]);
+    case Option::Upscaler: {
+        std::string label = "UPSCALER";
+        switch (v.upscaler) {
+        case 3: label += " DLSS"; break;
+        case 4: label += " FSR4"; break;
+        default: label += v.upscaler == 1 ? " FSR1" : v.upscaler == 2 ? " FSR3" : " BILINEAR"; break;
         }
-        else if (v.render_percent >= 100)
-            std::snprintf(text, kTextBytes, "UPSCALER %s (OFF AT 100%%)", v.upscaler == 1 ? "FSR 1" : "BILINEAR");
-        else
-            std::snprintf(text, kTextBytes, "UPSCALER %s", v.upscaler == 1 ? "FSR 1" : "BILINEAR");
+        if (v.upscaler == 3 || v.upscaler == 2 || v.upscaler == 4) {
+            const char* preset = v.render_percent == 50 ? "PERF" : v.render_percent == 58 ? "BAL"
+                                  : v.render_percent == 67 ? "QUAL" : v.render_percent == 100 ? "NAT" : nullptr;
+            if (!preset) {
+                label = "UPSCALER SCALE";
+            } else if (v.upscaler != 3 && v.fsr_state == kFsrNoDll) {
+                label = "UPSCALER FSR3 NODLL";
+            } else if (v.upscaler == 3 && v.dlss_state == kDlssNotBuilt) {
+                label = "UPSCALER DLSS NONE";
+            } else if (v.upscaler == 3 && v.dlss_state == kDlssUnavailable) {
+                label = "UPSCALER DLSS N/A";
+            } else if (v.upscaler == 4 && v.fsr_state == kFsrNo4) {
+                label = std::string("UPSCALER FSR4* ") + preset;
+            } else {
+                label += ' ';
+                label += preset;
+            }
+        }
+        std::snprintf(text, kTextBytes, "%s", label.c_str());
         break;
+    }
     case Option::Sharpening:
         if (v.sharpening)
             std::snprintf(text, kTextBytes, "SHARPENING %u", v.sharpening);

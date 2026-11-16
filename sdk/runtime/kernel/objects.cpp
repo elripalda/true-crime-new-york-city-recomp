@@ -281,19 +281,25 @@ int64_t Now100ns() {
 int64_t ToDeadline(int64_t due) {
     using namespace std::chrono;
     int64_t now = duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
-    if (due < 0) return now + (-due) * 100;  // negative due is relative, positive is absolute system time
-    int64_t rel = due - Now100ns();
-    return now + std::max<int64_t>(rel, 0) * 100;
+    const int64_t max_100ns = (INT64_MAX - now) / 100;
+    if (due < 0) {  // negative due is relative, positive is absolute system time
+        const int64_t rel = due == INT64_MIN ? INT64_MAX : -due;
+        if (rel > max_100ns) return INT64_MAX;
+        return now + rel * 100;
+    }
+    const int64_t rel = due > Now100ns() ? due - Now100ns() : 0;
+    if (rel > max_100ns) return INT64_MAX;
+    return now + rel * 100;
 }
 
 // A pulse that happened after this waiter registered counts as a release. For an
 // auto-reset event only one waiter may take each pulse; notification events wake
 // every waiter that was already waiting.
-static bool Pulsed(Object& o, size_t i, const Queued& q) {
+static bool Pulsed(Object& o, size_t i, const Queued& q, bool consume = true) {
     if (i >= q.pulse_seen.size() || o.pulse == q.pulse_seen[i]) return false;
     if (o.notification) return true;
     if (o.pulse_taken >= o.pulse) return false;
-    ++o.pulse_taken;
+    if (consume) ++o.pulse_taken;
     return true;
 }
 
@@ -321,10 +327,16 @@ static uint32_t WaitFor(const std::vector<ObjectRef>& objs, bool wait_all, int64
         if (wait_all) {
             bool all = true;
             for (size_t i = 0; i < objs.size() && all; i++)
-                all = objs[i] && (Satisfied(*objs[i], me) || Pulsed(*objs[i], i, queued));
+                all = objs[i] && (Satisfied(*objs[i], me) || Pulsed(*objs[i], i, queued, false));
             if (all) {
-                for (auto& o : objs)
-                    if (o && Satisfied(*o, me)) Consume(*o, me);
+                // Only now take the pulses: a failed wait-all must not spend one
+                // on an object that was satisfied while another was not.
+                for (size_t i = 0; i < objs.size(); ++i) {
+                    if (!objs[i]) continue;
+                    if (Satisfied(*objs[i], me)) Consume(*objs[i], me);
+                    else if (!objs[i]->notification && Pulsed(*objs[i], i, queued, false))
+                        ++objs[i]->pulse_taken;
+                }
                 return kWait0;
             }
         } else {
@@ -390,6 +402,9 @@ int32_t PulseEvent(Object& o) {
     // is not enough: the signal would be cleared again before they could run.
     std::lock_guard<std::mutex> lock(g_dispatch);
     int32_t old = o.signal;
+    // Windows PulseEvent with no waiter is lost: it must not be stored for a
+    // later wait, where it would release a second waiter.
+    if (o.waiters.empty()) return old;
     ++o.pulse;
     Wake(o);
     return old;
@@ -481,6 +496,7 @@ bool CancelDpc(uint32_t dpc) {
 
 void QueueDpc(uint32_t dpc, uint32_t arg1, uint32_t arg2) {
     std::lock_guard<std::mutex> lock(g_dpc_lock);
+    G<uint8_t>(dpc + 2) = 1;  // KDPC.Inserted: timer DPCs reach RunDpcs too
     W32(dpc + 0x14, arg1);  // KDPC.SystemArgument1 and 2
     W32(dpc + 0x18, arg2);
     g_dpcs.push_back({dpc, arg1, arg2});

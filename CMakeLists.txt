@@ -34,6 +34,11 @@ if(MINGW)
 endif()
 include(${SDK}/cmake/XbeRecomp.cmake)
 
+# Host regression tests need the SDK's fetched dependencies (SDL3, toml++) but
+# not the player's own XBE. CI uses this to run ctest on machines without game
+# assets, so a missing XBE cannot take the tests out of the gate.
+option(TCNYC_TESTS_ONLY "Configure only the host regression tests" OFF)
+
 file(GLOB XBE_HOST_SOURCES CONFIGURE_DEPENDS src/*/*.cpp)
 list(FILTER XBE_HOST_SOURCES EXCLUDE REGEX "/src/game/")
 # Developer debug tools (src/dev/): off unless a dev build asks;
@@ -71,6 +76,9 @@ if(NOT GAME_PARTITIONS)
 endif()
 
 # target name = GAME_EXE in build.bat, xbe = GAME_XBE
+set(TCNYC_REPO "${CMAKE_CURRENT_SOURCE_DIR}")
+set(TCNYC_TEST_SDL SDL3::SDL3-static)
+if(NOT TCNYC_TESTS_ONLY)
 add_xbe_image(TrueCrimeNYC ${GAME_XBE} ${GAME_CONFIG} ${GAME_PARTITIONS} ${GAME_DIR} game)
 if(TCNYC_DEV_TOOLS)
     target_compile_definitions(TrueCrimeNYC PRIVATE TCNYC_DEV_TOOLS=1)
@@ -127,7 +135,6 @@ else()
         "-Wl,/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/launcher/TrueCrimeNYC.manifest")
 endif()
 target_link_libraries(TrueCrimeNYC PRIVATE shell32 gdi32 user32)
+endif()  # NOT TCNYC_TESTS_ONLY
 
-set(TCNYC_REPO "${CMAKE_CURRENT_SOURCE_DIR}")
-set(TCNYC_TEST_SDL SDL3::SDL3-static)
 include(tests/HostTests.cmake)

@@ -38,6 +38,16 @@ int main() {
         if (settings.ao != 1 || settings.ao_method != 1 || settings.ao_quality != 1) result = 1;
         LoadOcclusionSettings(settings, toml::table{{"ao", 0}, {"ao_method", 1}, {"ao_quality", 1}});
         if (settings.ao != 0 || settings.ao_method != 1 || settings.ao_quality != 1) result = 1;
+        // Legacy msaa = true means 4x; explicit counts are 2, 4 or 8, and a
+        // missing key keeps the default.
+        if (MsaaSamplesFromTable(toml::table{{"msaa", true}}, 8) != 4) result = 1;
+        if (MsaaSamplesFromTable(toml::table{{"msaa", false}}, 8) != 0) result = 1;
+        for (const auto samples : {2, 4, 8}) {
+            if (MsaaSamplesFromTable(toml::table{{"msaa", samples}}, 0) != uint32_t(samples)) result = 1;
+        }
+        if (MsaaSamplesFromTable(toml::table{{"msaa", 3}}, 8) != 0) result = 1;
+        if (MsaaSamplesFromTable(toml::table{{"msaa", 1}}, 8) != 0) result = 1;
+        if (MsaaSamplesFromTable(toml::table{}, 8) != 8) result = 1;
         if (result) std::cerr << saved << '\n';
 
         // A file that does not parse is moved aside and rebuilt from the full settings plus the edits.

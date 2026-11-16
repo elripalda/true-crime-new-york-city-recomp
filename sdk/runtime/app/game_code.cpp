@@ -101,7 +101,7 @@ fs::path ConfigFor(const std::string& xbe) {
     std::error_code ec;
     for (auto& e : fs::directory_iterator(CompilerDir() / "config", ec)) {
         try {
-            toml::table t = toml::parse_file(e.path().string());
+            toml::table t = toml::parse_file(e.path().u8string());
             if (fs::path(t["xbe"]["path"].value_or(std::string())).filename() == xbe) return e.path();
         } catch (const toml::parse_error&) {
         }
@@ -216,7 +216,7 @@ struct Job {
 
 uint32_t PartitionCount(const Image& image) {
     try {
-        toml::table t = toml::parse_file(image.config.string());
+        toml::table t = toml::parse_file(image.config.u8string());
         return uint32_t(t["xbe"]["partitions"].value_or(int64_t(0)));
     } catch (const toml::parse_error&) {
         return 0;

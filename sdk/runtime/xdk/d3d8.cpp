@@ -1260,24 +1260,28 @@ HLE_STDCALL(D3DDevice_SetVertexShader, 1) {
 }
 
 HLE_FASTCALL(D3DDevice_SetVertexShaderConstant1Fast, 0) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t reg = a[0];
     if (reg < 192) std::memcpy(g_state.vsc[reg].data(), HostPtr(a[1]), 16);
     return 0;
 }
 
 HLE_FASTCALL(D3DDevice_SetVertexShaderConstant1, 0) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t reg = a[0];
     if (reg < 192) std::memcpy(g_state.vsc[reg].data(), HostPtr(a[1]), 16);
     return 0;
 }
 
 HLE_FASTCALL(D3DDevice_SetVertexShaderConstant4, 0) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t reg = a[0], src = a[1];
     for (uint32_t i = 0; i < 4 && reg + i < 192; i++) std::memcpy(g_state.vsc[reg + i].data(), HostPtr(src + i * 16), 16);
     return 0;
 }
 
 HLE_FASTCALL(D3DDevice_SetVertexShaderConstantNotInlineFast, 1) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t reg = a[0], src = a[1], dwords = a[2];
     for (uint32_t i = 0; i < dwords / 4 && reg + i < 192; i++) std::memcpy(g_state.vsc[reg + i].data(), HostPtr(src + i * 16), 16);
     return 0;
@@ -1302,6 +1306,7 @@ constexpr size_t kMaxSelected = 1024;  // bound the derived-program cache; entri
 
 // bytes of one D3DVSDT element: kind in the low nibble, count in the next
 uint32_t ElementBytes(uint32_t type) {
+    if (type == 0x72) return 12;  // D3DVSDT_FLOAT2H: three packed floats
     uint32_t kind = type & 15;
     uint32_t count = (type >> 4) & 15;
     if (kind == 0 || kind == 6) return 4;          // D3DCOLOR, packed 11:11:10
@@ -1523,6 +1528,7 @@ HLE_STDCALL(D3DDevice_SetPixelShaderConstant, 3) {
 
 // Guest caller chain of the draw being submitted (return address, then ebp frames); the F3 capture prints it.
 uint32_t g_capture_caller[6];
+std::atomic<bool> g_capture_caller_enabled{false};
 static void NoteDrawCaller(X86Context &ctx) {
     uint8_t *base = mem::Base();
     std::memset(g_capture_caller, 0, sizeof(g_capture_caller));
@@ -1536,13 +1542,23 @@ static void NoteDrawCaller(X86Context &ctx) {
     }
 }
 
+// The caller chain is only read by a draw capture. In release the walk is
+// skipped unless a capture is active; developer builds keep it for diagnostics.
+static void NoteDrawCallerIfNeeded(X86Context &ctx) {
+#if TCNYC_DEV_TOOLS
+    NoteDrawCaller(ctx);
+#else
+    if (g_capture_caller_enabled.load(std::memory_order_relaxed)) NoteDrawCaller(ctx);
+#endif
+}
+
 HLE_STDCALL(D3DDevice_DrawVertices, 3) {
     ::XbeDrawCalls().fetch_add(1, std::memory_order_relaxed);
     if (const XbeDrawProbeFn probe = ::XbeDrawProbe()) probe(ctx, R32(kStreams + XDK_Stream_Buffer), a[2], g_state.textures[0]);
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     Walk(Dev(kDevPush));  // a visibility test begun since the last draw counts this one
     SyncDeferred();
-    NoteDrawCaller(ctx);
+    NoteDrawCallerIfNeeded(ctx);
     if (g_backend) g_backend->Draw(g_state, a[0], a[1], a[2], nullptr);
     g_frame_draws++;
     gpu::RetainVertexAttributes(g_state, a[1], a[2], nullptr);
@@ -1555,7 +1571,7 @@ HLE_STDCALL(D3DDevice_DrawIndexedVertices, 3) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     Walk(Dev(kDevPush));
     SyncDeferred();
-    NoteDrawCaller(ctx);
+    NoteDrawCallerIfNeeded(ctx);
     const uint8_t* indices = a[2] ? static_cast<const uint8_t*>(HostPtr(a[2])) : nullptr;
     if (g_backend) g_backend->Draw(g_state, a[0], 0, a[1], indices);
     g_frame_draws++;
@@ -1641,6 +1657,7 @@ void EndPrimitive() {
     };
     // the render thread tells shaders apart by pointer: one object per program and slot set, the program kept alive
     static std::map<std::pair<gpu::VertexShader*, uint32_t>, Made> made;
+    if (made.size() > 1024) made.clear();  // stale shader identities would grow forever
     static std::vector<float> packed;
     uint32_t prim = g_im_prim, count = uint32_t(g_im_vertices.size() / 64), handle = g_state.vs_handle;
     g_im_prim = 0;

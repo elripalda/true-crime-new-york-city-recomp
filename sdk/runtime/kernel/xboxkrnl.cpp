@@ -678,6 +678,8 @@ KERNEL_EXPORT(158, KeWaitForMultipleObjects, 8) {
 KERNEL_EXPORT(145, KeSetEvent, 3) { return uint32_t(SetEvent(*FromPointer(a[0]))); }
 
 KERNEL_EXPORT(246, ObReferenceObjectByHandle, 3) {
+    static std::mutex reference_lock;
+    std::lock_guard<std::mutex> reference_guard(reference_lock);
     uint32_t h = a[0];
     ObjectRef o = h == 0xFFFFFFFE ? CurrentRef() : FromHandle(h);
     if (!o) return kInvalidHandle;
@@ -708,8 +710,13 @@ KERNEL_EXPORT(113, KeInitializeTimerEx, 2) {
     uint32_t t = a[0];
     // Re-initialising an armed timer must stop the old host entry first: the
     // memset below destroys the stamp that FromPointer uses to find it again.
-    if (t) {
-        if (ObjectRef old = FromPointer(t)) CancelTimer(*old);
+    if (t && mem::IsCommitted(t)) {
+        // Only a real timer header can be bound. An uninitialised KTIMER must not
+        // be turned into a host object (and logged) before the memset below.
+        const uint8_t kind = G<uint8_t>(t);
+        if (kind == 8 || kind == 9) {
+            if (ObjectRef old = FromPointer(t)) CancelTimer(*old);
+        }
     }
     std::memset(HostPtr(t), 0, 0x28);
     G<uint8_t>(t) = uint8_t(8 + a[1]);  // TimerNotificationObject or TimerSynchronizationObject
@@ -1152,7 +1159,7 @@ static std::string FormatGuest(X86Context& ctx, uint32_t fmt_va, uint32_t args_v
         }
         std::string spec = "%";
         i++;
-        while (i < fmt.size() && std::strchr("-+ #0123456789.lhI", fmt[i])) spec += fmt[i++];
+        while (i < fmt.size() && std::strchr("-+ #0123456789.*lhI", fmt[i])) spec += fmt[i++];
         if (i >= fmt.size()) break;
         char c = fmt[i];
         char buf[512];
@@ -1161,8 +1168,16 @@ static std::string FormatGuest(X86Context& ctx, uint32_t fmt_va, uint32_t args_v
             continue;
         }
         if (c == 's') {
-            out += ReadCString(R32(ap), 256);
+            // %.*s: the precision is an int argument before the string pointer.
+            int precision = -1;
+            if (spec.find('*') != std::string::npos) {
+                precision = int32_t(R32(ap));
+                ap += 4;
+            }
+            std::string text = ReadCString(R32(ap), 256);
             ap += 4;
+            if (precision >= 0 && text.size() > size_t(precision)) text.resize(size_t(precision));
+            out += text;
             continue;
         }
         if (c == 'f' || c == 'g' || c == 'e') {
@@ -1173,13 +1188,26 @@ static std::string FormatGuest(X86Context& ctx, uint32_t fmt_va, uint32_t args_v
             out += buf;
             continue;
         }
+        // %I64d/%I64u/%I64x take a 64-bit guest argument. Strip the I/l/h markers
+        // and ask snprintf for a long long.
+        const bool int64 = spec.find("I64") != std::string::npos;
         std::string clean;
         for (char ch : spec)
-            if (ch != 'l' && ch != 'h' && ch != 'I') clean += ch;
+            if (ch != 'l' && ch != 'h' && ch != 'I' && !(int64 && (ch == '6' || ch == '4'))) clean += ch;
         // Only conversions that consume the guest's 32-bit argument. %n and
         // arbitrary snprintf conversions would write through guest pointers.
         if (!std::strchr("diouxXc", c) && c != 'p') {
             out += '%';
+            continue;
+        }
+        if (int64) {
+            const uint64_t v = uint64_t(R32(ap)) | uint64_t(R32(ap + 4)) << 32;
+            ap += 8;
+            const bool signed_value = c == 'd' || c == 'i';
+            std::snprintf(buf, sizeof(buf), (clean + (signed_value ? "ll" : "ll") + c).c_str(),
+                          signed_value ? static_cast<long long>(static_cast<int64_t>(v))
+                                       : static_cast<unsigned long long>(v));
+            out += buf;
             continue;
         }
         std::snprintf(buf, sizeof(buf), (clean + (c == 'p' ? 'x' : c)).c_str(), R32(ap));

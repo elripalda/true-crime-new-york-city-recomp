@@ -145,13 +145,7 @@ void Load() {
     s.aniso = t["anisotropic_filtering"].value_or(s.aniso);
     // a sample count; older settings files stored msaa = true for 4x. A file
     // without the key keeps the built-in default (Settings::msaa).
-    const auto msaa = t["msaa"];
-    if (!msaa) {
-        SetMsaaSamples(Settings{}.msaa);
-    } else {
-        const auto samples = msaa.value_or(msaa.value_or(false) ? 4u : 0u);
-        SetMsaaSamples(samples == 2 || samples == 4 || samples == 8 ? samples : 0);
-    }
+    SetMsaaSamples(MsaaSamplesFromTable(t, Settings{}.msaa));
     s.smaa = t["smaa"].value_or(s.smaa);
     s.bloom = t["bloom"].value_or(s.bloom);
     s.bloom_strength = uint32_t(std::clamp<int64_t>(t["bloom_strength"].value_or(int64_t(s.bloom_strength)), 50, 400));
@@ -271,6 +265,11 @@ toml::table Table() {
 
 }  // namespace
 
+void FullSettingsTable(toml::table& out) {
+    SettingsLock guard;
+    out = Table();
+}
+
 bool Save() {
     try {
         const std::lock_guard save_guard(g_save_lock);
@@ -282,7 +281,7 @@ bool Save() {
             changes = ChangedSettings(g_saved_settings, current);
         }
         if (!std::filesystem::exists(path)) changes = current;
-        MergeSettingsTable(path, changes, &current);
+        PublishSettingsAsync(path, changes, current);
         {
             SettingsLock guard;
             g_saved_settings = std::move(current);
@@ -320,6 +319,12 @@ Mode Output() {
     return Desktop();
 }
 
+namespace {
+std::atomic<uint32_t> g_output_generation{0};
+}
+
+void InvalidateOutputCache() { g_output_generation.fetch_add(1, std::memory_order_relaxed); }
+
 // Output for every frame: the desktop mode lookup reads the registry, so it runs again only when the resolution
 // setting or the window's monitor changes
 Mode CachedOutput() {
@@ -327,13 +332,15 @@ Mode CachedOutput() {
         uint32_t width;
         uint32_t height;
         HMONITOR monitor;
+        uint32_t generation;
         bool operator==(const Key&) const = default;
     };
     static std::mutex lock;
     static Key key{};
     static Mode mode{};
     const Settings s = Snapshot();
-    Key now{s.width, s.height, MonitorFromWindow(static_cast<HWND>(Window()), MONITOR_DEFAULTTOPRIMARY)};
+    Key now{s.width, s.height, MonitorFromWindow(static_cast<HWND>(Window()), MONITOR_DEFAULTTOPRIMARY),
+            g_output_generation.load(std::memory_order_relaxed)};
     {
         std::lock_guard<std::mutex> guard(lock);
         if (now == key && mode.height) return mode;

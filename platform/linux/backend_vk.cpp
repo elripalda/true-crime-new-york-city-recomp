@@ -2405,7 +2405,7 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
     // TCNYC_DEFER_SCENE=1; the recording worker still splits the replay whenever deferral is on.
     defer_forced_ = defer_override ? std::atoi(defer_override) != 0 : false;
     defer_scene_ = defer_forced_ || ao_mode_ != 0;
-    msaa_store_ = defer_scene_;
+    msaa_store_ = true;
     if (defer_scene_)
         LOGR("vulkan: deferred scene display list enabled (%s)",
              defer_forced_ ? (defer_override ? "TCNYC_DEFER_SCENE" : "draw recording worker") : "ambient occlusion setting");
@@ -2970,7 +2970,11 @@ bool VulkanBackend::CreateSwapchain() {
     VkSurfaceFormatKHR sdr = formats[0], hdr10{}, linear{};
     bool have_sdr = false, have_hdr10 = false, have_linear = false;
     for (const auto& f : formats) {
-        if (!have_sdr && (f.format == VK_FORMAT_B8G8R8A8_UNORM || f.format == VK_FORMAT_R8G8B8A8_UNORM)) {
+        const bool bgra = f.format == VK_FORMAT_B8G8R8A8_UNORM || f.format == VK_FORMAT_R8G8B8A8_UNORM;
+        // Prefer sRGB nonlinear: a linear UNORM SDR surface makes the plain present pass
+        // apply the wrong transfer function.
+        if (bgra && (!have_sdr || (sdr.colorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR &&
+                                   f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR))) {
             sdr = f;
             have_sdr = true;
         }
@@ -5690,7 +5694,7 @@ void VulkanBackend::ResetDeferred(uint32_t ao_wanted) {
     }
     ao_mode_ = ao_failed_ ? 0 : ao_wanted;
     defer_scene_ = defer_forced_ || ao_mode_ != 0;
-    msaa_store_ = defer_scene_;
+    msaa_store_ = true;
     for (VkPipeline p : retired_ao_pipelines_)
         if (p) vkDestroyPipeline(device_, p, nullptr);
     retired_ao_pipelines_.clear();
@@ -7200,7 +7204,7 @@ Tex* VulkanBackend::EnsureTexture(const State& s, int stage, bool* is_target) {
                 tx->borrowed = true;
                 tx->image = target->samples > 1 ? target->resolved_image : target->image;
                 tx->view = target->samples > 1
-                               ? target->resolved_view
+                               ? (depth_tex && target->sample_view ? target->sample_view : target->resolved_view)
                                : (depth_tex && target->sample_view ? target->sample_view : target->view);
                 tx->format = target->format;
                 tx->w = target->w;
@@ -7372,6 +7376,13 @@ void VulkanBackend::LatchPackKey(Tex& tx, const TextureDesc& d, const FormatInfo
 
 // the pack image for tx's bytes once it has loaded; textures with the same bytes share its GPU copy
 void VulkanBackend::LatchPackImage(Tex& tx) {
+    // The prompt atlas is baked from the bindings when uploaded. A pack image would
+    // replace those pixels and revert every prompt to the original glyphs.
+    if (tx.prompt_gen) {
+        tx.pack_key = 0;
+        tx.swap = nullptr;
+        return;
+    }
     auto it = pack_textures_.find(tx.pack_key);
     if (it == pack_textures_.end()) {
         texturedumper::Image img;
@@ -7495,27 +7506,6 @@ void VulkanBackend::ReleasePackTextures() {
 // a copy of the target to read while the draw writes to it, as the D3D12 backend does
 Tex* VulkanBackend::FeedbackTexture(const State& s, Target* t, const TextureDesc& d) {
     if (!t || t->depth || !t->image) return nullptr;
-    if (t->samples > 1) {
-        if (!t->fb_tex) {
-            t->fb_tex = new Tex();
-            t->fb_tex->borrowed = true;
-            t->fb_tex->image = t->resolved_image;
-            t->fb_tex->view = t->resolved_view;
-            t->fb_tex->format = t->format;
-            t->fb_tex->w = t->w;
-            t->fb_tex->h = t->h;
-            t->fb_tex->levels = 1;
-            t->fb_tex->layers = 1;
-            t->fb_tex->depth = 1;
-        }
-        t->fb_tex->data = d.data;
-        t->fb_tex->guest_format = d.format;
-        FlushPass();
-        BeginRecord();
-        Transition(t->resolved_image, t->resolved_layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, t->format);
-        t->fb_tex->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        return t->fb_tex;
-    }
     if (!t->fb_image) {
         VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         info.imageType = VK_IMAGE_TYPE_2D;
@@ -7562,12 +7552,23 @@ Tex* VulkanBackend::FeedbackTexture(const State& s, Target* t, const TextureDesc
     BeginRecord();
     Transition(t->image, t->layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t->format);
     Transition(t->fb_image, t->fb_layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, t->format);
-    VkImageCopy region{};
-    region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.dstSubresource = region.srcSubresource;
-    region.extent = {t->w, t->h, 1};
-    vkCmdCopyImage(cmd_, t->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t->fb_image,
-                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    if (t->samples > 1) {
+        // Resolve the multisampled scene into the feedback copy. Resolving into the pass's own
+        // resolve attachment would make it unreadable while the pass still writes it.
+        VkImageResolve region{};
+        region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.dstSubresource = region.srcSubresource;
+        region.extent = {t->w, t->h, 1};
+        vkCmdResolveImage(cmd_, t->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t->fb_image,
+                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    } else {
+        VkImageCopy region{};
+        region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.dstSubresource = region.srcSubresource;
+        region.extent = {t->w, t->h, 1};
+        vkCmdCopyImage(cmd_, t->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t->fb_image,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    }
     Transition(t->fb_image, t->fb_layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, t->format);
     Transition(t->image, t->layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, t->format);
     t->fb_tex->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -7581,12 +7582,13 @@ Tex* VulkanBackend::FeedbackTexture(const State& s, Target* t, const TextureDesc
 }
 
 bool VulkanBackend::MakeTexImage(Tex& t) {
+    const bool volume = t.depth > 1;
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    info.imageType = VK_IMAGE_TYPE_2D;
+    info.imageType = volume ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
     info.format = t.format;
-    info.extent = {t.w, t.h, 1};
+    info.extent = {t.w, t.h, volume ? t.depth : 1};
     info.mipLevels = t.levels;
-    info.arrayLayers = t.layers;
+    info.arrayLayers = volume ? 1 : t.layers;
     info.samples = VK_SAMPLE_COUNT_1_BIT;
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
     info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
@@ -7613,12 +7615,12 @@ bool VulkanBackend::MakeTexImage(Tex& t) {
     t.layout = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     view.image = t.image;
-    view.viewType = t.cube ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_2D;
+    view.viewType = t.cube ? VK_IMAGE_VIEW_TYPE_CUBE : volume ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;
     view.format = t.format;
     // Tex::depth is the volume depth, not the format's range: a 2D colour texture always has 1.
     const bool depth_format = Format(t.guest_format).depth;
     view.subresourceRange = {depth_format ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, t.levels, 0,
-                             t.layers};
+                             volume ? 1 : t.layers};
     if (vkCreateImageView(device_, &view, nullptr, &t.view) != VK_SUCCESS) {
         vkDestroyImage(device_, t.image, nullptr);
         vkFreeMemory(device_, t.memory, nullptr);
@@ -7695,8 +7697,10 @@ void VulkanBackend::UploadTexture(Tex* t, const TextureDesc& d, const uint32_t* 
                 images.push_back(px);
             }
             VkBufferImageCopy copy{};
-            copy.imageSubresource = {aspect, l, f, 1};
-            copy.imageExtent = {std::max(1u, t->w >> l), std::max(1u, t->h >> l), 1};
+            const bool volume = t->depth > 1;
+            copy.imageSubresource = {aspect, l, volume ? 0 : f, 1};
+            copy.imageExtent = {std::max(1u, t->w >> l), std::max(1u, t->h >> l),
+                                volume ? std::max(1u, t->depth >> l) : 1};
             copies.push_back(copy);
         }
     }
@@ -7808,6 +7812,15 @@ VkSampler VulkanBackend::EnsureSampler(const State& s, int stage, const TexInfo&
     }
     VkSampler sampler = VK_NULL_HANDLE;
     if (vkCreateSampler(device_, &info_vk, nullptr, &sampler) != VK_SUCCESS) return white_sampler_;
+    if (samplers_.size() >= 4096) {
+        // Guest border colours make a new sampler per distinct state. Trim the cache
+        // instead of growing it for the life of the process.
+        vkDeviceWaitIdle(device_);
+        for (auto& [old_key, old_sampler] : samplers_)
+            if (old_sampler && old_sampler != white_sampler_) vkDestroySampler(device_, old_sampler, nullptr);
+        samplers_.clear();
+        sampler_memo_valid_ = 0;
+    }
     samplers_[key] = sampler;
     if (stage < 4) {
         sampler_memo_key_[stage] = key;
@@ -9720,6 +9733,7 @@ bool VulkanBackend::EnsureSmaa(uint32_t w, uint32_t h, VkFormat format) {
             smaa_ps_[i] = CompileShader(src, shaderc_fragment_shader, passes[i].entry);
             if (!smaa_vs_[i] || !smaa_ps_[i]) {
                 smaa_failed_ = true;
+                smaa_lookups_pending_ = false;
                 LOGE("vulkan: SMAA shaders failed to compile, SMAA is off");
                 return false;
             }
@@ -9771,6 +9785,7 @@ bool VulkanBackend::EnsureSmaa(uint32_t w, uint32_t h, VkFormat format) {
             if (CreatePipelines(1, &info, nullptr, &smaa_pipelines_[i]) !=
                 VK_SUCCESS) {
                 smaa_failed_ = true;
+                smaa_lookups_pending_ = false;
                 LOGE("vulkan: SMAA pipelines could not be created, SMAA is off");
                 return false;
             }
@@ -9782,6 +9797,7 @@ bool VulkanBackend::EnsureSmaa(uint32_t w, uint32_t h, VkFormat format) {
         !CreateSmaaImage(smaa_weights_, w, h, VK_FORMAT_R8G8B8A8_UNORM, true) ||
         !CreateSmaaImage(smaa_output_, w, h, format, true)) {
         DestroySmaaTargets();
+        smaa_lookups_pending_ = false;
         smaa_failed_ = true;
         LOGE("vulkan: SMAA resources could not be created, SMAA is off");
         return false;

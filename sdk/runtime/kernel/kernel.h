@@ -183,7 +183,7 @@ void LogGuestStack(X86Context& ctx, int words, const Thread* thread = nullptr);
 // EBP-chain walk for the reliable guest call stack (the raw stack scan can hit stale return addresses)
 void LogGuestFrames(X86Context& ctx, const Thread* thread);
 // writes committed guest bytes (unmapped pages become zeros) for crash analysis
-bool DumpGuestRegion(uint32_t va, uint32_t len, const char* path);
+bool DumpGuestRegion(uint32_t va, uint32_t len, const std::filesystem::path& path);
 // XBE_SERIAL_GUEST=1: only one guest thread executes guest code at a time, matching the single-core Xbox.
 // HLE calls release the lock so blocking kernel calls still make progress.
 bool GuestRunSerial();
