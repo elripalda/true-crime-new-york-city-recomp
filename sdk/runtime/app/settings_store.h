@@ -16,9 +16,9 @@ toml::table ReadSettingsTable(const std::filesystem::path& path);
 // the edits, so one bad file does not make every later save fail.
 void MergeSettingsTable(const std::filesystem::path& path, const toml::table& edits,
                         const toml::table* full = nullptr);
-// Queues one merge+publish on the settings worker, so the UI thread never waits
-// for the cross-process file lock. FlushSettings waits for the queue to drain.
-void PublishSettingsAsync(std::filesystem::path path, toml::table edits, toml::table full);
+// Queues a snapshot. The worker compares it to the last published snapshot or
+// the loaded settings on its first save. FlushSettings waits for the queue to drain.
+void PublishSettingsAsync(std::filesystem::path path, toml::table loaded, toml::table current);
 void FlushSettings();
 toml::table ChangedSettings(const toml::table& previous, const toml::table& current);
 

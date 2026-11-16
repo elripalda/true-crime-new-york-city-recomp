@@ -25,7 +25,7 @@ namespace app {
 namespace {
 
 toml::table Table();
-toml::table g_saved_settings;
+toml::table g_loaded_settings;
 std::mutex g_save_lock;
 
 const char* kModes[] = {"fullscreen", "borderless", "windowed"};
@@ -117,12 +117,12 @@ void Load() {
     try {
         std::ifstream in(SettingsPath(), std::ios::binary);
         if (!in) {
-            g_saved_settings = Table();
+            g_loaded_settings = Table();
             return;
         }
         t = toml::parse(in);
     } catch (...) {
-        g_saved_settings = Table();
+        g_loaded_settings = Table();
         return;
     }
     std::string mode = t["display_mode"].value_or(std::string(kModes[uint32_t(s.display_mode)]));
@@ -206,7 +206,7 @@ void Load() {
         }
     }
     if (kGame.load) kGame.load(&t);
-    g_saved_settings = Table();
+    g_loaded_settings = Table();
 }
 
 namespace {
@@ -273,19 +273,9 @@ void FullSettingsTable(toml::table& out) {
 bool Save() {
     try {
         const std::lock_guard save_guard(g_save_lock);
-        toml::table current, changes;
         const auto path = SettingsPath();
-        {
-            SettingsLock guard;
-            current = Table();
-            changes = ChangedSettings(g_saved_settings, current);
-        }
-        if (!std::filesystem::exists(path)) changes = current;
-        PublishSettingsAsync(path, changes, current);
-        {
-            SettingsLock guard;
-            g_saved_settings = std::move(current);
-        }
+        SettingsLock guard;
+        PublishSettingsAsync(path, g_loaded_settings, Table());
         return true;
     } catch (const std::exception& failure) {
         LOGE("Settings: %s", failure.what());

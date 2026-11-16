@@ -206,5 +206,7 @@ int main(int argc, char** argv) {
         SDL_Delay(2);  // the guest's swap paces the game; this loop only pumps events and blits software frames
     }
 
+    app::Save();
+    app::FlushSettings();
     kernel::Shutdown(0);
 }

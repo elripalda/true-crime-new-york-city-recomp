@@ -63,8 +63,37 @@ int main() {
             std::cerr << "corrupt recovery: " << rebuilt << " asides " << asides << '\n';
             result = 1;
         }
+
+        const auto async_file = dir / "async.toml";
+        const toml::table loaded{{"ao", 0}, {"fps_cap", 30}};
+        MergeSettingsTable(async_file, loaded);
+        const auto lock_path = dir / "async.toml.lock";
+        fs::remove(lock_path);
+        fs::create_directory(lock_path);  // force the worker to fail to open the lock
+        auto current = loaded;
+        current.insert_or_assign("ao", 2);
+        PublishSettingsAsync(async_file, loaded, current);
+        FlushSettings();
+        if (ReadSettingsTable(async_file)["ao"].value_or(-1) != 0) result = 1;
+        fs::remove(lock_path);
+
+        // An unchanged retry must keep the failed edit and the launcher's new FPS cap.
+        MergeSettingsTable(async_file, toml::table{{"fps_cap", 60}});
+        PublishSettingsAsync(async_file, loaded, current);
+        FlushSettings();
+        const auto retried = ReadSettingsTable(async_file);
+        if (retried["ao"].value_or(0) != 2 || retried["fps_cap"].value_or(0) != 60) result = 1;
+
+        // The following save must diff against the successfully published snapshot.
+        MergeSettingsTable(async_file, toml::table{{"ao", 1}});
+        current.insert_or_assign("ao_method", 1);
+        PublishSettingsAsync(async_file, loaded, current);
+        FlushSettings();
+        const auto next = ReadSettingsTable(async_file);
+        if (next["ao"].value_or(0) != 1 || next["ao_method"].value_or(0) != 1) result = 1;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
+        result = 1;
     }
     std::error_code ignored;
     fs::remove_all(dir, ignored);

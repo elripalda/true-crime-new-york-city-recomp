@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <deque>
 #include <fstream>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -225,8 +226,8 @@ namespace {
 struct SettingsPublisher {
     struct Job {
         fs::path path;
-        toml::table edits;
-        toml::table full;
+        toml::table loaded;
+        toml::table current;
     };
     std::mutex mutex;
     std::condition_variable cv;
@@ -246,6 +247,7 @@ struct SettingsPublisher {
     }
 
     void Run() {
+        std::map<fs::path, toml::table> published;
         for (;;) {
             Job job;
             {
@@ -257,7 +259,13 @@ struct SettingsPublisher {
                 busy = true;
             }
             try {
-                MergeSettingsTable(job.path, job.edits, &job.full);
+                // Keep the last successfully written snapshot. Queued saves after a
+                // failure must include all outstanding local changes, while still
+                // merging only those changes into the shared file.
+                auto& previous = published.try_emplace(job.path, std::move(job.loaded)).first->second;
+                const auto edits = fs::exists(job.path) ? ChangedSettings(previous, job.current) : job.current;
+                MergeSettingsTable(job.path, edits, &job.current);
+                previous = std::move(job.current);
             } catch (const std::exception& failure) {
                 LOGE("Settings: %s", failure.what());
             }
@@ -290,9 +298,8 @@ SettingsPublisher& Publisher() {
 
 }  // namespace
 
-void PublishSettingsAsync(fs::path path, toml::table edits, toml::table full) {
-    if (edits.empty()) return;
-    Publisher().Push({std::move(path), std::move(edits), std::move(full)});
+void PublishSettingsAsync(fs::path path, toml::table loaded, toml::table current) {
+    Publisher().Push({std::move(path), std::move(loaded), std::move(current)});
 }
 
 void FlushSettings() { Publisher().Flush(); }

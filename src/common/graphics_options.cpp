@@ -392,7 +392,6 @@ void SaveOnExit() {
     saved = true;
     g_menu.apply_pending = false;
     g_menu.dirty = !app::Save();
-    app::FlushSettings();  // the process is exiting: do not leave the publish behind
 }
 #endif
 
