@@ -34,6 +34,7 @@ public:
     bool Load(std::string_view path, std::vector<uint8_t>& out) const;
     uint64_t Time() const { return time_; }  // the volume's FILETIME, the only time the disc keeps
     const std::filesystem::path& Path() const { return path_; }
+    bool StillAtPath() const;
 
 private:
     uint32_t ReadAt(uint64_t at, void* out, uint32_t len) const;
@@ -43,6 +44,9 @@ private:
     intptr_t file_ = -1;  // HANDLE or fd
     std::filesystem::path path_;
     uint64_t file_size_ = 0;
+#ifndef _WIN32
+    int64_t open_mtime_s_ = 0, open_mtime_ns_ = 0, open_ctime_s_ = 0, open_ctime_ns_ = 0;
+#endif
     uint64_t base_ = 0;  // the game partition
     uint64_t time_ = 0;
     Entry root_;

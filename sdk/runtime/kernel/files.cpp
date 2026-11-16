@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -7,7 +8,10 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <mutex>
+#include <optional>
 #include <unordered_map>
+#include <sys/stat.h>
 
 #ifdef _WIN32
 #include <io.h>
@@ -15,11 +19,18 @@
 #include <unistd.h>
 #endif
 
+#include "app/app.h"
 #include "kernel/disc.h"
 #include "kernel/kernel.h"
 #include "kernel/exports.h"
 
 namespace fs = std::filesystem;
+
+namespace game {
+uint32_t RadioOverrideTrack();  // audio_volume.cpp: the Music Player song being opened, or 0
+std::filesystem::path MusicFolder();               // extra_songs.cpp
+std::filesystem::path ExtraSongPath(uint32_t track);
+}
 
 namespace kernel {
 
@@ -70,10 +81,12 @@ bool Within(const fs::path& root, const fs::path& p) {
 // host lookup that ignores case on file systems that do not. Guest names are untrusted: '..' never
 // climbs above the mapped device, and the resolved host path must stay inside it even through a
 // symlink or junction.
-fs::path MatchCase(const fs::path& dir, const std::vector<std::string>& parts) {
+fs::path MatchCase(const fs::path& dir, const std::vector<std::string>& parts, bool cache) {
     fs::path cache_key = dir;
     for (const std::string& part : parts) cache_key /= part;
-    if (auto hit = g_resolved.find(cache_key); hit != g_resolved.end()) return hit->second;
+    if (cache) {
+        if (auto hit = g_resolved.find(cache_key); hit != g_resolved.end()) return hit->second;
+    }
     fs::path cur = dir;
     size_t depth = 0;
     for (auto& part : parts) {
@@ -113,8 +126,14 @@ fs::path MatchCase(const fs::path& dir, const std::vector<std::string>& parts) {
         g_resolved.erase(cache_key);
         return {};
     }
-    g_resolved.emplace(std::move(cache_key), resolved);
+    if (cache && fs::exists(resolved, ec) && !ec) g_resolved.emplace(std::move(cache_key), resolved);
     return resolved;
+}
+
+bool PathUnchanged(const fs::path& path) {
+    if (path.empty()) return false;
+    std::error_code ec;
+    return fs::weakly_canonical(path, ec) == path && !ec;
 }
 
 struct File : Object {
@@ -131,6 +150,7 @@ struct File : Object {
     size_t next = 0;
     bool listed = false;
     bool delete_on_close = false;
+    bool host_decoded = false;  // an MP3, OGG, FLAC or WAV radio replacement: the game's WMA decoder is bypassed
 #if TCNYC_DEV_TOOLS
     bool trace_wma = false;
 #endif
@@ -144,7 +164,7 @@ struct File : Object {
             Unbind(guest);
             mem::FreeSystem(guest);
         }
-        if (delete_on_close) {
+        if (delete_on_close && PathUnchanged(host)) {
             std::error_code ec;
             fs::remove(host, ec);
         }
@@ -242,11 +262,27 @@ bool WildMatch(const std::string& pat, const std::string& s) {
 }
 
 // past 2 GB a long offset wraps on Windows
-void Seek(FILE* fp, uint64_t pos) {
+bool ResizeStream(FILE* fp, uint64_t size, bool shrink_only) {
+    if (size > INT64_MAX) return false;
 #ifdef _WIN32
-    _fseeki64(fp, int64_t(pos), SEEK_SET);
+    const int fd = _fileno(fp);
+    struct _stat64 info{};
+    if (shrink_only && _fstat64(fd, &info) != 0) return false;
+    return (shrink_only && size >= uint64_t(info.st_size)) || _chsize_s(fd, size) == 0;
 #else
-    fseeko(fp, off_t(pos), SEEK_SET);
+    const int fd = fileno(fp);
+    struct stat info{};
+    if (shrink_only && fstat(fd, &info) != 0) return false;
+    return (shrink_only && size >= uint64_t(info.st_size)) || ftruncate(fd, off_t(size)) == 0;
+#endif
+}
+
+bool Seek(FILE* fp, uint64_t pos) {
+    if (pos > INT64_MAX) return false;
+#ifdef _WIN32
+    return _fseeki64(fp, int64_t(pos), SEEK_SET) == 0;
+#else
+    return fseeko(fp, off_t(pos), SEEK_SET) == 0;
 #endif
 }
 
@@ -413,9 +449,9 @@ Target Resolve(const std::string& xbox_path, uint32_t root_handle) {
         if (part.find(':') != std::string::npos) return {};
     if (best->first == kCdRom) {
         if (const Disc* disc = MountedDisc()) return {{}, true, disc->Find(parts), true};
-        return {MatchCase(best->second, parts), false, nullptr, true};
+        return {MatchCase(best->second, parts, true), false, nullptr, true};
     }
-    return {MatchCase(best->second, parts)};
+    return {MatchCase(best->second, parts, false)};
 }
 
 // the disc image is read only: nothing on it is created, replaced or written
@@ -449,7 +485,110 @@ uint32_t OpenOnDisc(const Disc::Entry* e, const std::string& name, uint32_t hand
     return kSuccess;
 }
 
+// WMA first (the game decodes it), then the formats decoded by the port
+constexpr int kNoAudio = 5;
+int AudioRank(const std::string& ext) {
+    return ext == ".WMA" ? 0 : ext == ".MP3" ? 1 : ext == ".OGG" ? 2 : ext == ".FLAC" ? 3 : ext == ".WAV" ? 4 : kNoAudio;
+}
+
+// The best replacement per track stem ("6012"): <track>.wma, .mp3, .ogg, .flac or .wav in any letter
+// case, WMA first since the game decodes it itself. The folder is listed once and listed again only when
+// its modification time changes (a file added, removed or renamed), not on every song start.
+struct Replacement {
+    fs::path path;
+    int rank = kNoAudio;
+};
+
+std::optional<Replacement> TrackReplacement(const fs::path& folder, const std::string& stem) {
+    static std::mutex lock;
+    static fs::path listed_folder;
+    static fs::file_time_type listed_time;
+    static std::unordered_map<std::string, Replacement> by_stem;
+    std::error_code ec;
+    const auto time = fs::last_write_time(folder, ec);
+    if (ec) return std::nullopt;
+    std::lock_guard guard(lock);
+    if (folder != listed_folder || time != listed_time) {
+        by_stem.clear();
+        for (fs::directory_iterator it(folder, ec), end; !ec && it != end; it.increment(ec)) {
+            const fs::path& candidate = it->path();
+            // u8string: other songs in the folder may have names the ANSI code page cannot hold
+            const std::u8string stem8 = candidate.stem().u8string(), ext8 = candidate.extension().u8string();
+            const int rank = AudioRank(Upper(std::string(ext8.begin(), ext8.end())));
+            if (rank == kNoAudio) continue;
+            std::error_code type_ec;
+            if (!fs::is_regular_file(candidate, type_ec)) continue;
+            Replacement& best = by_stem[Upper(std::string(stem8.begin(), stem8.end()))];
+            if (rank < best.rank) best = {candidate, rank};
+        }
+        listed_folder = folder;
+        listed_time = time;
+    }
+    const auto found = by_stem.find(stem);
+    if (found == by_stem.end()) return std::nullopt;
+    return found->second;
+}
+
+bool OpenRadioOverride(const std::string& name, uint32_t handle_out, uint32_t iosb) {
+    const uint32_t track = game::RadioOverrideTrack();
+    if (!track) return false;
+    const std::string filename = std::to_string(track) + ".WMA";
+    if (!Upper(Normalize(name)).ends_with("\\DATA\\SOUNDS\\" + filename)) return false;
+
+    const fs::path folder = game::MusicFolder();
+    if (folder.empty()) return false;
+
+    // An extra song (a track past the game's own) is the file the song list was built from. Only the
+    // game's own tracks are replaced by name, so a file called e.g. 6095.mp3 cannot take over the extra
+    // song that happens to get track 6095.
+    fs::path path = game::ExtraSongPath(track);
+    int best = kNoAudio;
+    if (!path.empty()) {
+        const std::u8string ext8 = path.extension().u8string();
+        best = AudioRank(Upper(std::string(ext8.begin(), ext8.end())));
+    }
+
+    if (path.empty()) {
+        if (const auto found = TrackReplacement(folder, std::to_string(track))) path = found->path, best = found->rank;
+    }
+    if (path.empty()) return false;
+    FILE* fp = OpenHostFile(path, "rb");
+    if (!fp) return false;
+    if (best == 0) {
+        constexpr uint8_t kAsfHeader[] = {
+            0x30, 0x26, 0xB2, 0x75, 0x8E, 0x66, 0xCF, 0x11, 0xA6, 0xD9, 0x00, 0xAA, 0x00, 0x62, 0xCE, 0x6C,
+        };
+        uint8_t header[sizeof(kAsfHeader)];
+        if (std::fread(header, 1, sizeof(header), fp) != sizeof(header) ||
+            std::memcmp(header, kAsfHeader, sizeof(header)) != 0 || std::fseek(fp, 0, SEEK_SET) != 0) {
+            std::fclose(fp);
+            LOGW("radio: invalid ASF header in replacement for track %u", track);
+            return false;
+        }
+    }
+
+    auto f = std::make_shared<File>();
+    f->xbox = Normalize(name);
+    f->host = path;
+    f->fp = fp;
+    f->read_only = true;
+    f->host_decoded = best != 0;
+#if TCNYC_DEV_TOOLS
+    TraceWmaOpen(*f);
+#endif
+    RegisterFile(f);
+    W32(handle_out, NewHandle(f));
+    IoStatus(iosb, kSuccess, 1);
+    LOGR("radio: opened local replacement %s for track %u", reinterpret_cast<const char*>(path.filename().u8string().c_str()), track);
+    return true;
+}
+
 }  // namespace
+
+fs::path HostDecodedRadioPath(uint32_t handle) {
+    const std::shared_ptr<File> f = FileFromHandle(handle);
+    return f && f->host_decoded ? f->host : fs::path{};
+}
 
 fs::path ResolvePath(const std::string& xbox_path, uint32_t root_handle) { return Resolve(xbox_path, root_handle).host; }
 
@@ -490,6 +629,8 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
     uint32_t root;
     std::string name = ObjectName(attrs, &root);
     Target t = Resolve(name, root);
+    if (t.read_only && disposition == 1 && (options & 0x1001) == 0 && OpenRadioOverride(name, handle_out, iosb))
+        return kSuccess;
     if (t.disc) return OpenOnDisc(t.entry, name, handle_out, iosb, disposition, options);
     const fs::path& host = t.host;
     if (host.empty()) {
@@ -606,6 +747,7 @@ KERNEL_EXPORT(202, NtOpenFile, 6) {
     uint32_t root;
     std::string name = ObjectName(attrs, &root);
     Target t = Resolve(name, root);
+    if (t.read_only && (options & 0x1001) == 0 && OpenRadioOverride(name, handle_out, iosb)) return kSuccess;
     if (t.disc) return OpenOnDisc(t.entry, name, handle_out, iosb, 1, options);
     const fs::path& host = t.host;
     std::error_code ec;
@@ -650,7 +792,8 @@ static uint64_t Offset(File& f, uint32_t off) {
 }
 
 // pages is the FILE_SEGMENT_ELEMENT array for scatter and gather, 0 for one buffer
-static uint32_t Transfer(const Args& a, bool write, uint32_t pages) {
+static uint32_t Transfer(const Args& a, bool write, bool scatter) {
+    constexpr uint32_t kIoDeviceError = 0xC0000185;
     uint32_t h = a[0], event = a[1], apc = a[2], apc_ctx = a[3], iosb = a[4], buf = a[5], len = a[6], off = a[7];
     auto f = FileFromHandle(h);
     if (!f || (!f->fp && !f->entry)) return kInvalidHandle;
@@ -659,14 +802,37 @@ static uint32_t Transfer(const Args& a, bool write, uint32_t pages) {
     const bool trace_read = f->trace_wma && !write;
     const auto read_start = trace_read ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 #endif
-    ResetEvent(*f);
+    if (iosb && !GuestWritable(iosb, 8)) return kAccessViolation;
     std::lock_guard<std::mutex> lock(f->io);
-    uint64_t pos = Offset(*f, off);
-    if (f->fp) Seek(f->fp, pos);
+    ResetEvent(*f);
+    const auto finish = [&](uint32_t status, uint32_t count = 0) {
+        return Finish(*f, status, count, event, apc, apc_ctx, iosb);
+    };
+    if (off && !GuestWritable(off, 8)) return finish(kAccessViolation);
+    std::vector<uint32_t> segments;
+    if (scatter && len) {
+        const uint32_t count = (len - 1) / mem::kPage + 1;
+        if (!GuestWritable(buf, count * 8)) return finish(kAccessViolation);
+        segments.reserve(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            // The union is eight bytes wide, but the 32-bit Xbox pointer occupies the low word.
+            const uint32_t at = R32(buf + i * 8);
+            if (!GuestWritable(at, std::min(len - i * mem::kPage, mem::kPage))) return finish(kAccessViolation);
+            segments.push_back(at);
+        }
+    } else if (!GuestWritable(buf, len)) {
+        return finish(kAccessViolation);
+    }
+    const uint64_t pos = Offset(*f, off);
+    if (pos > uint64_t(INT64_MAX) - len) return finish(kInvalidParameter);
+    if (f->fp) {
+        std::clearerr(f->fp);
+        if (!Seek(f->fp, pos)) return finish(kIoDeviceError);
+    }
     uint32_t n = 0;
     while (n < len) {
-        uint32_t at = pages ? R32(pages + n / 0x1000 * 8) + n % 0x1000 : buf + n;
-        uint32_t chunk = pages ? std::min(len - n, 0x1000 - n % 0x1000) : len;
+        const uint32_t at = scatter ? segments[n / mem::kPage] : buf;
+        const uint32_t chunk = scatter ? std::min(len - n, mem::kPage) : len;
         size_t done = f->entry ? MountedDisc()->Read(*f->entry, pos + n, HostPtr(at), chunk)
                       : write  ? std::fwrite(HostPtr(at), 1, chunk, f->fp)
                                : std::fread(HostPtr(at), 1, chunk, f->fp);
@@ -682,16 +848,19 @@ static uint32_t Transfer(const Args& a, bool write, uint32_t pages) {
                  static_cast<unsigned long long>(pos), std::chrono::duration<double, std::milli>(elapsed).count());
     }
 #endif
-    if (write && n < len) return Finish(*f, 0xC000007F, n, event, apc, apc_ctx, iosb);  // disk full
-    if (!write && len && !n) return Finish(*f, kEndOfFile, 0, event, apc, apc_ctx, iosb);
-    return Finish(*f, kSuccess, n, event, apc, apc_ctx, iosb);
+    if (write && n < len) return finish(errno == ENOSPC ? kDiskFull : kIoDeviceError, n);
+    if (!write && ((f->fp && std::ferror(f->fp)) ||
+                   (f->entry && pos < f->entry->size && n < std::min<uint64_t>(len, f->entry->size - pos))))
+        return finish(kIoDeviceError, n);
+    if (!write && len && !n) return finish(kEndOfFile);
+    return finish(kSuccess, n);
 }
 
-KERNEL_EXPORT(219, NtReadFile, 8) { return Transfer(a, false, 0); }
-KERNEL_EXPORT(236, NtWriteFile, 8) { return Transfer(a, true, 0); }
+KERNEL_EXPORT(219, NtReadFile, 8) { return Transfer(a, false, false); }
+KERNEL_EXPORT(236, NtWriteFile, 8) { return Transfer(a, true, false); }
 // the buffer argument is an array of one page per element
-KERNEL_EXPORT(220, NtReadFileScatter, 8) { return Transfer(a, false, a[5]); }
-KERNEL_EXPORT(237, NtWriteFileGather, 8) { return Transfer(a, true, a[5]); }
+KERNEL_EXPORT(220, NtReadFileScatter, 8) { return Transfer(a, false, true); }
+KERNEL_EXPORT(237, NtWriteFileGather, 8) { return Transfer(a, true, true); }
 
 KERNEL_EXPORT(211, NtQueryInformationFile, 5) {
     uint32_t h = a[0], iosb = a[1], out = a[2], len = a[3], cls = a[4];
@@ -772,12 +941,8 @@ KERNEL_EXPORT(226, NtSetInformationFile, 5) {
                 // The function already holds f->io; taking it again here deadlocks
                 // the first time a save truncates a file.
                 if (std::fflush(f->fp) != 0) return kDiskFull;
-                const uintmax_t host_size = fs::file_size(f->host, ec);
-                const uint64_t size = ec ? 0 : uint64_t(host_size);
-                if (cls == 20 || R64(in) < size) {
-                    fs::resize_file(f->host, R64(in), ec);
-                    if (ec) return kDiskFull;
-                }
+                if (!GuestWritable(in, 8)) return kAccessViolation;
+                if (!ResizeStream(f->fp, R64(in), cls == 19)) return kDiskFull;
                 // Truncation is metadata; commit it before reporting success.
                 if (!SyncStream(f->fp)) return kDiskFull;
             }
@@ -792,6 +957,7 @@ KERNEL_EXPORT(226, NtSetInformationFile, 5) {
             if (resolved.read_only) return kAccessDenied;
             fs::path host = resolved.host;
             if (host.empty()) return kObjectPathNotFound;
+            if (!PathUnchanged(f->host) || !PathUnchanged(host)) return kAccessDenied;
             if (f->fp && std::fflush(f->fp) != 0) return kDiskFull;
             fs::rename(f->host, host, ec);
             if (ec) return kAccessDenied;

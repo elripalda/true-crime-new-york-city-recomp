@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cstring>
 
 #ifdef _WIN32
@@ -37,15 +38,10 @@ constexpr uint32_t kMaxTable = 16 << 20;
 
 std::unique_ptr<Disc> g_mounted;
 
-bool SameName(std::string_view a, std::string_view b) {
-    return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](char x, char y) {
-               return std::toupper(uint8_t(x)) == std::toupper(uint8_t(y));
-           });
-}
-
-std::string Upper(std::string s) {
-    for (char& c : s) c = char(std::toupper(uint8_t(c)));
-    return s;
+bool NameLess(std::string_view a, std::string_view b) {
+    return std::lexicographical_compare(a.begin(), a.end(), b.begin(), b.end(), [](char x, char y) {
+        return std::toupper(uint8_t(x)) < std::toupper(uint8_t(y));
+    });
 }
 
 }  // namespace
@@ -62,23 +58,34 @@ Disc::~Disc() {
 // each read carries its own position, so threads reading at once do not queue on one handle
 uint32_t Disc::ReadAt(uint64_t at, void* out, uint32_t len) const {
 #ifdef _WIN32
-    thread_local HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (event) ResetEvent(event);
+    struct ReadEvent {
+        HANDLE handle = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        ~ReadEvent() { if (handle) CloseHandle(handle); }
+    };
+    thread_local ReadEvent event;
+    if (!event.handle || !ResetEvent(event.handle)) return 0;
     OVERLAPPED o{};
     o.Offset = DWORD(at);
     o.OffsetHigh = DWORD(at >> 32);
-    o.hEvent = event;
+    o.hEvent = event.handle;
     DWORD got = 0;
     if (!ReadFile(HANDLE(file_), out, len, nullptr, &o) && GetLastError() != ERROR_IO_PENDING) return 0;
     if (!GetOverlappedResult(HANDLE(file_), &o, &got, TRUE)) return 0;
     return got;
 #else
-    ssize_t got = pread(int(file_), out, len, off_t(at));
+    ssize_t got;
+    do {
+        got = pread(int(file_), out, len, off_t(at));
+    } while (got < 0 && errno == EINTR);
     return got > 0 ? uint32_t(got) : 0;
 #endif
 }
 
 bool Disc::Open(const std::filesystem::path& path, std::string& error) {
+    if (file_ != -1) {
+        error = "a disc is already open on this object";
+        return false;
+    }
     path_ = path;
 #ifdef _WIN32
     file_ = intptr_t(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr));
@@ -97,6 +104,10 @@ bool Disc::Open(const std::filesystem::path& path, std::string& error) {
     struct stat info{};
     const bool sized = fstat(int(file_), &info) == 0 && info.st_size >= 0;
     file_size_ = sized ? uint64_t(info.st_size) : 0;
+    open_mtime_s_ = info.st_mtim.tv_sec;
+    open_mtime_ns_ = info.st_mtim.tv_nsec;
+    open_ctime_s_ = info.st_ctim.tv_sec;
+    open_ctime_ns_ = info.st_ctim.tv_nsec;
 #endif
     if (!sized) {
         error = "cannot read the image size";
@@ -123,6 +134,21 @@ bool Disc::Open(const std::filesystem::path& path, std::string& error) {
     }
     error = "no Xbox disc image";
     return false;
+}
+
+bool Disc::StillAtPath() const {
+    if (file_ == -1) return false;
+#ifdef _WIN32
+    // The handle denies writes and deletion while it is open.
+    return true;
+#else
+    struct stat opened{}, named{};
+    return fstat(int(file_), &opened) == 0 && stat(path_.c_str(), &named) == 0 &&
+           opened.st_dev == named.st_dev && opened.st_ino == named.st_ino &&
+           opened.st_size >= 0 && uint64_t(opened.st_size) == file_size_ &&
+           opened.st_mtim.tv_sec == open_mtime_s_ && opened.st_mtim.tv_nsec == open_mtime_ns_ &&
+           opened.st_ctim.tv_sec == open_ctime_s_ && opened.st_ctim.tv_nsec == open_ctime_ns_;
+#endif
 }
 
 bool Disc::Contains(uint64_t offset, uint64_t size) const {
@@ -160,7 +186,7 @@ bool Disc::ReadDir(Entry& dir, int depth, uint64_t& budget, std::unordered_set<u
                                 offset, size, (attributes & kFolder) != 0, {}});
     }
     std::sort(dir.children.begin(), dir.children.end(),
-              [](const Entry& a, const Entry& b) { return Upper(a.name) < Upper(b.name); });
+              [](const Entry& a, const Entry& b) { return NameLess(a.name, b.name); });
     for (Entry& child : dir.children)
         if (child.dir && !ReadDir(child, depth + 1, budget, active)) return false;
     active.erase(dir.offset);
@@ -176,8 +202,9 @@ const Disc::Entry* Disc::Find(const std::vector<std::string>& parts) const {
             continue;
         }
         const Entry* dir = path.back();
-        auto it = std::find_if(dir->children.begin(), dir->children.end(), [&](const Entry& e) { return SameName(e.name, part); });
-        if (it == dir->children.end()) return nullptr;
+        auto it = std::lower_bound(dir->children.begin(), dir->children.end(), part,
+                                   [](const Entry& e, std::string_view name) { return NameLess(e.name, name); });
+        if (it == dir->children.end() || NameLess(part, it->name)) return nullptr;
         path.push_back(&*it);
     }
     return path.back();

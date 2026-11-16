@@ -227,6 +227,8 @@ bool CreateSymbolicLink(const std::string& link, const std::string& target);
 bool DeleteSymbolicLink(const std::string& link);
 std::string QuerySymbolicLink(const std::string& link);
 std::filesystem::path ResolvePath(const std::string& xbox_path, uint32_t root_handle);  // host path or empty
+// the MP3 or OGG file behind a radio replacement handle, or empty
+std::filesystem::path HostDecodedRadioPath(uint32_t handle);
 bool ReadGameFile(const std::string& xbox_path, std::vector<uint8_t>& out);  // from a host folder or the disc image
 // wide-safe fopen for host paths; mode is the usual CRT mode string
 FILE* OpenHostFile(const std::filesystem::path& path, const char* mode);

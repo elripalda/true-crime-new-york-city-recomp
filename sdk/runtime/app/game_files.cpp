@@ -30,6 +30,13 @@ namespace {
 
 namespace fs = std::filesystem;
 
+struct ValidatedDisc {
+    fs::path path;
+    GameFiles game;
+    std::unique_ptr<kernel::Disc> disc;
+};
+ValidatedDisc g_validated_disc;
+
 // assets beside the exe or in any folder above it (the build output)
 fs::path FindAssets() {
     auto dir = ExeDir();
@@ -60,6 +67,11 @@ bool Alert(const wchar_t* text, bool question = false) {
 #endif
 }
 
+std::string PathText(const fs::path& path) {
+    const auto utf8 = path.u8string();
+    return {utf8.begin(), utf8.end()};
+}
+
 bool ReadHostFile(const fs::path& path, std::vector<uint8_t>& out) {
     constexpr uint64_t kMaxXbeBytes = 64ull << 20;
     std::error_code ec;
@@ -87,7 +99,34 @@ std::string Sha1(const std::vector<uint8_t>& data) {
     return hex;
 }
 
+std::string ValidateGameIso(const fs::path& path) {
+    g_validated_disc = {};
+    auto extension = PathText(path.extension());
+    std::ranges::transform(extension, extension.begin(), [](unsigned char ch) { return char(std::tolower(ch)); });
+    if (extension != ".iso" || !fs::is_regular_file(path)) return "Choose an existing Xbox .iso file.";
+    const auto source = fs::canonical(path);
+    auto disc = std::make_unique<kernel::Disc>();
+    std::string reason;
+    if (!disc->Open(source, reason)) return "Could not read the Xbox disc image. " + reason;
+    std::vector<uint8_t> xbe;
+    if (!disc->Load(IMAGE_XBE, xbe)) return "The disc image needs a readable " IMAGE_XBE ".";
+    if (Sha1(xbe) != kImageSha1) return "This ISO is from a different Xbox release. Choose the disc matching this build.";
+    if (!disc->StillAtPath()) return "The ISO changed while it was being read. Choose the disc again.";
+    g_validated_disc = {source, {path.parent_path(), std::move(xbe)}, std::move(disc)};
+    return {};
+}
+
 bool FindGame(GameFiles& game, std::string* error, const fs::path& location) {
+    if (g_validated_disc.disc) {
+        auto validated = std::move(g_validated_disc);
+        std::error_code ec;
+        if (!location.empty() && fs::canonical(location, ec) == validated.path && !ec && validated.disc->StillAtPath()) {
+            LOGR("Game: using the disc verified by the launcher in %s", PathText(location).c_str());
+            game = std::move(validated.game);
+            kernel::MountDisc(std::move(validated.disc));
+            return true;
+        }
+    }
     const fs::path source = location.empty() ? FindAssets() : location;
     std::error_code ec;
     const bool source_iso = fs::is_regular_file(source, ec) && [&] {
@@ -116,7 +155,7 @@ bool FindGame(GameFiles& game, std::string* error, const fs::path& location) {
     auto consider = [&](const fs::path& name, std::vector<uint8_t> xbe, std::unique_ptr<kernel::Disc> disc) {
         std::string sha = Sha1(xbe);
         bool match = sha == kImageSha1;
-        LOGR("Game: %s in %s, sha1 %s%s", IMAGE_XBE, name.string().c_str(), sha.c_str(), match ? "" : ", another release");
+        LOGR("Game: %s in %s, sha1 %s%s", IMAGE_XBE, PathText(name).c_str(), sha.c_str(), match ? "" : ", another release");
         if (match) {
             game = {dir, std::move(xbe)};
             kernel::MountDisc(std::move(disc));
@@ -138,17 +177,17 @@ bool FindGame(GameFiles& game, std::string* error, const fs::path& location) {
         auto disc = std::make_unique<kernel::Disc>();
         std::string why;
         if (!disc->Open(iso, why)) {
-            LOGW("game: %s: %s", iso.string().c_str(), why.c_str());
+            LOGW("game: %s: %s", PathText(iso).c_str(), why.c_str());
             continue;
         }
         if (!disc->Load(IMAGE_XBE, xbe)) {
-            LOGW("game: %s has no %s", iso.string().c_str(), IMAGE_XBE);
+            LOGW("game: %s has no %s", PathText(iso).c_str(), IMAGE_XBE);
             continue;
         }
         if (consider(iso, std::move(xbe), std::move(disc))) return true;
     }
 
-    const std::string searched = source.empty() ? std::string() : " (" + source.string() + ")";
+    const std::string searched = source.empty() ? std::string() : " (" + PathText(source) + ")";
     if (other_name.empty()) {
         Alert(kGame.missing);
         if (error) *error = Narrow(kGame.missing) + searched;
@@ -158,7 +197,7 @@ bool FindGame(GameFiles& game, std::string* error, const fs::path& location) {
                         L" is a different release of the game than this build was made from, and will most likely "
                         L"crash.\n\nStart it anyway?";
     if (!Alert(text.c_str(), true)) {
-        if (error) *error = other_name.filename().string() +
+        if (error) *error = PathText(other_name.filename()) +
                             " is a different release of the game than this build was made from.";
         return false;
     }

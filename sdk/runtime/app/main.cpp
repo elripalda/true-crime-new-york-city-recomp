@@ -542,6 +542,14 @@ void Pace(uint32_t max_fps, uint32_t cap_override) {
 
 }  // namespace app
 
+static std::filesystem::path startup_game_location;
+
+namespace app {
+void SetStartupGameLocation(std::filesystem::path location) {
+    startup_game_location = std::move(location);
+}
+} // namespace app
+
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     SetUnhandledExceptionFilter(app::WriteCrashDump);
     AddVectoredExceptionHandler(1, app::GuestWatchHandler);
@@ -560,7 +568,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     LOGR("diagnostics: effect watch %s", std::getenv("XBE_EFFECT_WATCH") ? "enabled" : "off");
 
     app::GameFiles game;
-    if (!app::FindGame(game)) return 1;
+    if (!app::FindGame(game, nullptr, startup_game_location)) return 1;
     if (!app::PrepareGameCode(game)) return 1;
 
     bool splash = app::OpenSplash(), handover = app::StartHandover();
