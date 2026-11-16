@@ -110,7 +110,7 @@ MSAA is off by default because it is the most demanding option; depth of field w
 | Texture replacement / dumping | Enable replacement packs; dump to PNG or DDS. |
 | Defaults / Close | Defaults resets every option (display changes still need Apply); Close saves and closes the menu. |
 
-Most of these also appear in the game's own **Options > Display** tab, with HDR on its own HDR SETTINGS page. Back cancels and A confirms there, as with the game's options; a display change is saved only once it has been applied.
+The same graphics settings are available in **Options > Display**, with HDR on its own HDR SETTINGS page. Back cancels changes, and A applies a pending display mode or resolution.
 
 The 3D scene renders in higher-precision (FP16) colour on D3D12 and Vulkan when the GPU supports it. Set
 `TCNYC_SCENE_FP16=0` before launch to use the original 8-bit scene targets. Guest surfaces retain their original formats.
@@ -158,7 +158,10 @@ The 3D scene renders in higher-precision (FP16) colour on D3D12 and Vulkan when 
 - Xbox, PlayStation and Switch controllers are supported with hot-plugging and rumble.
 - On-screen glyphs switch automatically between the active controller and keyboard/mouse.
 - Mouse look uses raw input and applies the PC version's camera scale on foot and in vehicles.
-- Mouse sensitivity and a separate vertical sensitivity are set in `settings.toml` (see [Settings file](#settings-file)).
+- Controller aim uses a radial dead zone and quadratic response by default, including L2 look. Its Original
+  response restores the Xbox behaviour, and its sensitivity raises full-stick turn speed from 100% to 400%.
+- Controller aim and mouse sensitivity (with a separate vertical speed) are set on the launcher's Controls
+  tab, in the F10 menu, or in the game's Options > Controller tab.
 - `Enter` confirms menus and `Backspace` cancels.
 - The cursor is confined to the game while focused and released for the F10 menu.
 - Button prompts follow the controller in use. If they guess wrong (for example an Xbox pad through Steam Input on a Steam Deck), set `prompt_style` in `settings.toml`.
@@ -167,12 +170,14 @@ The 3D scene renders in higher-precision (FP16) colour on D3D12 and Vulkan when 
 
 ## Settings file
 
-Everything in the F10 menu is saved to `settings.toml`: beside the executable on Windows, and in `~/.config/TrueCrimeNYC/settings.toml` on Linux. A few options are only in the file:
+Everything in the F10 menu is saved to `settings.toml`: beside the executable on Windows, and in `~/.config/TrueCrimeNYC/settings.toml` on Linux. The file also holds these options:
 
 | Setting | Default | Meaning |
 |---|---|---|
 | `mouse_sensitivity_percent` | `100` | Mouse look speed, 10 to 400. |
 | `mouse_vertical_sensitivity_percent` | `100` | Vertical speed relative to horizontal, 10 to 400. |
+| `controller_aim_response` | `0` | `0` is the radial dead zone and quadratic response; `1` is the original Xbox response. |
+| `controller_aim_sensitivity_percent` | `100` | Controller turn speed after the curve, 100 to 400 (refined response only). |
 | `direct_mouse_aim` | `true` | The mouse turns the camera directly; `false` feeds it to the right stick instead. |
 | `music_folder` | `""` | Folder of custom songs (see Customization); empty uses `music` beside the executable, relative paths start there too. |
 | `prompt_style` | `0` | Button prompts: 0 automatic, 1 original Xbox, 2 Xbox, 3 PlayStation, 4 Steam Deck. |

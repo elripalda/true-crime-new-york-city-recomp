@@ -1,7 +1,5 @@
 # Changelog
 
-## Unreleased
-
 ## 0.9.2.4 - Beta 4 (2026-11-16)
 
 ### Controls
@@ -12,6 +10,14 @@
   shows the physical button now doing the job, in every prompt style.
 - Bindings are saved in `settings.toml` under `[controls]`. The older `reload_key`, `heavy_attack_key`,
   `use_key` and `climb_key` settings are carried over and then replaced.
+- Controller aiming uses one radial dead zone across the whole right stick, then a quadratic curve on the
+  stick's magnitude, so a diagonal push turns the camera as far as a straight push at the same deflection.
+  The original per-axis dead zone made the centre feel uneven; full-stick speed is unchanged. The same curve
+  applies while looking around with L2. An `Original` response keeps the Xbox behaviour, and Controller aim
+  sensitivity (100-400%) can raise full-stick turn speed.
+- Controller aim response and sensitivity, mouse sensitivity and mouse vertical sensitivity are now on the
+  launcher's Controls tab, in the F10 menu, and in the game's own Options > Controller tab.
+- The camera no longer sticks after looking hard up or down with the controller.
 
 ### Audio
 - Custom music: songs in a folder you choose replace the Music Player's, by song number
@@ -65,34 +71,43 @@
   own detail (they only carry low-detail textures until woken).
 
 ### Fixes
+- City detail High no longer crashes the game after a while of driving: the visible-instance list's count
+  is now read from its moved location by every function that uses it.
+- Options > Display offers the rest of the F10 graphics settings (pedestrian, traffic and city detail, texture
+  replacement and dumping) and Restore Defaults.
 - Updates are validated before extraction: symbolic links, special files and traversal names are refused, and
   tar runs with `--no-same-owner --no-same-permissions`. A failed install no longer leaves a pending update
   that every launch retries, and an active journal without its staged installer rolls back in-process.
 - The updater reads up to five release pages, reports a failed check instead of "up to date", resumes large
   downloads, and makes an already-staged release visible when update checks are off. Files removed from a
-  newer package are deleted, and directories created by a failed install are removed.
+  newer package are deleted; they are backed up first, so an interrupted or failed install restores them.
+  Directories created by a failed install are removed.
 - Ambient occlusion works on D3D12: the reversed-depth prepass clears to the far value, and the AO depth
   target no longer leaves the draw's GREATER test with nothing to pass.
 - Vulkan: MSAA scene attachments keep their contents across pass reopens, borrowed depth uses its depth view,
   and a multisampled target's feedback copy resolves into a separate image instead of reading its own resolve
   target.
-- The car lamp fix is limited to the car types it was meant for, and reads the object only after the caller
-  check. Full-opacity car paint keeps its depth writes.
+- Moving car lamps stay steady through dusk and dawn in both the body and distant instance draws.
+  Full-opacity car paint keeps its depth writes.
 - Input: Return, Backspace and the arrow keys can no longer be bound (they always drive menus). Duplicate
   controller sources are repaired, sources without a glyph clear their prompt, and the launcher promotes a
   new key to the prompt slot. The in-game editor accepts every key the launcher does.
-- Settings: a legacy `msaa = true` still means 4x, saves publish on a worker instead of holding the UI lock,
+- Settings: a legacy `msaa = true` still means 4x, saves publish on a worker instead of holding the UI lock
+  (a save that fails is retried with every unsaved change), settings are saved when the game exits,
   the launcher keeps unknown keys, and Linux reads the field of view and city detail settings and remaps
   DLSS to FSR 3.1 when DLSS is not built in.
 - Files: renames share delete, `ReplaceIfExists` and directory/file mismatches are honored, missing CD-ROM
   files report not-found, and volume queries stay inside the caller's buffer.
 - Kernel: timer DPCs set `Inserted`, wait-all no longer spends a pulse, huge timeouts are clamped, and
-  `MEM_RELEASE` validates its base. Crash dumps avoid logger deadlocks and recursion.
+  `MEM_RELEASE` validates its base. Crash dumps avoid logger deadlocks and recursion, and a crash on one
+  thread waits briefly for another thread's log line so its own lines still reach `tcnyc.log`.
+- `DbgPrint`/`RtlSprintf` handle `*` widths and precisions and 64-bit arguments, a Linux thread exit no longer
+  frees its start closure twice, and 16-bit `rep stos` fills only the requested length.
 - Larger character caches and the city grid store allocate from the top of user space, away from the game's
   heap. The last-vertex diagnostic clamps its index and checks the stream bound.
 - Non-ASCII install paths work for config parsing, logs, crash dumps and the splash screen.
-- Recompiler: `FNSAVE`/`FRSTOR` keep the x87 register stack, `push seg`/`push imm16` use the 32-bit form,
-  and `cvtss2si` follows MXCSR rounding.
+- Recompiler: `FNSAVE`/`FRSTOR` keep the x87 register stack at the right offset, `push`/`pop` with a 16-bit
+  operand size move the stack by two bytes, and `cvtss2si` follows MXCSR rounding.
 
 ## 0.9.2.0 — Beta 3 (2026-11-12)
 
