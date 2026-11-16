@@ -1,262 +1,1068 @@
-// The window TrueCrimeNYC.exe shows before the game: pick an ISO, which is copied into the assets folder beside the
-// executable, then start the game (RecompMain, the SDK's wWinMain renamed in CMakeLists.txt).
+#include "launcher.h"
+#include "updater.h"
 
-#ifndef UNICODE
-#define UNICODE
-#endif
-#include <windows.h>
-#include <commdlg.h>
-
-#include <atomic>
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <initializer_list>
+#include <cctype>
 #include <cstdlib>
-#include <filesystem>
-#include <thread>
-
-#include "app/app.h"
+#include <fstream>
+#include <mutex>
+#include <span>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
-#include "kernel/disc.h"
-#include "xbe/xbe.h"
+#include <SDL3/SDL.h>
+#include <backends/imgui_impl_sdl3.h>
+#include <backends/imgui_impl_sdlrenderer3.h>
+#include <imgui.h>
+#include <misc/cpp/imgui_stdlib.h>
+#include <toml++/toml.hpp>
 
-extern const char kImageSha1[];
+#define STB_IMAGE_STATIC
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_PNG
+#define STBI_NO_STDIO
+#include <stb_image.h>
 
-namespace fs = std::filesystem;
+#include "app/app.h"
+#include "app/settings_store.h"
+#include "common/graphics_choices.h"
+#include "core/input.h"
 
+namespace launcher {
 namespace {
 
-constexpr wchar_t kTitle[] = L"True Crime NYC Launcher";
-constexpr UINT kInstallProgress = WM_APP + 1;
-constexpr UINT kInstallDone = WM_APP + 2;
-std::thread g_install;
-std::atomic<bool> g_cancel{false};
-std::wstring g_error;
-bool g_installing = false;
+namespace fs = std::filesystem;
+using namespace game::choices;
 
-int Error(const wchar_t *message) {
-    MessageBoxW(nullptr, message, kTitle, MB_OK | MB_ICONERROR);
-    return 1;
+// Dear ImGui 1.91.1 renamed the child border flag; Windows and Linux pin different versions.
+#if IMGUI_VERSION_NUM >= 19110
+constexpr ImGuiChildFlags kChildBorder = ImGuiChildFlags_Borders;
+#else
+constexpr ImGuiChildFlags kChildBorder = ImGuiChildFlags_Border;
+#endif
+
+constexpr char kTitle[] = "True Crime: New York City";
+constexpr unsigned char kBanner[] = {
+#include "launcher_banner.inc"
+};
+
+std::string Utf8(const fs::path &path) {
+    auto bytes = path.u8string();
+    return {bytes.begin(), bytes.end()};
 }
 
-std::wstring Widen(const std::string &text) {
-    if (text.empty()) return {};
-    const int n = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), int(text.size()), nullptr, 0);
-    std::wstring out(size_t(n), L'\0');
-    if (n) MultiByteToWideChar(CP_UTF8, 0, text.c_str(), int(text.size()), out.data(), n);
-    return out;
+fs::path PreferencesPath() {
+#ifdef TCNYC_PAL
+    constexpr char name[] = "launcher-pal.toml";
+#else
+    constexpr char name[] = "launcher.toml";
+#endif
+    return app::SettingsPath().parent_path() / name;
 }
 
-std::wstring ValidateIso(const fs::path &image) {
-    kernel::Disc disc;
-    std::string why;
-    if (!disc.Open(image, why)) return L"This is not a usable Xbox disc image. " + Widen(why);
+struct Picker {
+    std::mutex mutex;
+    bool pending = false;
+    std::string path;
+    std::string error;
+};
 
-    const auto *entry = disc.Find("default.xbe");
-    constexpr uint32_t kMaxXbeSize = 64u << 20;
-    std::vector<uint8_t> xbe;
-    if (!entry || entry->size > kMaxXbeSize || !disc.Load("default.xbe", xbe))
-        return L"The disc image does not contain a readable default.xbe.";
-    if (app::Sha1(xbe) != kImageSha1)
-        return L"Select the original Xbox disc image that matches this build of True Crime NYC.";
-    return {};
+// The dialog callback can run on a different thread.
+void SDLCALL Picked(void *userdata, const char *const *files, int) {
+    auto &picker = *static_cast<Picker *>(userdata);
+    std::lock_guard lock(picker.mutex);
+    if (!files)
+        picker.error = std::string("Could not open the file picker. ") + SDL_GetError();
+    else if (*files)
+        picker.path = *files;
+    picker.pending = false;
 }
 
-DWORD CALLBACK CopyProgress(LARGE_INTEGER total, LARGE_INTEGER transferred, LARGE_INTEGER, LARGE_INTEGER, DWORD,
-                            DWORD, HANDLE, HANDLE, LPVOID window) {
-    if (g_cancel.load()) return PROGRESS_CANCEL;
-    if (total.QuadPart > 0)
-        PostMessageW(static_cast<HWND>(window), kInstallProgress, transferred.QuadPart * 100 / total.QuadPart, 0);
-    return PROGRESS_CONTINUE;
-}
-
-std::wstring InstallIso(HWND window, const fs::path &source) {
-    std::vector<wchar_t> path(32768);
-    const DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
-    if (!length || length == path.size()) return L"Could not locate the launcher folder.";
-    const auto assets = fs::path(path.data()).parent_path() / L"assets";
-
-    if (_wcsicmp(source.extension().c_str(), L".iso") != 0) return L"Select an .iso file.";
-    fs::create_directories(assets);
-    if (fs::exists(assets / L"default.xbe"))
-        return L"Move the extracted game files out of the local assets folder before launching an ISO.";
-
-    bool installed = false;
-    for (const auto &entry : fs::directory_iterator(assets)) {
-        if (!entry.is_regular_file() || _wcsicmp(entry.path().extension().c_str(), L".iso") != 0) continue;
-        if (!fs::equivalent(entry.path(), source))
-            return L"Move the existing ISO out of the local assets folder before selecting a different ISO.";
-        installed = true;
+void Browse(SDL_Window *window, Picker &picker) {
+    static constexpr SDL_DialogFileFilter filters[] = {{"Xbox disc images", "iso;ISO"}};
+    {
+        std::lock_guard lock(picker.mutex);
+        picker.pending = true;
     }
-    if (installed) return ValidateIso(source);
+    SDL_ShowOpenFileDialog(Picked, &picker, window, filters, 1, nullptr, false);
+}
 
-    if (std::wstring error = ValidateIso(source); !error.empty()) return error;
-    if (g_cancel.load()) return {};
-    const auto destination = assets / source.filename();
-    wchar_t temp[MAX_PATH];
-    if (!GetTempFileNameW(assets.c_str(), L"iso", 0, temp))
-        return L"Could not create a staging file in assets.";
-    struct Staged {
-        const wchar_t *path;
-        ~Staged() {
-            if (DeleteFileW(path) || GetLastError() != ERROR_ACCESS_DENIED) return;
-            const DWORD attributes = GetFileAttributesW(path);
-            if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_READONLY)) {
-                SetFileAttributesW(path, attributes & ~FILE_ATTRIBUTE_READONLY);
-                DeleteFileW(path);
-            }
+struct Graphics {
+    app::Settings settings;
+    toml::table edits;
+    SDL_Window *window = nullptr;
+    Picker music_picker;  // the custom music folder
+    std::vector<app::Mode> resolutions{{0, 0}};
+
+    void Save() {
+        if (edits.empty()) return;
+        app::MergeSettingsTable(app::SettingsPath(), edits);
+        edits.clear();
+    }
+
+    void FindResolutions(SDL_Window *window) {
+        int count = 0;
+        auto modes = SDL_GetFullscreenDisplayModes(SDL_GetDisplayForWindow(window), &count);
+        for (int i = 0; i < count; ++i) {
+            const auto &mode = *modes[i];
+            if (mode.w >= 640 && mode.h >= 480) resolutions.push_back({uint32_t(mode.w), uint32_t(mode.h)});
         }
-    } staged{temp};
-
-    if (!CopyFileExW(source.c_str(), staged.path, CopyProgress, window, nullptr, 0))
-        return L"Could not copy the ISO. Check free space and write access.";
-    if (g_cancel.load()) return {};
-    if (std::wstring error = ValidateIso(staged.path); !error.empty()) return error;
-    if (g_cancel.load()) return {};
-    if (!MoveFileW(staged.path, destination.c_str())) return L"Could not install the ISO in assets.";
-    return {};
-}
-
-constexpr int kBrowse = 101;
-constexpr int kLaunch = 102;
-HWND isoField;
-
-fs::path selectedIso;
-bool launchRequested = false;
-
-void Browse(HWND window) {
-    std::vector<wchar_t> path(32768);
-    OPENFILENAMEW picker{};
-    picker.lStructSize = sizeof(picker);
-    picker.hwndOwner = window;
-    picker.lpstrFilter = L"Xbox disc images (*.iso)\0*.iso\0";
-    picker.lpstrFile = path.data();
-    picker.nMaxFile = static_cast<DWORD>(path.size());
-    picker.lpstrTitle = L"Select your True Crime NYC Xbox ISO";
-    picker.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-    if (GetOpenFileNameW(&picker)) {
-        selectedIso = path.data();
-        SetWindowTextW(isoField, selectedIso.c_str());
-
-    } else if (CommDlgExtendedError()) {
-        Error(L"Could not open the ISO picker.");
+        SDL_free(modes);
+        if (settings.width && settings.height) resolutions.push_back({settings.width, settings.height});
+        const auto dimensions = [](app::Mode mode) { return std::pair{mode.width, mode.height}; };
+        std::ranges::sort(resolutions, {}, dimensions);
+        auto duplicates = std::ranges::unique(resolutions, {}, dimensions);
+        resolutions.erase(duplicates.begin(), duplicates.end());
     }
-}
 
-HWND AddControl(HWND parent, const wchar_t *type, const wchar_t *text, DWORD style, int x, int y, int width, int height,
-                int id = 0) {
-    HWND control = CreateWindowW(type, text, WS_CHILD | WS_VISIBLE | style, x, y, width, height, parent,
-                                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), nullptr, nullptr);
-    SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
-    return control;
-}
+    void Toggle(const char *label, const char *key, bool &value) {
+        ImGui::TableNextColumn();
+        if (ImGui::Checkbox(label, &value)) edits.insert_or_assign(key, value);
+    }
 
-LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
-    switch (message) {
-    case WM_CREATE:
-        AddControl(window, L"STATIC", L"Select your original Xbox disc image (.iso).", 0, 16, 16, 440, 20);
-        isoField = AddControl(window, L"EDIT", L"", WS_BORDER | ES_READONLY | ES_AUTOHSCROLL, 16, 44, 350, 25);
-        AddControl(window, L"BUTTON", L"&Browse...", WS_TABSTOP, 376, 43, 80, 27, kBrowse);
-        AddControl(window, L"STATIC", L"Launch uses assets if no ISO is selected.", 0, 16, 84, 330, 20);
-        AddControl(window, L"BUTTON", L"&Launch", WS_TABSTOP, 376, 79, 80, 29, kLaunch);
-        return 0;
-    case WM_COMMAND:
-        if (g_installing) return 0;  // the copy's message pump must not start a second install
-        if (LOWORD(wParam) == kBrowse) Browse(window);
-        if (LOWORD(wParam) == kLaunch) {
-            if (selectedIso.empty()) {
-                launchRequested = true;
-                DestroyWindow(window);
-                return 0;
+    // A labelled drop-down filling one grid cell.
+    template <class Label>
+    bool Choice(const char *label, const char *key, uint32_t &value, std::span<const uint32_t> options, Label name) {
+        ImGui::TableNextColumn();
+        ImGui::TextDisabled("%s", label);
+        ImGui::SetNextItemWidth(-1);
+        ImGui::PushID(key);
+        bool changed = false;
+        if (ImGui::BeginCombo("##choice", name(value).c_str())) {
+            for (uint32_t option : options) {
+                if (ImGui::Selectable(name(option).c_str(), value == option)) {
+                    value = option;
+                    edits.insert_or_assign(key, value);
+                    changed = true;
+                }
+                if (value == option) ImGui::SetItemDefaultFocus();
             }
-            g_cancel.store(false);
-            g_installing = true;
-            SetWindowTextW(window, L"True Crime NYC Launcher - installing");
-            try {
-                g_install = std::thread([window, source = selectedIso] {
-                    try {
-                        g_error = InstallIso(window, source);
-                    } catch (const std::exception &) {
-                        g_error = L"Could not access the selected ISO or the local assets folder.";
+            ImGui::EndCombo();
+        }
+        ImGui::PopID();
+        return changed;
+    }
+
+    static bool Section(const char *title) {
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(IM_COL32(243, 178, 79, 255)));
+        ImGui::SeparatorText(title);
+        ImGui::PopStyleColor();
+        return ImGui::BeginTable(title, 3, ImGuiTableFlags_SizingStretchSame);
+    }
+
+    void Draw() {
+        constexpr const char *display_names[] = {"Fullscreen", "Borderless", "Windowed"};
+        constexpr const char *display_keys[] = {"fullscreen", "borderless", "windowed"};
+        constexpr const char *upscaler_names[] = {"Bilinear", "AMD FSR 1", "AMD FSR 3.1", "NVIDIA DLSS", "AMD FSR 4.1"};
+        const auto percent = [](uint32_t v) { return std::to_string(v) + "%"; };
+        const auto multiple = [](uint32_t v) { return v ? std::to_string(v) + "x" : std::string("Off"); };
+        const auto level = [](uint32_t v) {
+            constexpr const char *names[] = {"Original", "Sharper", "Sharpest"};
+            return std::string(names[v]);
+        };
+        const auto softness = [](uint32_t v) {
+            constexpr const char *names[] = {"Original", "Soft", "Softer"};
+            return std::string(names[v]);
+        };
+        const auto resolution_name = [](app::Mode mode) {
+            return mode.width ? std::to_string(mode.width) + " x " + std::to_string(mode.height)
+                              : std::string("Desktop");
+        };
+
+        if (Section("DISPLAY")) {
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("Display mode");
+            ImGui::SetNextItemWidth(-1);
+            int mode = int(settings.display_mode);
+            if (ImGui::Combo("##display", &mode, display_names, int(std::size(display_names)))) {
+                settings.display_mode = app::DisplayMode(mode);
+                edits.insert_or_assign("display_mode", display_keys[mode]);
+            }
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("Resolution");
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::BeginCombo("##resolution", resolution_name({settings.width, settings.height}).c_str())) {
+                for (auto option : resolutions) {
+                    const bool selected = option.width == settings.width && option.height == settings.height;
+                    if (ImGui::Selectable(resolution_name(option).c_str(), selected)) {
+                        settings.width = option.width;
+                        settings.height = option.height;
+                        edits.insert_or_assign("width", option.width);
+                        edits.insert_or_assign("height", option.height);
                     }
-                    PostMessageW(window, kInstallDone, 0, 0);
-                });
-            } catch (const std::system_error &) {
-                g_installing = false;
-                SetWindowTextW(window, kTitle);
-                Error(L"Could not start the ISO installer.");
+                    if (selected) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            Choice("Aspect ratio", "aspect_ratio", settings.aspect, kAspects, [](uint32_t v) {
+                if (!v) return std::string("Match display");
+                const std::string name = AspectName(v);
+                return name.empty() ? std::to_string(v / 1000.0).substr(0, 5) + ":1" : name;
+            });
+            Choice("Frame cap", "fps_cap", settings.fps_cap, kFrameCaps,
+                   [](uint32_t v) { return std::to_string(EffectiveFrameCap(v)) + " FPS"; });
+            Toggle("VSync", "vsync", settings.vsync);
+            Toggle("Low latency", "low_latency", settings.low_latency);
+            ImGui::EndTable();
+        }
+
+        if (Section("IMAGE QUALITY")) {
+            Choice("Render scale", "render_percent", settings.render_percent, kRenderPercents, percent);
+            Choice("Upscaler", "upscaler", settings.upscaler, kUpscalers,
+                   [&](uint32_t v) { return std::string(upscaler_names[v]); });
+            Choice("Sharpening", "sharpening", settings.sharpening, kSharpenPercents,
+                   [](uint32_t v) { return v ? std::to_string(v) + "%" : std::string("Off"); });
+            Choice("Multisample AA", "msaa", settings.msaa, kMsaaSamples, multiple);
+            Choice("Anisotropic filtering", "anisotropic_filtering", settings.aniso, kAnisoLevels,
+                   [](uint32_t v) { return v ? std::to_string(v) + "x" : std::string("Game default"); });
+            ImGui::TableNextColumn();
+            Toggle("SMAA", "smaa", settings.smaa);
+            Toggle("Temporal AA (experimental)", "taa", settings.taa);
+            ImGui::EndTable();
+        }
+        if (settings.upscaler >= kFsr3 && !TemporalScale(settings.render_percent))
+            ImGui::TextDisabled("Temporal upscaling needs 50%%, 58%%, 67%% or 100%% render scale.");
+
+        if (Section("LIGHTING & EFFECTS")) {
+            uint32_t ao_choice = AoMethodChoice(settings.ao, settings.ao_method);
+            if (Choice("Ambient occlusion", "ao_choice", ao_choice, kAoMethodChoices, [](uint32_t v) {
+                    constexpr const char *names[] = {"Off", "SSAO", "GTAO"};
+                    return std::string(names[v]);
+                })) {
+                edits.erase("ao_choice");
+                settings.ao = ApplyAoMethodChoice(ao_choice, settings.ao_quality, settings.ao_method);
+                edits.insert_or_assign("ao", settings.ao);
+                edits.insert_or_assign("ao_method", settings.ao_method);
+            }
+            if (Choice("Occlusion quality", "ao_quality", settings.ao_quality, kAoQualities,
+                       [](uint32_t v) { return std::string(v == 1 ? "Half resolution" : "Full resolution"); }) &&
+                settings.ao) {
+                settings.ao = settings.ao_quality;
+                edits.insert_or_assign("ao", settings.ao);
+            }
+            Choice("Bloom strength", "bloom_strength", settings.bloom_strength, kBloomStrengths, percent);
+            Choice("Shadow resolution", "shadow_resolution", settings.shadow_resolution, kShadowLevels, level);
+            Choice("Shadow softness", "shadow_softness", settings.shadow_softness, kShadowLevels, softness);
+            ImGui::TableNextColumn();
+            Toggle("Bloom", "bloom", settings.bloom);
+            Toggle("Depth of field", "dof", settings.dof);
+            Toggle("PC contrast", "pc_contrast", settings.pc_contrast);
+            ImGui::EndTable();
+        }
+
+        if (Section("HDR")) {
+            Toggle("HDR output", "hdr", settings.hdr);
+            ImGui::TableNextRow();
+            ImGui::BeginDisabled(!settings.hdr);
+            Choice("Paper white", "hdr_paper_white", settings.hdr_paper_white, kHdrPaperWhiteNits,
+                   [](uint32_t v) { return std::to_string(v) + " nits"; });
+            Choice("Peak brightness", "hdr_peak", settings.hdr_peak, kHdrPeakNits,
+                   [](uint32_t v) { return v ? std::to_string(v) + " nits" : std::string("Display"); });
+            Choice("Highlights", "hdr_highlights", settings.hdr_highlights, kHdrHighlightPercents, percent);
+            ImGui::EndDisabled();
+            ImGui::EndTable();
+        }
+
+        if (Section("THE CITY")) {
+            Choice("Object detail", "object_detail", settings.object_detail, kObjectDetails,
+                   [](uint32_t v) { return std::string(ObjectDetailName(v)); });
+            Choice("Traffic density", "traffic_density", settings.traffic_density, kTrafficDensities,
+                   [](uint32_t v) { return std::string(TrafficDensityName(v)); });
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("How many ambient cars there are. Raise it with Traffic distance to keep streets busy.");
+            Choice("Traffic distance", "traffic_distance", settings.traffic_distance, kTrafficDistances,
+                   [](uint32_t v) { return std::string(TrafficDistanceName(v)); });
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("How far away cars appear. The same cars spread over a wider area, "
+                                  "so a longer distance looks emptier unless Traffic density is raised too.");
+            Choice("Pedestrian limit", "ped_limit", settings.ped_limit, kPedLimits,
+                   [](uint32_t v) { return std::string(PedLimitName(v)); });
+            Choice("Crowd density", "ped_density", settings.ped_density, kPedDensities,
+                   [](uint32_t v) { return std::string(PedDensityName(v)); });
+            Choice("Pedestrian detail", "ped_detail", settings.ped_detail, kPedDetails,
+                   [](uint32_t v) { return std::string(PedDetailName(v)); });
+            Toggle("Building seam fix", "building_seam_fix", settings.building_seam_fix);
+            ImGui::EndTable();
+        }
+
+        if (Section("TEXTURES")) {
+            Toggle("Custom textures", "custom_textures", settings.custom_textures);
+            Toggle("Dump textures", "dump_textures", settings.dump_textures);
+            ImGui::BeginDisabled(!settings.dump_textures);
+            Choice("Dump format", "texture_dump_format", settings.texture_dump_format, std::array<uint32_t, 2>{0, 1},
+                   [](uint32_t v) { return std::string(v ? "DDS" : "PNG"); });
+            ImGui::EndDisabled();
+            ImGui::EndTable();
+        }
+
+        if (Section("CUSTOM MUSIC")) ImGui::EndTable();
+        {
+            std::lock_guard lock(music_picker.mutex);
+            if (!music_picker.path.empty()) {
+                settings.music_folder = std::move(music_picker.path);
+                music_picker.path.clear();
+                edits.insert_or_assign("music_folder", settings.music_folder);
             }
         }
-        return 0;
-    case kInstallProgress: {
-        wchar_t title[96];
-        swprintf_s(title, L"%s - installing %u%%", kTitle, static_cast<unsigned>(wParam));
-        if (!g_cancel.load()) SetWindowTextW(window, title);
-        return 0;
+        ImGui::TextDisabled("Files named after a Music Player song (6000 to 6092; mp3, ogg, flac, wav or wma) replace it.");
+        ImGui::SetNextItemWidth(-ImGui::CalcTextSize("Browse...Clear").x - ImGui::GetStyle().ItemSpacing.x * 2 -
+                                ImGui::GetStyle().FramePadding.x * 4);
+        if (ImGui::InputTextWithHint("##music_folder", "Folder with your songs (empty: the game's music)",
+                                     &settings.music_folder))
+            edits.insert_or_assign("music_folder", settings.music_folder);
+        ImGui::SameLine();
+        bool picking;
+        {
+            std::lock_guard lock(music_picker.mutex);
+            picking = music_picker.pending;
+        }
+        ImGui::BeginDisabled(picking);
+        if (ImGui::Button("Browse...")) {
+            {
+                std::lock_guard lock(music_picker.mutex);
+                music_picker.pending = true;
+            }
+            SDL_ShowOpenFolderDialog(Picked, &music_picker, window,
+                                     settings.music_folder.empty() ? nullptr : settings.music_folder.c_str(), false);
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button("Clear") && !settings.music_folder.empty()) {
+            settings.music_folder.clear();
+            edits.insert_or_assign("music_folder", settings.music_folder);
+        }
     }
-    case kInstallDone:
-        g_install.join();
-        g_installing = false;
-        if (g_cancel.load() || g_error.empty()) {
-            launchRequested = !g_cancel.load();
-            DestroyWindow(window);
+};
+
+// The Controls tab: keyboard and controller bindings, captured by pressing the new key or button.
+struct Controls {
+    input::KeyBinding keys[input::kKeyBindingCount];
+    input::PadBinding pad[input::kPadBindingCount];
+    // what is being captured: a keyboard row and slot, or a controller row; -1 none
+    int key_row = -1, key_slot = 0, pad_row = -1;
+    std::vector<SDL_Gamepad *> gamepads;
+
+    Controls() {
+        input::KeyBindings(keys);
+        input::PadBindings(pad);
+    }
+    ~Controls() {
+        for (auto *gamepad : gamepads) SDL_CloseGamepad(gamepad);
+    }
+    bool Capturing() const { return key_row >= 0 || pad_row >= 0; }
+
+    // pushes the tables into the input module and the settings edits
+    void Commit(toml::table &edits) {
+        input::SetBindings(keys, pad);
+        toml::table written;
+        input::SaveBindings(&written);
+        if (auto *controls = written["controls"].as_table()) edits.insert_or_assign("controls", *controls);
+    }
+
+    void SetKey(uint32_t key, toml::table &edits) {
+        auto &slots = keys[key_row].keys;
+        if (key) for (auto& binding : slots) if (binding == key) binding = 0;
+        slots[key_slot] = key;
+        // keep the set packed: the first key is the one the prompts show
+        std::stable_partition(std::begin(slots), std::end(slots), [](uint32_t k) { return k != 0; });
+        key_row = -1;
+        Commit(edits);
+    }
+
+    // true when the launcher used the event for a capture
+    bool Event(const SDL_Event &event, toml::table &edits) {
+        if (event.type == SDL_EVENT_GAMEPAD_ADDED) {
+            if (auto *gamepad = SDL_OpenGamepad(event.gdevice.which)) gamepads.push_back(gamepad);
+            return false;
+        }
+        if (event.type == SDL_EVENT_GAMEPAD_REMOVED) {
+            std::erase_if(gamepads, [&](SDL_Gamepad* gamepad) {
+                if (SDL_GetGamepadID(gamepad) != event.gdevice.which) return false;
+                SDL_CloseGamepad(gamepad);
+                return true;
+            });
+            return false;
+        }
+        if (!Capturing()) return false;
+        if (event.type == SDL_EVENT_KEY_DOWN) {
+            const SDL_Keycode key = event.key.key;
+            if (key == SDLK_ESCAPE) {
+                key_row = pad_row = -1;
+            } else if (key_row >= 0) {
+                if (key == SDLK_DELETE) SetKey(0, edits);
+                else if (key != SDLK_RETURN && key != SDLK_UP && key != SDLK_DOWN && key != SDLK_LEFT &&
+                         key != SDLK_RIGHT && input::CanBindKey(uint32_t(key)))  // menu keys stay fixed
+                    SetKey(uint32_t(key), edits);
+            }
+            return true;
+        }
+        if (event.type == SDL_EVENT_KEY_UP || event.type == SDL_EVENT_TEXT_INPUT) return true;
+        if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && key_row >= 0) {
+            constexpr int mouse[] = {-1, 0, 1, 2, 3, 4};  // SDL's 1-based buttons
+            if (event.button.button <= 5) SetKey(input::MouseKey(mouse[event.button.button]), edits);
+            return true;
+        }
+        if (pad_row >= 0) {
+            int source = -1;
+            if (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN && event.gbutton.button != SDL_GAMEPAD_BUTTON_GUIDE)
+                source = event.gbutton.button;
+            if (event.type == SDL_EVENT_GAMEPAD_AXIS_MOTION && event.gaxis.value > 20000 &&
+                (event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER || event.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER))
+                source = input::kPadAxis | event.gaxis.axis;
+            if (source >= 0) {
+                // a swap: the input that had this button takes the old one, so nothing is left unbound
+                for (auto &binding : pad)
+                    if (binding.source == source) binding.source = pad[pad_row].source;
+                pad[pad_row].source = source;
+                pad_row = -1;
+                Commit(edits);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static std::string KeyName(uint32_t key) {
+        if (!key) return "";
+        if (key & input::kMouseKey) {
+            constexpr const char *names[] = {"Mouse left", "Mouse middle", "Mouse right", "Mouse 4", "Mouse 5"};
+            return (key & 0xFF) < 5 ? names[key & 0xFF] : "?";
+        }
+        return SDL_GetKeyName(SDL_Keycode(key));
+    }
+
+    static std::string PadName(int source) {
+        if (source & input::kPadAxis)
+            return (source & 0xFF) == SDL_GAMEPAD_AXIS_LEFT_TRIGGER ? "Left trigger (LT / L2)" : "Right trigger (RT / R2)";
+        switch (source) {
+        case SDL_GAMEPAD_BUTTON_SOUTH: return "Bottom (A / Cross)";
+        case SDL_GAMEPAD_BUTTON_EAST: return "Right (B / Circle)";
+        case SDL_GAMEPAD_BUTTON_WEST: return "Left (X / Square)";
+        case SDL_GAMEPAD_BUTTON_NORTH: return "Top (Y / Triangle)";
+        case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER: return "Left bumper (LB / L1)";
+        case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER: return "Right bumper (RB / R1)";
+        case SDL_GAMEPAD_BUTTON_BACK: return "View / Share";
+        case SDL_GAMEPAD_BUTTON_START: return "Menu / Options";
+        case SDL_GAMEPAD_BUTTON_LEFT_STICK: return "Left stick click";
+        case SDL_GAMEPAD_BUTTON_RIGHT_STICK: return "Right stick click";
+        case SDL_GAMEPAD_BUTTON_DPAD_UP: return "D-pad up";
+        case SDL_GAMEPAD_BUTTON_DPAD_DOWN: return "D-pad down";
+        case SDL_GAMEPAD_BUTTON_DPAD_LEFT: return "D-pad left";
+        case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: return "D-pad right";
+        default: {
+            const char *name = SDL_GetGamepadStringForButton(SDL_GamepadButton(source));
+            return name ? name : "?";
+        }
+        }
+    }
+
+    // the same key on another row that can be active at the same time
+    bool Clash(int row, uint32_t key) const {
+        for (int other = 0; other < input::kKeyBindingCount; ++other) {
+            if (other == row) continue;
+            const auto a = keys[row].context, b = keys[other].context;
+            if (a != input::Context::Any && b != input::Context::Any && a != b) continue;
+            if (std::ranges::find(keys[other].keys, key) != std::end(keys[other].keys)) return true;
+        }
+        return false;
+    }
+
+    void Draw(float scale, toml::table &edits) {
+        constexpr const char *actions[input::kKeyBindingCount] = {
+            "Move forward", "Move back", "Move left", "Move right",
+            "Light attack", "Grapple / human shield", "Heavy attack", "Jump / climb",
+            "Accelerate", "Handbrake", "Brake / reverse", "Vehicle Y action",
+            "Reload / block", "Use / enter vehicle", "Aim / lock on", "Fire",
+            "Badge / horn / siren", "Left stick click", "Right stick click", "Pause"};
+        constexpr struct { const char *title; int first, last; } groups[] = {
+            {"KEYBOARD: MOVEMENT", 0, 3}, {"KEYBOARD: ON FOOT", 4, 7},
+            {"KEYBOARD: DRIVING", 8, 11}, {"KEYBOARD: EVERYWHERE", 12, 18}};
+        ImGui::TextDisabled("Click a slot, then press the key or mouse button. Delete clears it, Escape cancels, "
+                            "right-click clears. Enter, the arrows and Escape always work in menus.");
+        for (const auto &group : groups) {
+            if (!Graphics::Section(group.title)) continue;
+            ImGui::EndTable();
+            if (!ImGui::BeginTable(group.title, 5, ImGuiTableFlags_SizingStretchSame)) continue;
+            ImGui::TableSetupColumn("action", ImGuiTableColumnFlags_WidthStretch, 1.6f);
+            for (int row = group.first; row <= group.last; ++row) {
+                ImGui::PushID(row);
+                ImGui::TableNextColumn();
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextUnformatted(actions[row]);
+                for (int slot = 0; slot < 4; ++slot) {
+                    ImGui::TableNextColumn();
+                    ImGui::PushID(slot);
+                    const uint32_t key = keys[row].keys[slot];
+                    const bool capturing = key_row == row && key_slot == slot;
+                    const bool clash = key && Clash(row, key);
+                    if (clash) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{1, 0.45f, 0.45f, 1});
+                    if (capturing) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4{0.55f, 0.36f, 0.10f, 1});
+                    const std::string text = capturing ? "Press a key..." : key ? KeyName(key) : "-";
+                    if (ImGui::Button(text.c_str(), {-1, 0})) {
+                        key_row = row;
+                        key_slot = slot;
+                        pad_row = -1;
+                    }
+                    if (ImGui::IsItemClicked(ImGuiMouseButton_Right) && key) {
+                        key_row = row;
+                        key_slot = slot;
+                        SetKey(0, edits);
+                    }
+                    if (clash && ImGui::IsItemHovered()) ImGui::SetTooltip("Also bound to another action");
+                    if (capturing) ImGui::PopStyleColor();
+                    if (clash) ImGui::PopStyleColor();
+                    ImGui::PopID();
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        if (ImGui::Button("Reset keyboard")) {
+            input::DefaultKeys(keys);
+            key_row = -1;
+            Commit(edits);
+        }
+
+        constexpr const char *pad_actions[input::kPadBindingCount] = {
+            "D-pad up (weapon)", "D-pad down (weapon)", "D-pad left", "D-pad right",
+            "Pause", "Badge / horn / siren", "Left stick click", "Right stick click",
+            "A: light attack / accelerate", "B: grapple / handbrake", "X: heavy attack / brake", "Y: jump / climb",
+            "Black: reload / block", "White: use / enter vehicle", "Left trigger: aim / lock on", "Right trigger: fire"};
+        if (Graphics::Section("CONTROLLER")) {
+            ImGui::EndTable();
+            ImGui::TextDisabled(gamepads.empty() ? "Connect a controller to rebind it."
+                                                 : "Click an action, then press the button. Taking a button "
+                                                   "from another action swaps the two.");
+            if (ImGui::BeginTable("controller", 2, ImGuiTableFlags_SizingStretchSame)) {
+                for (int row = 0; row < input::kPadBindingCount; ++row) {
+                    ImGui::PushID(100 + row);
+                    ImGui::TableNextColumn();
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextUnformatted(pad_actions[row]);
+                    ImGui::TableNextColumn();
+                    const bool capturing = pad_row == row;
+                    if (capturing) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4{0.55f, 0.36f, 0.10f, 1});
+                    ImGui::BeginDisabled(gamepads.empty() || row == int(input::PadInput::Start));
+                    if (ImGui::Button(capturing ? "Press a button..." : PadName(pad[row].source).c_str(), {-1, 0})) {
+                        pad_row = row;
+                        key_row = -1;
+                    }
+                    ImGui::EndDisabled();
+                    if (capturing) ImGui::PopStyleColor();
+                    ImGui::PopID();
+                }
+                ImGui::EndTable();
+            }
+            if (ImGui::Button("Reset controller")) {
+                input::DefaultPadBindings(pad);
+                pad_row = -1;
+                Commit(edits);
+            }
+        }
+        (void)scale;
+    }
+};
+
+SDL_Texture *LoadBanner(SDL_Renderer *renderer) {
+    int width = 0, height = 0, channels = 0;
+    auto *pixels = stbi_load_from_memory(kBanner, int(sizeof(kBanner)), &width, &height, &channels, 4);
+    if (!pixels) return nullptr;
+    auto *surface = SDL_CreateSurfaceFrom(width, height, SDL_PIXELFORMAT_RGBA32, pixels, width * 4);
+    auto *texture = surface ? SDL_CreateTextureFromSurface(renderer, surface) : nullptr;
+    SDL_DestroySurface(surface);
+    stbi_image_free(pixels);
+    return texture;
+}
+
+ImFont *g_display = nullptr; // Impact-style headline font, matching the banner
+ImFont *g_button = nullptr;
+
+ImFont *AddFirst(std::initializer_list<const char *> names, float size) {
+    auto &fonts = *ImGui::GetIO().Fonts;
+    for (const char *name : names) {
+#ifdef _WIN32
+        const char *windows = std::getenv("WINDIR");
+        if (!windows) break;
+        const auto font = fs::path(windows) / "Fonts" / name;
+#else
+        const fs::path font = name;
+#endif
+        std::error_code ec;
+        if (fs::is_regular_file(font, ec))
+            if (auto *added = fonts.AddFontFromFileTTF(font.string().c_str(), size)) return added;
+    }
+    return nullptr;
+}
+
+void LoadFont(float size) {
+#ifdef _WIN32
+    auto *body = AddFirst({"bahnschrift.ttf", "segoeui.ttf"}, size);
+    const std::initializer_list<const char *> display = {"impact.ttf", "bahnschrift.ttf"};
+#else
+    auto *body = AddFirst({"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/TTF/DejaVuSans.ttf",
+                           "/usr/share/fonts/noto/NotoSans-Regular.ttf"},
+                          size);
+    const std::initializer_list<const char *> display = {"/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed-Bold.ttf",
+                                                         "/usr/share/fonts/TTF/DejaVuSansCondensed-Bold.ttf"};
+#endif
+    if (!body) {
+        ImFontConfig font;
+        font.SizePixels = size;
+        ImGui::GetIO().Fonts->AddFontDefault(&font);
+    }
+    g_display = AddFirst(display, size * 1.6f);
+    g_button = AddFirst(display, size * 1.25f);
+}
+
+// Banner palette: night navy, sodium-lamp amber, cold street blue, siren red/blue.
+constexpr ImU32 kAmber = IM_COL32(243, 178, 79, 255);
+constexpr ImU32 kNight = IM_COL32(9, 11, 20, 255);
+
+void Headline(const char *text) {
+    if (g_display) ImGui::PushFont(g_display);
+    ImGui::PushStyleColor(ImGuiCol_Text, kAmber);
+    ImGui::TextUnformatted(text);
+    ImGui::PopStyleColor();
+    if (g_display) ImGui::PopFont();
+}
+
+// Hazard stripe, like police caution tape across a crime scene.
+void Tape(ImDrawList *draw, ImVec2 a, ImVec2 b, float scale) {
+    draw->AddRectFilled(a, b, kAmber);
+    draw->PushClipRect(a, b, true);
+    const float step = 14 * scale, h = b.y - a.y;
+    for (float x = a.x - h; x < b.x + h; x += step * 2)
+        draw->AddQuadFilled({x, b.y}, {x + h, a.y}, {x + h + step, a.y}, {x + step, b.y}, kNight);
+    draw->PopClipRect();
+}
+
+// Night skyline with lit windows and sodium street glow.
+void Backdrop(ImDrawList *draw, ImVec2 size, float scale) {
+    draw->AddRectFilledMultiColor({0, 0}, size, IM_COL32(24, 33, 58, 255), IM_COL32(24, 33, 58, 255),
+                                  IM_COL32(6, 7, 12, 255), IM_COL32(6, 7, 12, 255));
+    draw->AddRectFilledMultiColor({0, size.y * 0.55f}, size, IM_COL32(243, 150, 60, 0), IM_COL32(243, 150, 60, 0),
+                                  IM_COL32(243, 150, 60, 50), IM_COL32(243, 150, 60, 50));
+    uint32_t seed = 0x7c15u;
+    const auto rnd = [&] {
+        seed = seed * 1664525u + 1013904223u;
+        return (seed >> 8) / float(1u << 24);
+    };
+    for (float x = 0; x < size.x;) {
+        const float w = (38 + rnd() * 70) * scale, h = (90 + rnd() * rnd() * 330) * scale;
+        const float top = size.y - h;
+        draw->AddRectFilled({x, top}, {x + w, size.y}, kNight);
+        if (rnd() < 0.25f) draw->AddLine({x + w / 2, top}, {x + w / 2, top - 26 * scale}, kNight, 2 * scale);
+        for (float wy = top + 8 * scale; wy < size.y - 6 * scale; wy += 11 * scale)
+            for (float wx = x + 6 * scale; wx < x + w - 8 * scale; wx += 9 * scale)
+                if (rnd() < 0.16f)
+                    draw->AddRectFilled({wx, wy}, {wx + 4 * scale, wy + 5 * scale},
+                                        rnd() < 0.8f ? IM_COL32(255, 210, 122, 150) : IM_COL32(159, 211, 255, 120));
+        x += w + rnd() * 6 * scale;
+    }
+}
+
+// Prints the window's logical, pixel and render sizes whenever any of them changes. The launcher runs
+// before the game log opens, so this goes to stderr through SDL_Log. It shows scaling mismatches (KDE
+// fractional scaling, a compositor resizing the window) that only appear on some desktops.
+void LogWindowGeometry(SDL_Window *window, SDL_Renderer *renderer) {
+    struct Geometry {
+        int w = 0, h = 0, pw = 0, ph = 0, rw = 0, rh = 0;
+        float density = 0, display = 0, rsx = 0, rsy = 0;
+        bool operator==(const Geometry &) const = default;
+    };
+    static Geometry last;
+    Geometry g;
+    SDL_GetWindowSize(window, &g.w, &g.h);
+    SDL_GetWindowSizeInPixels(window, &g.pw, &g.ph);
+    SDL_GetCurrentRenderOutputSize(renderer, &g.rw, &g.rh);
+    SDL_GetRenderScale(renderer, &g.rsx, &g.rsy);
+    g.density = SDL_GetWindowPixelDensity(window);
+    g.display = SDL_GetWindowDisplayScale(window);
+    if (g == last) return;
+    last = g;
+    const auto &io = ImGui::GetIO();
+    SDL_Log("launcher: window %dx%d, pixels %dx%d, render output %dx%d, render scale %.2fx%.2f, pixel density %.2f, "
+            "display scale %.2f, ImGui display %.0fx%.0f at %.2fx%.2f, video %s, renderer %s",
+            g.w, g.h, g.pw, g.ph, g.rw, g.rh, g.rsx, g.rsy, g.density, g.display, io.DisplaySize.x, io.DisplaySize.y,
+            io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y, SDL_GetCurrentVideoDriver(),
+            SDL_GetRendererName(renderer));
+}
+
+// TCNYC_LAUNCHER_SHOT=<file.bmp>: saves the backbuffer of the 30th frame, to check the layout on a
+// desktop whose windows cannot be captured from outside (Wayland over SSH).
+void SaveLauncherShot(SDL_Renderer *renderer) {
+    static const char *path = std::getenv("TCNYC_LAUNCHER_SHOT");
+    static int frame = 0;
+    if (!path || ++frame != 30) return;
+    if (SDL_Surface *shot = SDL_RenderReadPixels(renderer, nullptr)) {
+        SDL_Log("launcher: saved %dx%d frame to %s: %s", shot->w, shot->h, path,
+                SDL_SaveBMP(shot, path) ? "ok" : SDL_GetError());
+        SDL_DestroySurface(shot);
+    }
+}
+
+void Theme(float scale) {
+    auto &style = ImGui::GetStyle();
+    style.WindowPadding = {24, 18};
+    style.FramePadding = {12, 8};
+    style.ItemSpacing = {12, 10};
+    style.CellPadding = {8, 4};
+    style.FrameRounding = 2;
+    style.ChildRounding = 3;
+    style.PopupRounding = 6;
+    style.TabRounding = 5;
+    style.FrameBorderSize = 1;
+    style.ScaleAllSizes(scale);
+
+    auto *c = style.Colors;
+    c[ImGuiCol_WindowBg] = {0, 0, 0, 0};
+    c[ImGuiCol_ChildBg] = {0.035f, 0.043f, 0.075f, 0.88f};
+    c[ImGuiCol_PopupBg] = {0.05f, 0.06f, 0.10f, 0.98f};
+    c[ImGuiCol_Text] = {0.93f, 0.95f, 1.0f, 1};
+    c[ImGuiCol_TextDisabled] = {0.50f, 0.65f, 0.79f, 1};
+    c[ImGuiCol_Border] = c[ImGuiCol_Separator] = {0.95f, 0.70f, 0.31f, 0.35f};
+    c[ImGuiCol_FrameBg] = c[ImGuiCol_Button] = c[ImGuiCol_Tab] = {0.094f, 0.13f, 0.23f, 1};
+    c[ImGuiCol_FrameBgHovered] = c[ImGuiCol_ButtonHovered] = c[ImGuiCol_TabHovered] = {0.16f, 0.22f, 0.36f, 1};
+    c[ImGuiCol_FrameBgActive] = c[ImGuiCol_ButtonActive] = c[ImGuiCol_HeaderActive] = {0.22f, 0.29f, 0.46f, 1};
+    c[ImGuiCol_Header] = c[ImGuiCol_HeaderHovered] = {0.95f, 0.70f, 0.31f, 0.28f};
+    c[ImGuiCol_TabSelected] = {0.55f, 0.36f, 0.10f, 1};
+    c[ImGuiCol_TabSelectedOverline] = {1, 0.82f, 0.48f, 1};
+    c[ImGuiCol_CheckMark] = c[ImGuiCol_NavHighlight] = {1.0f, 0.82f, 0.48f, 1};
+}
+
+bool DrawLauncher(SDL_Window *window, SDL_Renderer *renderer, float scale, fs::path &location) {
+    app::Load();
+    Graphics graphics{app::Snapshot()};
+    graphics.window = window;
+    graphics.FindResolutions(window);
+    const auto preferences = PreferencesPath();
+    std::string iso, remembered_iso, notice, skip_version;
+    bool error = false, check_updates = true;
+    try {
+        const auto prefs = app::ReadSettingsTable(preferences);
+        iso = remembered_iso = prefs["iso"].value_or(std::string{});
+        check_updates = prefs["check_updates"].value_or(true);
+        skip_version = prefs["skip_version"].value_or(std::string{});
+    } catch (const std::exception &) {
+        notice = "Could not read the saved disc path.";
+        error = true;
+    }
+    // launcher.toml holds several values: update one and keep the rest
+    const auto save_pref = [&](const char *key, auto value) {
+        try {
+            toml::table edits;
+            edits.insert(key, value);
+            app::MergeSettingsTable(preferences, edits);
+        } catch (const std::exception &failure) {
+            notice = failure.what();
+            error = true;
+        }
+    };
+    Updater updater;
+    if (check_updates) updater.Check();
+
+    Picker picker;
+    SDL_Texture *banner = LoadBanner(renderer);
+    Controls controls;
+    bool play = false, quit = false;
+    SDL_Event event{};
+    bool waited_event = false;
+    uint64_t last_activity = SDL_GetTicks();
+    while (!play) {
+        while (waited_event || SDL_PollEvent(&event)) {
+            waited_event = false;
+            last_activity = SDL_GetTicks();
+            if (controls.Event(event, graphics.edits)) continue;
+            ImGui_ImplSDL3_ProcessEvent(&event);
+            if (event.type == SDL_EVENT_QUIT || event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) quit = true;
+            if (event.type == SDL_EVENT_DROP_FILE && event.drop.data) {
+                iso = event.drop.data;
+                notice.clear();
+            }
+        }
+
+        bool picking;
+        {
+            std::lock_guard lock(picker.mutex);
+            picking = picker.pending;
+            if (!picker.path.empty()) {
+                iso = std::move(picker.path);
+                picker.path.clear();
+                notice.clear();
+            }
+            if (!picker.error.empty()) {
+                notice = std::move(picker.error);
+                picker.error.clear();
+                error = true;
+            }
+        }
+        // Keep the callback state and its parent window alive until the native dialog returns.
+        if (quit && !picking) break;
+        if (quit) {
+            SDL_Delay(16);
+            continue;
+        }
+
+        ImGui_ImplSDLRenderer3_NewFrame();
+        ImGui_ImplSDL3_NewFrame();
+        ImGui::NewFrame();
+        LogWindowGeometry(window, renderer);
+        ImGui::SetNextWindowPos({0, 0});
+        ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
+        Backdrop(ImGui::GetBackgroundDrawList(), ImGui::GetIO().DisplaySize, scale);
+        ImGui::Begin("Launcher", nullptr,
+                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+        if (banner) {
+            float width = ImGui::GetContentRegionAvail().x;
+            ImGui::Image((ImTextureID)(intptr_t)banner, {width, width / 4});
         } else {
-            SetWindowTextW(window, kTitle);
-            Error(g_error.c_str());
+            ImGui::TextUnformatted(kTitle);
         }
-        return 0;
-    case WM_CLOSE:
-        if (g_installing) {
-            g_cancel.store(true);
-            SetWindowTextW(window, L"True Crime NYC Launcher - cancelling");
-            return 0;
+
+        // Update strip: shown only when there is something to say
+        {
+            const auto state = updater.state();
+            const std::string latest = updater.latest();
+            const bool show = (state == Updater::State::Available && latest != skip_version) ||
+                              state == Updater::State::Downloading || state == Updater::State::Staging ||
+                              state == Updater::State::Ready || state == Updater::State::Failed;
+            if (show) {
+                ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4{0.95f, 0.70f, 0.31f, 0.16f});
+                ImGui::PushStyleColor(ImGuiCol_Border, ImVec4{0.95f, 0.70f, 0.31f, 0.8f});
+                ImGui::BeginChild("update", {0, 0}, kChildBorder | ImGuiChildFlags_AutoResizeY |
+                                                        ImGuiChildFlags_AlwaysUseWindowPadding);
+                switch (state) {
+                case Updater::State::Available:
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::Text("Update available: v%s (you have v%s)", latest.c_str(), Updater::Current());
+                    ImGui::SameLine();
+                    if (ImGui::Button("Update now")) updater.Download();
+                    ImGui::SameLine();
+                    if (ImGui::Button("What's new")) SDL_OpenURL(Updater::kReleasesPage);
+                    ImGui::SameLine();
+                    if (ImGui::Button("Skip this version")) {
+                        skip_version = latest;
+                        save_pref("skip_version", latest);
+                    }
+                    break;
+                case Updater::State::Downloading: {
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::Text("Downloading v%s", latest.c_str());
+                    ImGui::SameLine();
+                    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4{0.95f, 0.70f, 0.31f, 1});
+                    ImGui::ProgressBar(updater.progress(), {ImGui::GetContentRegionAvail().x - 90 * scale, 0});
+                    ImGui::PopStyleColor();
+                    ImGui::SameLine();
+                    if (ImGui::Button("Cancel", {-1, 0})) updater.Cancel();
+                    break;
+                }
+                case Updater::State::Staging:
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::Text("Verifying and unpacking v%s...", latest.c_str());
+                    break;
+                case Updater::State::Ready:
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::Text("v%s is ready to install. Restart the launcher.", latest.c_str());
+                    ImGui::SameLine();
+                    if (ImGui::Button("Restart now")) {
+                        if (updater.Relaunch()) quit = true;
+                        else notice = "Could not restart; open the game again to use the update.";
+                    }
+                    break;
+                default:
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextColored({1, 0.49f, 0.51f, 1}, "%s", updater.error().c_str());
+                    ImGui::SameLine();
+                    if (ImGui::Button("Try again")) updater.Download();
+                    ImGui::SameLine();
+                    if (ImGui::Button("Releases page")) SDL_OpenURL(Updater::kReleasesPage);
+                    break;
+                }
+                ImGui::EndChild();
+                ImGui::PopStyleColor(2);
+            }
         }
-        break;
-    case WM_DESTROY:
-        PostQuitMessage(0);
-        return 0;
+        const bool updating =
+            updater.state() == Updater::State::Downloading || updater.state() == Updater::State::Staging;
+
+        bool graphics_tab = false;
+        const float panel_height = std::max(100.0f, ImGui::GetWindowHeight() - ImGui::GetCursorPosY() - 79 * scale);
+        const float tape_y = ImGui::GetCursorScreenPos().y;
+        Tape(ImGui::GetWindowDrawList(), {0, tape_y}, {ImGui::GetIO().DisplaySize.x, tape_y + 8 * scale}, scale);
+        ImGui::Dummy({0, 10 * scale});
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {18 * scale, 14 * scale});
+        ImGui::BeginChild("Launcher panel", {0, panel_height - 18 * scale},
+                          kChildBorder | ImGuiChildFlags_AlwaysUseWindowPadding);
+        ImGui::PopStyleVar();
+        if (ImGui::BeginTabBar("Launcher tabs")) {
+            if (ImGui::BeginTabItem("  PLAY  ")) {
+                ImGui::Spacing();
+                Headline("CASE FILE: THE DISC");
+                ImGui::TextDisabled("Point the precinct at your Xbox disc image, or drop the .iso on this window.");
+                ImGui::Spacing();
+                ImGui::BeginDisabled(picking);
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 114 * scale);
+                if (ImGui::InputTextWithHint("##iso", "Path to your Xbox ISO", &iso)) notice.clear();
+                ImGui::SameLine();
+                if (ImGui::Button("Browse...", {102 * scale, 0})) Browse(window, picker);
+                if (ImGui::Button("Use local assets")) {
+                    iso.clear();
+                    notice.clear();
+                }
+                ImGui::EndDisabled();
+                ImGui::TextDisabled("%s", iso.empty() ? "The game will look for an ISO or extracted files in assets/."
+                                                      : "The game will mount this ISO directly.");
+                ImGui::Spacing();
+                if (ImGui::Checkbox("Check for updates when the launcher opens", &check_updates)) {
+                    save_pref("check_updates", check_updates);
+                    if (check_updates && updater.state() == Updater::State::Idle) updater.Check();
+                }
+                ImGui::SameLine();
+                ImGui::TextDisabled("v%s", Updater::Current());
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("  GRAPHICS  ")) {
+                ImGui::Spacing();
+                Headline("THE STREETS: GRAPHICS");
+                graphics_tab = true;
+                ImGui::BeginChild("graphics scroll", {0, 0}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
+                graphics.Draw();
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("  CONTROLS  ")) {
+                ImGui::Spacing();
+                Headline("THE BADGE: CONTROLS");
+                graphics_tab = true;
+                ImGui::BeginChild("controls scroll", {0, 0}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
+                controls.Draw(scale, graphics.edits);
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            } else {
+                controls.key_row = controls.pad_row = -1;
+            }
+            ImGui::EndTabBar();
+        }
+        ImGui::EndChild();
+
+        ImGui::SetCursorPosY(std::max(ImGui::GetCursorPosY(), ImGui::GetWindowHeight() - 69 * scale));
+        const float width = ImGui::GetContentRegionAvail().x;
+        ImGui::BeginGroup();
+        const float actions_width = (graphics_tab ? 310 : 164) * scale;
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + width - actions_width);
+        ImGui::TextColored(error && !notice.empty() ? ImVec4{1, 0.49f, 0.51f, 1}
+                                                    : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled),
+                           "%s", notice.empty() ? "In-game graphics menu: F10 / Back + Start" : notice.c_str());
+        ImGui::PopTextWrapPos();
+        ImGui::EndGroup();
+        bool save = false;
+        if (graphics_tab) {
+            ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - 296 * scale);
+            ImGui::BeginDisabled(graphics.edits.empty());
+            save = ImGui::Button("Save settings", {132 * scale, 38 * scale});
+            ImGui::EndDisabled();
+        }
+        ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - 152 * scale);
+        ImGui::PushStyleColor(ImGuiCol_Button, {0.72f, 0.08f, 0.13f, 1});
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, {0.92f, 0.16f, 0.20f, 1});
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, {0.55f, 0.05f, 0.10f, 1});
+        ImGui::PushStyleColor(ImGuiCol_Border, {1, 0.82f, 0.48f, 0.9f});
+        ImGui::BeginDisabled(picking || updating);
+        if (g_button) ImGui::PushFont(g_button);
+        const bool launch = ImGui::Button("HIT THE STREETS", {152 * scale, 38 * scale});
+        if (g_button) ImGui::PopFont();
+        ImGui::EndDisabled();
+        ImGui::PopStyleColor(4);
+        ImGui::End();
+
+        if (save || launch) {
+            try {
+                auto chosen = launch && !iso.empty()
+                                  ? fs::absolute(fs::path(reinterpret_cast<const char8_t *>(iso.c_str())))
+                                  : fs::path{};
+                notice = launch && !chosen.empty() ? app::ValidateGameIso(chosen) : "";
+                error = !notice.empty();
+                if (!error) {
+                    graphics.Save();
+                    if (launch) {
+                        const auto selected = Utf8(chosen);
+                        if (selected != remembered_iso) save_pref("iso", selected);
+                        location = std::move(chosen);
+                        play = true;
+                    } else {
+                        notice = "Settings saved.";
+                    }
+                }
+            } catch (const std::exception &failure) {
+                notice = failure.what();
+                error = true;
+            }
+        }
+
+        ImGui::Render();
+        // The SDL_Renderer backend leaves vertex positions in window units and expects the renderer scaled
+        // to the backbuffer. With desktop scaling (KDE at 150%: a 760x620 window has a 1140x930 backbuffer)
+        // an unscaled renderer drew the launcher into the top-left two-thirds of its window.
+        const ImVec2 fb_scale = ImGui::GetIO().DisplayFramebufferScale;
+        SDL_SetRenderScale(renderer, fb_scale.x > 0 ? fb_scale.x : 1.0f, fb_scale.y > 0 ? fb_scale.y : 1.0f);
+        SDL_SetRenderDrawColor(renderer, 6, 7, 12, 255);
+        SDL_RenderClear(renderer);
+        ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), renderer);
+        SaveLauncherShot(renderer);
+        SDL_RenderPresent(renderer);
+        const bool busy = updating || updater.state() == Updater::State::Checking || picking || controls.Capturing();
+        if (!play && !busy && SDL_GetTicks() - last_activity >= 250)
+            waited_event = SDL_WaitEventTimeout(&event, 100);
+        else if (!play)
+            SDL_Delay(12);
     }
-    return DefWindowProcW(window, message, wParam, lParam);
+    SDL_DestroyTexture(banner);
+    return play;
 }
 
 } // namespace
 
-extern "C" int WINAPI RecompMain(HINSTANCE, HINSTANCE, PWSTR, int);
-
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR args, int show) {
-#if TCNYC_DEV_TOOLS
-    // dev builds: automated tests start the game without the launcher window
-    if (_wgetenv(L"XBE_DEV_SKIP_LAUNCHER")) return RecompMain(instance, previous, args, show);
-#endif
-    WNDCLASSW windowClass{};
-    windowClass.lpfnWndProc = WindowProc;
-    windowClass.hInstance = instance;
-    windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    windowClass.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(1));
-    windowClass.hbrBackground = GetSysColorBrush(COLOR_BTNFACE);
-    windowClass.lpszClassName = L"TrueCrimeNYCLauncher";
-    if (!RegisterClassW(&windowClass)) return Error(L"Could not initialize the launcher window.");
-
-    constexpr DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    RECT bounds{0, 0, 472, 125};
-    AdjustWindowRect(&bounds, style, FALSE);
-    HWND window =
-        CreateWindowW(windowClass.lpszClassName, L"True Crime NYC Launcher", style, CW_USEDEFAULT, CW_USEDEFAULT,
-                      bounds.right - bounds.left, bounds.bottom - bounds.top, nullptr, nullptr, instance, nullptr);
-    if (!window) return Error(L"Could not open the launcher window.");
-
-    ShowWindow(window, show);
-    SetFocus(GetDlgItem(window, kBrowse));
-    MSG message{};
-    while (GetMessageW(&message, nullptr, 0, 0) > 0) {
-        if (!IsDialogMessageW(window, &message)) {
-            TranslateMessage(&message);
-            DispatchMessageW(&message);
-        }
+bool Run(fs::path &location) {
+    input::SetHints();
+    constexpr auto subsystems = SDL_INIT_VIDEO | SDL_INIT_GAMEPAD;
+    if (!SDL_InitSubSystem(subsystems)) {
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, kTitle, SDL_GetError(), nullptr);
+        return false;
     }
-    if (g_install.joinable()) {
-        g_cancel.store(true);
-        g_install.join();
+    SDL_Window *window = SDL_CreateWindow(kTitle, 760, 620, SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_RESIZABLE);
+    SDL_Renderer *renderer = window ? SDL_CreateRenderer(window, nullptr) : nullptr;
+    bool play = false;
+    if (renderer) {
+        const float pixel_density = std::max(1.0f, SDL_GetWindowPixelDensity(window));
+        const float scale = std::max(1.0f, SDL_GetWindowDisplayScale(window) / pixel_density);
+        if (scale > 1.0f) SDL_SetWindowSize(window, int(760 * scale), int(620 * scale));
+        SDL_SetWindowMinimumSize(window, int(620 * scale), int(540 * scale));
+        IMGUI_CHECKVERSION();
+        ImGui::CreateContext();
+        auto &io = ImGui::GetIO();
+        io.IniFilename = nullptr;
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
+        LoadFont(16 * scale);
+        Theme(scale);
+        ImGui_ImplSDL3_InitForSDLRenderer(window, renderer);
+        ImGui_ImplSDLRenderer3_Init(renderer);
+        play = DrawLauncher(window, renderer, scale, location);
+        ImGui_ImplSDLRenderer3_Shutdown();
+        ImGui_ImplSDL3_Shutdown();
+        ImGui::DestroyContext();
+    } else {
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, kTitle, SDL_GetError(), window);
     }
-    return launchRequested ? RecompMain(instance, previous, args, show) : 0;
+    if (renderer) SDL_DestroyRenderer(renderer);
+    if (window) SDL_DestroyWindow(window);
+    SDL_QuitSubSystem(subsystems);
+    return play;
 }
+
+} // namespace launcher

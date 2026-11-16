@@ -20,6 +20,8 @@ case "$EPOCH" in
 esac
 export SOURCE_DATE_EPOCH=$EPOCH
 BUILD_TIME=$(date -u -d "@$EPOCH" '+%Y-%m-%dT%H:%M:%SZ')
+VERSION=$(tr -d '\r\n' < "$REPO/launcher/VERSION")
+test -n "$VERSION"
 
 if [ ! -f "$BUILD/TrueCrimeNYC" ]; then
     echo "Native build not found: $BUILD/TrueCrimeNYC" >&2
@@ -99,7 +101,7 @@ if [ -f "$BUILD/CMakeCache.txt" ]; then
                 exit 1
             fi
             install -m 0644 "${dlss_runtime[0]}" "$PKG/lib/"
-            ln -s "$(basename "${dlss_runtime[0]}")" "$PKG/lib/libnvidia-ngx-dlss.so"
+            install -m 0644 "${dlss_runtime[0]}" "$PKG/lib/libnvidia-ngx-dlss.so"
             install -m 0644 "$DLSS_SDK/LICENSE.txt" "$PKG/LICENSES/NVIDIA-RTX-SDK.txt"
         fi
     fi
@@ -127,7 +129,7 @@ GLIBC=$(objdump -T "$PKG/TrueCrimeNYC" | grep -oE 'GLIBC_[0-9.]+' | sort -V | ta
 [ -n "$GLIBC" ] || GLIBC=unknown
 {
     echo "True Crime: New York City - native Linux build"
-    echo "Version: 0.9.2.0"
+    echo "Version: $VERSION"
     echo "Built: $BUILD_TIME"
     echo "Git: $(git -C "$REPO" describe --always --dirty 2>/dev/null || echo unknown)"
     echo "GLIBC: $GLIBC"
@@ -144,6 +146,13 @@ done
 chmod 0755 "$PKG" "$PKG/lib" "$PKG/assets" "$PKG/LICENSES"
 
 mkdir -p "$OUT"
+if [[ -n $(find "$PKG" -type f \( -iname '*.xbe' -o -iname '*.iso' \) -print -quit) ]]; then
+    echo "The release staging directory contains game assets." >&2
+    exit 1
+fi
+printf 'tcnyc-update-1\n%s\n' "$VERSION" > "$PKG/UPDATE-PROTOCOL"
+(cd "$PKG" && find . -type f ! -name SHA256SUMS -printf '%P\0' | sort -z | xargs -0 sha256sum > SHA256SUMS)
+
 tar --sort=name --format=gnu --mtime="@$EPOCH" --owner=0 --group=0 --numeric-owner \
     -C "$STAGE" -cf - "$NAME" | gzip -n > "$OUT/$NAME.tar.gz"
 (cd "$OUT" && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256")

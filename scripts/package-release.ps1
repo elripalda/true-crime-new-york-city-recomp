@@ -40,6 +40,10 @@ function Add-ReleaseFile([string]$File, [string]$Entry) {
         throw "Missing release file: $File"
     }
     $source = (Resolve-Path -LiteralPath $File).Path
+    if ([IO.Path]::GetExtension($Entry) -in '.xbe', '.iso' -or
+        $Entry -match '(?i)(^|/)(generated|assets-pal)(/|$)') {
+        throw "Refusing to package game-derived input: $Entry"
+    }
     $zipEntry = $zip.CreateEntry($Entry, [IO.Compression.CompressionLevel]::Optimal)
     $zipEntry.LastWriteTime = $script:entryTime
     $input = [IO.File]::OpenRead($source)
@@ -202,8 +206,8 @@ try {
 
 # Compute provenance before the temporary archive exists in the repository, so
 # packaging itself cannot make the tree look dirty.
-$version = (Get-Item -LiteralPath $exe).VersionInfo.FileVersion
-if (!$version) { $version = 'unknown' }
+$version = (Get-Content -Raw -LiteralPath (Join-Path $root 'launcher/VERSION')).Trim()
+if (!$version) { throw 'launcher/VERSION is empty.' }
 try { $git = (git -C $root rev-parse --short HEAD 2>$null) } catch { $git = $null }
 if (!$git) { $git = 'unknown' }
 else {
@@ -263,6 +267,17 @@ try {
         try { $buildHash = -join ($sha.ComputeHash($buildBytes) | ForEach-Object { $_.ToString('x2') }) }
         finally { $sha.Dispose() }
         $hashLines.Add("$buildHash  BUILD.txt")
+
+        $protocol = [Text.Encoding]::ASCII.GetBytes("tcnyc-update-1`n$version`n")
+        $entry = $zip.CreateEntry('UPDATE-PROTOCOL')
+        $entry.LastWriteTime = $entryTime
+        $stream = $entry.Open()
+        try { $stream.Write($protocol, 0, $protocol.Length) } finally { $stream.Dispose() }
+        $protocolSha = [Security.Cryptography.SHA256]::Create()
+        try {
+            $protocolHash = [BitConverter]::ToString($protocolSha.ComputeHash($protocol)).Replace('-', '').ToLowerInvariant()
+        } finally { $protocolSha.Dispose() }
+        $hashLines.Add("$protocolHash  UPDATE-PROTOCOL")
 
         # Checksums of the files above, stored inside the archive. The checksum
         # file itself is not listed.
