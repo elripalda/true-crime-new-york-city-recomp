@@ -52,9 +52,16 @@ thread_local uint32_t t_vehicle = 0;
 thread_local bool t_allowed = false;
 constexpr uint32_t kActiveCarVtable = TC_ADDR(0x2D5A7C);
 constexpr uint32_t kTrafficCarVtable = TC_ADDR(0x2D9654);
-constexpr uint32_t kNight = TC_ADDR(0x363D3C);
+// Vehicle lamps. Before each body draw (0x13F585, 0x13F7A0) the dynamic-object draw sets material bit 0x8000 (lamps
+// lit) when the low 16 bits of [object+0x70] are below the night amount at 0x363D44, which climbs from 0 to 0xFFFF
+// through dusk and falls through dawn, so lamps come on object by object. [object+0x70] is the object's X position,
+// a float: its low bits change with every movement, so a moving car's lamps switch on and off every frame through
+// dusk and dawn. Distant cars drawn by the city instance draw get the bit from 0x136E70 the same way. The draws here
+// compare the night amount against a fixed number per object instead.
+constexpr uint32_t kNightAmount = TC_ADDR(0x363D44);
 constexpr uint32_t kMaterialFlags = TC_ADDR(0x3F54CC);
 constexpr uint16_t kNightLights = 0x8000;
+thread_local uint32_t t_lamp_object = 0;  // the object of the body draw running on this thread, 0 outside one
 
 bool AllowedType(uint32_t vtable) {
     static uint32_t list[16];
@@ -80,16 +87,23 @@ bool AllowedType(uint32_t vtable) {
     return false;
 }
 
-void ApplyCarNightLights(uint8_t *base) {
-    // Match the day/night switch used by the guest's separate lamp effects.
-    const uint16_t lights = X86_MEM8(kNight) ? kNightLights : 0;
+// a fixed 16-bit threshold for an object (its address, mixed), in place of the bits of its position
+uint16_t LampThreshold(uint32_t object) { return uint16_t((object * 0x9E3779B9u) >> 16); }
+
+void ApplyStableLamps(uint8_t *base) {
+    if (!t_lamp_object) return;
+    const uint16_t lights = LampThreshold(t_lamp_object) < X86_MEM16(kNightAmount) ? kNightLights : 0;
     X86_MEM16(kMaterialFlags) = (X86_MEM16(kMaterialFlags) & ~kNightLights) | lights;
 }
 
-void DrawCarWithStableLights(X86Context &ctx, uint8_t *base) {
+void DrawWithStableLamps(X86Context &ctx, uint8_t *base, uint32_t object) {
+    const uint32_t outer = t_lamp_object;
+    t_lamp_object = object;
+    ApplyStableLamps(base);
     const uint16_t flags = X86_MEM16(kMaterialFlags);
-    ApplyCarNightLights(base);
     __imp__sub_0021E1A0(ctx, base);
+    t_lamp_object = outer;
+    // the game's flags as the draw found them, with the stable lamp bit: the part draws that follow reuse them
     X86_MEM16(kMaterialFlags) = flags;
 }
 
@@ -130,7 +144,7 @@ X86_FUNC(sub_0009DDB0) {
     // The guest can replace the entire mask here, including the night bit set at draw entry.
     const bool setup_draw = X86_MEM32(ctx.esp + 4) == 16 && X86_MEM32(ctx.esp + 8) != 0;
     __imp__sub_0009DDB0(ctx, base);
-    if (setup_draw) ApplyCarNightLights(base);
+    if (setup_draw) ApplyStableLamps(base);
 }
 
 X86_EXTERN_FUNC(__imp__sub_0021C330);
@@ -172,8 +186,12 @@ X86_FUNC(sub_0021E1A0) {
                 for (uint32_t i = 0; i < n; ++i) LOGR("vehicles: vtable %08X drawn %u times", vts[i], counts[i]);
         }
     }
-    if (vt == kActiveCarVtable || vt == kTrafficCarVtable)
-        DrawCarWithStableLights(ctx, base);
+    // The callers that set the lamp bit from a moving value: the two body draws of the dynamic-object draw, and the
+    // city instance draw 0x1387F0 for an instance carrying an object (distant traffic cars, model 0x2DA270), whose
+    // bit comes from 0x136E70's test of the instance's +8 against the same night amount. All three pass the car
+    // object, so a car keeps one lamp state as it moves between the near and distant draws.
+    if (ret0 == TC_ADDR(0x13F5CA) || ret0 == TC_ADDR(0x13F7C2) || ret0 == TC_ADDR(0x1388AF))
+        DrawWithStableLamps(ctx, base, obj);
     else
         __imp__sub_0021E1A0(ctx, base);
     t_allowed = was;

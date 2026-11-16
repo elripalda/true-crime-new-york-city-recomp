@@ -156,6 +156,7 @@ constexpr uint32_t TC_ADDR(uint32_t usa) {
         case 0x00363D0Cu: return 0x003645CCu;
         case 0x00363D38u: return 0x003645F8u;
         case 0x00363D3Cu: return 0x003645FCu;
+        case 0x00363D44u: return 0x00364604u;
         case 0x00363D50u: return 0x00364610u;
         case 0x0036FE80u: return 0x00370740u;
         case 0x00373554u: return 0x00373E24u;
