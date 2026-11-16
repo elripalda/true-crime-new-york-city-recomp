@@ -163,8 +163,14 @@ uint32_t MsaaSamplesFromTable(const toml::table& table, uint32_t fallback) {
 
 toml::table ReadSettingsTable(const fs::path& path) {
     if (!fs::exists(path)) return {};
-    std::ifstream in(path, std::ios::binary);
-    if (!in) throw std::runtime_error("Could not read the settings file.");
+    std::ifstream in;
+    // A reader can catch the file while another process replaces it; retry a
+    // sharing violation briefly instead of failing the load.
+    for (int attempt = 0; attempt < 4 && !in.is_open(); ++attempt) {
+        in.open(path, std::ios::binary);
+        if (!in.is_open()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (!in.is_open()) throw std::runtime_error("Could not read the settings file.");
     return toml::parse(in);
 }
 

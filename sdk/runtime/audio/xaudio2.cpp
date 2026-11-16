@@ -6,9 +6,11 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <mmdeviceapi.h>
 #include <xaudio2.h>
 
 #include <atomic>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -36,6 +38,25 @@ struct Output : IXAudio2EngineCallback {
         if (engine) engine->Release();
     }
 };
+
+// The default render endpoint's id; empty when Core Audio cannot be read.
+std::wstring DefaultRenderDevice() {
+    IMMDeviceEnumerator* enumerator = nullptr;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator))))
+        return {};
+    std::wstring id;
+    IMMDevice* device = nullptr;
+    if (SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device))) {
+        LPWSTR text = nullptr;
+        if (SUCCEEDED(device->GetId(&text))) {
+            id = text;
+            CoTaskMemFree(text);
+        }
+        device->Release();
+    }
+    enumerator->Release();
+    return id;
+}
 
 }  // namespace
 
@@ -78,6 +99,8 @@ void StartOutput(std::function<void(float*, uint32_t)> render) {
         std::vector<float> bufs(kSlots * kFrames * 2);
         bool recovering = false;
         DWORD retry_delay = 250;
+        std::wstring device = DefaultRenderDevice();
+        DWORD device_checked = GetTickCount();
         for (;;) {
             {
                 Output output;
@@ -126,6 +149,17 @@ void StartOutput(std::function<void(float*, uint32_t)> render) {
                     operation = "engine callback";
                     hr = output.error.load();
                     if (FAILED(hr)) break;
+                    // Follow a change of Windows' default output device.
+                    if (GetTickCount() - device_checked >= 1000) {
+                        device_checked = GetTickCount();
+                        std::wstring now = DefaultRenderDevice();
+                        if (!now.empty() && !device.empty() && now != device) {
+                            LOGI("audio: default output changed, reopening XAudio2");
+                            hr = XAUDIO2_E_DEVICE_INVALIDATED;
+                            break;
+                        }
+                        if (!now.empty()) device = std::move(now);
+                    }
                     XAUDIO2_VOICE_STATE state{};
                     output.voice->GetState(&state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
                     const DWORD now = GetTickCount();

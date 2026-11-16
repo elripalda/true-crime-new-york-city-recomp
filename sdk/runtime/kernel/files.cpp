@@ -735,7 +735,7 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
     const char* mode = nullptr;
     // A read-only desired access must not ask the host for write permission: a
     // read-only asset would otherwise fail its first open.
-    const bool read_request = (access & 0x40000000u) == 0 && (access & 0x2u) == 0;
+    const bool read_request = access && (access & 0x40000000u) == 0 && (access & 0x2u) == 0;
     switch (disposition) {
         case 0:  // supersede
         case 5:  // overwrite if
@@ -828,7 +828,7 @@ KERNEL_EXPORT(202, NtOpenFile, 6) {
     f->dir = fs::is_directory(host, ec);
     f->read_only = t.read_only;
     if (!f->dir) {
-        const bool read_request = (access & 0x40000000u) == 0 && (access & 0x2u) == 0;
+        const bool read_request = access && (access & 0x40000000u) == 0 && (access & 0x2u) == 0;
         bool write = !t.read_only && !read_request;
         f->fp = OpenHostFile(host, write ? "r+b" : "rb");
         if (!f->fp && write) {
