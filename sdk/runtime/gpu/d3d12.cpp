@@ -78,6 +78,7 @@
 
 using Microsoft::WRL::ComPtr;
 
+extern uint32_t g_capture_caller[6];  // xdk/d3d8.cpp: guest caller chain of the current draw
 namespace gpu {
 
 // TCNYC_SAMPLE=1: a sampling profiler for the render thread, the Windows counterpart of the Linux one. A sampler
@@ -860,6 +861,7 @@ bool LatchCpuWrite(Target& t) {
 
 struct Tex {
     input::PromptStyle prompt_style = input::PromptStyle::Original;
+    uint32_t prompt_gen = 0;  // the bindings baked into a prompt atlas; 0 for any other texture
     ComPtr<ID3D12Resource> res;
     TextureDesc d;
     DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
@@ -1828,6 +1830,7 @@ private:
     struct Query {
         uint32_t index;
         float samples_per_pixel;  // host samples one console pixel covers
+        uint64_t serial;          // allocation order; index is serial % kQueries
     };
     struct Report {
         uint32_t va;
@@ -1837,8 +1840,9 @@ private:
     ComPtr<ID3D12QueryHeap> query_heap_;
     ComPtr<ID3D12Resource> query_rb_;
     const uint64_t* query_counts_ = nullptr;
-    uint32_t query_next_ = 0;
-    std::vector<Query> counted_;  // since the last ClearReport
+    uint64_t query_next_ = 0;  // serial of the next query; slots are reused as a ring
+    uint64_t pending_serial_ = 0;  // the serial BeginCountedDraw handed out, for EndCountedDraw
+    std::vector<Query> counted_;   // since the last ClearReport
     std::deque<Report> reports_;
     bool tearing_ = false;
     // Frames the CPU may queue ahead of the display: 3 as DXGI's default, 1 with the low latency setting. The
@@ -2270,7 +2274,7 @@ void D3D12Backend::PrepareAoPipelines() {
                                                    "AO occlusion resolve");
         ready = ready && occlusion;
         for (uint32_t mode : {1u, 2u}) {
-            const auto horizon = AoHorizonSource(mode, depth_ms);
+            const auto horizon = AoHorizonSource(mode, depth_ms, render_.ao_method == 1);
             const auto* gtao = EnsurePassPipeline(horizon.c_str(), "psmain", kAoFormat, -1, DXGI_FORMAT_UNKNOWN,
                                                   "GTAO horizon search");
             ready = ready && gtao;
@@ -3749,7 +3753,8 @@ ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, ID3DBlob* vs,
         const auto& b = d.BlendState.RenderTarget[0];
         const auto& r = d.RasterizerState;
         static int failed = 0;
-        if (failed++ < 16) LOGE("d3d12: pipeline creation failed (0x%08lX, device removed reason 0x%08lX): blend %d logic %d op %d src %d dst %d bop %d srcA %d dstA %d bopA %d "
+        if (failed++ < 16) {
+            LOGE("d3d12: pipeline creation failed (0x%08lX, device removed reason 0x%08lX): blend %d logic %d op %d src %d dst %d bop %d srcA %d dstA %d bopA %d "
                       "mask %X | fill %d cull %d bias %d clamp %.3f slope %.3f | rt %d fmt %d ds %d samples %d | depth %d "
                       "zfunc %d stencil %d sfunc %d", hr, dev_->GetDeviceRemovedReason(),
                   b.BlendEnable, b.LogicOpEnable, b.LogicOp, b.SrcBlend, b.DestBlend, b.BlendOp, b.SrcBlendAlpha,
@@ -3757,6 +3762,16 @@ ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, ID3DBlob* vs,
                   r.DepthBiasClamp, r.SlopeScaledDepthBias, d.NumRenderTargets, d.RTVFormats[0], d.DSVFormat,
                   d.SampleDesc.Count, d.DepthStencilState.DepthEnable, d.DepthStencilState.DepthFunc,
                   d.DepthStencilState.StencilEnable, d.DepthStencilState.FrontFace.StencilFunc);
+            LOGE("d3d12: failed pipeline %016llX at frame %llu, VS %016llX, PS %016llX, topology %u, GS %zu bytes, "
+                 "alpha-to-coverage %d, registers %04X",
+                 static_cast<unsigned long long>(h), static_cast<unsigned long long>(frame_),
+                 static_cast<unsigned long long>(k.vs), static_cast<unsigned long long>(k.ps),
+                 unsigned(d.PrimitiveTopologyType), d.GS.BytecodeLength,
+                 d.BlendState.AlphaToCoverageEnable, k.regs);
+            for (uint32_t i = 0; i < n; ++i)
+                LOGE("d3d12: failed pipeline input ATTR%u format %u slot %u offset %u", el[i].SemanticIndex,
+                     unsigned(el[i].Format), el[i].InputSlot, el[i].AlignedByteOffset);
+        }
     }
     psos_[h] = pso;
     if (pso) RecordPipelineKey(k, h);
@@ -4397,7 +4412,8 @@ void D3D12Backend::UploadTexture(Tex& tx, const TextureDesc& d, const FormatInfo
             uint32_t pitch;
             DecodeLevel(d, l, f, p, colours, px, pitch);
             if (ext_) ext_->Decoded(d, fi, f, l, px, pitch, tx.flags);
-            if (tx.prompt_style != input::PromptStyle::Original) ReplaceControllerGlyphs(px, pitch, tx.prompt_style);
+            if (tx.prompt_gen && (tx.prompt_style != input::PromptStyle::Original || input::PadRemapped()))
+                ReplaceControllerGlyphs(px, pitch, tx.prompt_style);
             UploadTextureLevel(tx, f, l, px, pitch);
         }
     }
@@ -4452,7 +4468,9 @@ ID3D12Resource* D3D12Backend::BindGuestTexture(const State& s, int stage, const 
     if (!same && !CreateTexture(tx, d, fi, key)) return nullptr;
     // cheap change check once per frame: lock epochs plus a sample of the bytes
     const auto prompt_style = IsPromptAtlas(d) ? input::ControllerPromptStyle() : input::PromptStyle::Original;
-    if (tx.frame != presents_ + 1 || !same || tx.palette != palette.hash || tx.prompt_style != prompt_style) {
+    const uint32_t prompt_gen = IsPromptAtlas(d) ? input::BindingGeneration() : 0;
+    if (tx.frame != presents_ + 1 || !same || tx.palette != palette.hash || tx.prompt_style != prompt_style ||
+        tx.prompt_gen != prompt_gen) {
         const uint64_t total = TotalSize(d);
         tx.frame = presents_ + 1;
         const bool palette_changed = tx.palette != palette.hash;
@@ -4470,9 +4488,10 @@ ID3D12Resource* D3D12Backend::BindGuestTexture(const State& s, int stage, const 
             sig = MemSig(d.data, total) ^ epoch ^ palette.hash;
         }
         tx.sig_epoch = epoch;
-        if (sig != tx.sig || !same || tx.prompt_style != prompt_style) {
+        if (sig != tx.sig || !same || tx.prompt_style != prompt_style || tx.prompt_gen != prompt_gen) {
             tx.changed = presents_;
             tx.prompt_style = prompt_style;
+            tx.prompt_gen = prompt_gen;
             PerfScope perf_up{g_perf.texup};
             g_perf.texups++;
             g_perf.texup_bytes += total;
@@ -5221,9 +5240,10 @@ void D3D12Backend::CaptureInputs(const State& s, const Assembled& a, const DrawC
 void D3D12Backend::CaptureDraw(const State& s, uint32_t prim, uint32_t count, const PsoKey& k, const DrawConstants& c,
                                const DrawTextures& stages, uint64_t vkey) {
     fprintf(cap_,
-            "%04u draw rt %08X ds %08X prim %u count %u vs %08X vk %016llX ps %08X blend %u %X %X zen %u %X zwrite %u "
+            "%04u draw from %08X<%08X<%08X<%08X<%08X<%08X rt %08X ds %08X prim %u count %u vs %08X vk %016llX ps %08X blend %u %X %X zen %u %X zwrite %u "
             "zbias %d %.2f cull %u cw %X c0 %.3f %.3f %.3f %.3f",
-            cap_i_++, s.rt.data, bound_ds_ ? s.zs.data : 0, prim, count, s.vs_handle, (unsigned long long)vkey,
+            cap_i_++, ::g_capture_caller[0], ::g_capture_caller[1], ::g_capture_caller[2], ::g_capture_caller[3],
+            ::g_capture_caller[4], ::g_capture_caller[5], s.rt.data, bound_ds_ ? s.zs.data : 0, prim, count, s.vs_handle, (unsigned long long)vkey,
             s.ps ? s.ps->handle : 0, k.blend,
             k.src, k.dst, k.zen, k.zfunc, k.zwrite, k.zbias, k.zslope, k.cull, k.wmask, c.pc[0][0], c.pc[0][1],
             c.pc[0][2], c.pc[0][3]);
@@ -5604,8 +5624,19 @@ bool D3D12Backend::EnsureQueries() {
 
 // a draw while the title counts visible pixels gets an occlusion query of its own, kNoQuery otherwise
 uint32_t D3D12Backend::BeginCountedDraw(const State& s) {
-    if (!s.simple[kMCountEnable >> 2] || !EnsureQueries() || query_next_ >= kQueries) return kNoQuery;
-    uint32_t query = query_next_++;
+    if (!s.simple[kMCountEnable >> 2] || !EnsureQueries()) return kNoQuery;
+    // A slot is free once no pending report or uncleared count still reads it. The ring used to rewind only
+    // when no report was pending at all, which under steady load never happened: it filled, every later
+    // visibility test counted nothing, and the title's light glows (car head and tail lights) blinked off.
+    uint64_t oldest = query_next_;
+    if (!reports_.empty() && !reports_.front().queries.empty()) oldest = reports_.front().queries.front().serial;
+    if (!counted_.empty()) oldest = std::min(oldest, counted_.front().serial);
+    if (query_next_ - oldest >= kQueries) {
+        LOG_FIRST(1, "d3d12: occlusion query ring full, a visibility test went uncounted");
+        return kNoQuery;
+    }
+    uint32_t query = uint32_t(query_next_ % kQueries);
+    pending_serial_ = query_next_++;
     cl_->BeginQuery(query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, query);
     return query;
 }
@@ -5615,7 +5646,7 @@ void D3D12Backend::EndCountedDraw(uint32_t query) {
     cl_->EndQuery(query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, query);
     uint64_t at = uint64_t(query) * sizeof(uint64_t);
     cl_->ResolveQueryData(query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, query, 1, query_rb_.Get(), at);
-    counted_.push_back({query, SamplesPerPixel()});
+    counted_.push_back({query, SamplesPerPixel(), pending_serial_});
 }
 
 // the console counts its own pixels: the bound target's scale and multisampling come out
@@ -5646,7 +5677,6 @@ void D3D12Backend::DeliverReports() {
         kernel::W32(r.va + kStatus, 0);
         reports_.pop_front();
     }
-    if (reports_.empty()) query_next_ = 0;  // no pending report references the query ring now
     if (cap_reports_left_) cap_reports_left_--;
 }
 
@@ -8360,7 +8390,7 @@ void D3D12Backend::RenderHalfAo(Target& t) {
     const float fov = game::g_camera_fov_degrees.load(std::memory_order_relaxed);
     if (fov > 1.0f && fov < 179.0f && aspect > 0.1f)
         tan_half_fov = std::tan(fov * 3.14159265f / 360.0f) / aspect;
-    const std::string shader = AoHorizonSource(render_.ao, depth_desc.SampleDesc.Count > 1);
+    const std::string shader = AoHorizonSource(render_.ao, depth_desc.SampleDesc.Count > 1, render_.ao_method == 1);
     if (!EnsurePassPipeline(shader.c_str(), "psmain", kAoFormat, -1, DXGI_FORMAT_UNKNOWN, "GTAO horizon search")) {
         static std::atomic<int> logged_pipe{0};
         if (logged_pipe.fetch_add(1, std::memory_order_relaxed) < 4)

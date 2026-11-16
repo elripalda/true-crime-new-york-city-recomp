@@ -12,6 +12,7 @@
 #include <smmintrin.h>
 
 #include <algorithm>
+#include <iterator>
 #include <bit>
 #include <chrono>
 #include <condition_variable>
@@ -161,9 +162,12 @@ public:
         // The worker owns the inner backend and touches this object's queue, mutexes and state:
         // join it instead of destroying those under a detached thread.
         if (thread_.joinable()) thread_.join();
+        delete cur_;
+        for (Batch* batch : free_) delete batch;
+        if (ring_) mem::FreeSystem(ring_);
     }
 
-    bool Init(uint32_t width, uint32_t height) override { return inner_->Init(width, height); }
+    bool Init(uint32_t width, uint32_t height) override { return ring_ && inner_->Init(width, height); }
 
     void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) override {
         const bool perf = diag::Perf();
@@ -232,12 +236,16 @@ public:
         const auto t = perf ? Clock::now() : Clock::time_point{};
         Cmd c{Op::Copy};
         c.a = count;
-        if (count && (uint64_t(count) * 16 > kHeaderRing || uint64_t(count) * 8 > kHeaderRing)) {
+        const uint64_t rect_bytes = src_rects ? uint64_t(count) * 16 : 0;
+        const uint64_t point_bytes = dst_points ? uint64_t(count) * 8 : 0;
+        const uint64_t scratch = AlignScratch(rect_bytes) + AlignScratch(point_bytes) + 2 * kHeaderSlot;
+        if (scratch > kHeaderRing) {
             LOG_FIRST(4, "render thread: CopyRects count %u does not fit the header ring", count);
             return;
         }
-        c.b = count && src_rects ? Scratch(kernel::HostPtr(src_rects), count * 16) : 0;
-        c.c = count && dst_points ? Scratch(kernel::HostPtr(dst_points), count * 8) : 0;
+        ReserveScratch(scratch);
+        c.b = rect_bytes ? Scratch(kernel::HostPtr(src_rects), uint32_t(rect_bytes)) : 0;
+        c.c = point_bytes ? Scratch(kernel::HostPtr(dst_points), uint32_t(point_bytes)) : 0;
         c.s1 = src;
         c.s1.header = Header(src.header);
         c.s2 = dst;
@@ -255,6 +263,7 @@ public:
         SnapshotCamera(presents_);  // the camera this frame was drawn with, for TAA on the render thread
         Cmd c{Op::Present};
         c.s1 = front;
+        ReserveScratch(kHeaderSlot);
         c.s1.header = Header(front.header);
         cur_->cmds.push_back(c);
         Use(front.header);
@@ -360,16 +369,31 @@ private:
         Wait(Submit(), WaitFor::ReadBack, "read-back");
     }
 
-    // bytes the render thread reads through a guest address, in the header ring
-    uint32_t Scratch(const void* p, uint32_t n) {
-        if (!ring_ || n > kHeaderRing) {
-            LOG_FIRST(4, "render thread: a %u byte header copy does not fit the ring", n);
-            return 0;
+    static uint64_t AlignScratch(uint64_t size) {
+        return (size + kHeaderSlot - 1) & ~uint64_t(kHeaderSlot - 1);
+    }
+
+    // Reserve before encoding a command so an entire copy fits even at wrap.
+    void ReserveScratch(uint64_t bytes) {
+        uint64_t start = ring_pos_;
+        if (start % kHeaderRing + bytes > kHeaderRing) start += kHeaderRing - start % kHeaderRing;
+        reservation_end_ = start + bytes;
+        if (current_scratch_ != UINT64_MAX && reservation_end_ - current_scratch_ > kHeaderRing) Submit();
+        if (submitted_scratch_ != UINT64_MAX && reservation_end_ - submitted_scratch_ > kHeaderRing) {
+            Wait(last_submitted_, WaitFor::Copy, "scratch ring");
+            submitted_scratch_ = UINT64_MAX;
         }
-        uint32_t size = (n + kHeaderSlot - 1) & ~(kHeaderSlot - 1);
-        if (ring_pos_ % kHeaderRing + size > kHeaderRing) ring_pos_ += kHeaderRing - ring_pos_ % kHeaderRing;
-        uint32_t at = ring_ + uint32_t(ring_pos_ % kHeaderRing);
-        ring_pos_ += size;
+        ring_pos_ = start;
+    }
+
+    uint32_t Scratch(const void* p, uint32_t n) {
+        current_scratch_ = std::min(current_scratch_, ring_pos_);
+        const uint32_t at = ring_ + uint32_t(ring_pos_ % kHeaderRing);
+        ring_pos_ += AlignScratch(n);
+        // Every command reserves its scratch first; writing past the reservation could overwrite bytes a
+        // queued batch still reads.
+        if (ring_pos_ > reservation_end_)
+            LOG_FIRST(4, "render thread: scratch copy of %u bytes ran past its reservation", n);
         std::memcpy(kernel::HostPtr(at), p, n);
         return at;
     }
@@ -385,11 +409,14 @@ private:
         Recent<HeaderCopy>& r = recent_headers_[(header >> 3) & 63];
         HeaderCopy& c = r.key == header ? *r.value : headers_[header];
         r = {header, &c};
-        if (c.made && !std::memcmp(c.bytes, now, kHeaderBytes) && ring_pos_ - c.made < kHeaderRing / 2) return c.at;
+        if (c.at && reservation_end_ - c.start <= kHeaderRing &&
+            ring_pos_ - c.start < kHeaderRing / 2 && !std::memcmp(c.bytes, now, kHeaderBytes)) {
+            current_scratch_ = std::min(current_scratch_, c.start);
+            return c.at;
+        }
+        c.start = ring_pos_;
         const uint32_t at = Scratch(now, kHeaderBytes);
-        if (!at) return header;
         c.at = at;
-        c.made = ring_pos_;
         std::memcpy(c.bytes, now, kHeaderBytes);
         return c.at;
     }
@@ -440,6 +467,8 @@ private:
 
     // what changed since the last command, in 64 byte pieces
     void SendState(const State& s) {
+        // one header copy per texture, palette and stream, plus the render target and depth surface
+        ReserveScratch((std::size(s.textures) + std::size(s.palettes) + s.streams.size() + 2) * kHeaderSlot);
         const uint8_t* now = reinterpret_cast<const uint8_t*>(&s);
         Cmd c{Op::State};
         size_t first = cur_->bytes.size();
@@ -488,6 +517,9 @@ private:
 
     uint64_t Submit() {
         uint64_t id = cur_->id;
+        last_submitted_ = id;
+        submitted_scratch_ = std::min(submitted_scratch_, current_scratch_);
+        current_scratch_ = UINT64_MAX;
         {
             std::lock_guard lock(m_);
             queue_.push_back(cur_);
@@ -598,7 +630,7 @@ private:
     // the title's thread
     struct HeaderCopy {
         uint32_t at = 0;
-        uint64_t made = 0;  // ring_pos_ after it was written
+        uint64_t start = 0;
         uint8_t bytes[kHeaderBytes];
     };
     std::unordered_map<uint32_t, HeaderCopy> headers_;
@@ -611,7 +643,8 @@ private:
     std::array<Recent<HeaderCopy>, 64> recent_headers_{};
     std::array<Recent<uint64_t>, 64> recent_uses_{};
     uint32_t ring_ = 0;
-    uint64_t ring_pos_ = 0;
+    uint64_t ring_pos_ = 0, reservation_end_ = 0;
+    uint64_t current_scratch_ = UINT64_MAX, submitted_scratch_ = UINT64_MAX, last_submitted_ = 0;
     Batch* cur_ = nullptr;
     State sent_;  // the state as the render thread will have it
     std::unordered_map<uint32_t, uint64_t> last_use_;

@@ -33,7 +33,7 @@
 using namespace kernel;
 
 std::atomic<uint64_t>& XbeDrawCalls();  // game draw calls (diagnostic)
-using XbeDrawProbeFn = void (*)(X86Context &, uint32_t vertex_buffer);
+using XbeDrawProbeFn = void (*)(X86Context &, uint32_t vertex_buffer, uint32_t count, uint32_t texture0);
 XbeDrawProbeFn &XbeDrawProbe();  // optional game-side probe on each draw (diagnostic)
 
 namespace dispatch {
@@ -1517,12 +1517,28 @@ HLE_STDCALL(D3DDevice_SetPixelShaderConstant, 3) {
 
 // drawing
 
+// Guest caller chain of the draw being submitted (return address, then ebp frames); the F3 capture prints it.
+uint32_t g_capture_caller[6];
+static void NoteDrawCaller(X86Context &ctx) {
+    uint8_t *base = mem::Base();
+    std::memset(g_capture_caller, 0, sizeof(g_capture_caller));
+    g_capture_caller[0] = mem::IsCommitted(ctx.esp) ? X86_MEM32(ctx.esp) : 0;
+    for (uint32_t ebp = ctx.ebp, n = 1; n < 6; ++n) {
+        if (ebp < 0x10000u || (ebp & 3u) || !mem::IsCommitted(ebp) || !mem::IsCommitted(ebp + 7)) break;
+        g_capture_caller[n] = X86_MEM32(ebp + 4);
+        const uint32_t next = X86_MEM32(ebp);
+        if (next <= ebp) break;
+        ebp = next;
+    }
+}
+
 HLE_STDCALL(D3DDevice_DrawVertices, 3) {
     ::XbeDrawCalls().fetch_add(1, std::memory_order_relaxed);
-    if (const XbeDrawProbeFn probe = ::XbeDrawProbe()) probe(ctx, R32(kStreams + XDK_Stream_Buffer));
+    if (const XbeDrawProbeFn probe = ::XbeDrawProbe()) probe(ctx, R32(kStreams + XDK_Stream_Buffer), a[2], g_state.textures[0]);
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     Walk(Dev(kDevPush));  // a visibility test begun since the last draw counts this one
     SyncDeferred();
+    NoteDrawCaller(ctx);
     if (g_backend) g_backend->Draw(g_state, a[0], a[1], a[2], nullptr);
     g_frame_draws++;
     gpu::RetainVertexAttributes(g_state, a[1], a[2], nullptr);
@@ -1531,10 +1547,11 @@ HLE_STDCALL(D3DDevice_DrawVertices, 3) {
 
 HLE_STDCALL(D3DDevice_DrawIndexedVertices, 3) {
     ::XbeDrawCalls().fetch_add(1, std::memory_order_relaxed);
-    if (const XbeDrawProbeFn probe = ::XbeDrawProbe()) probe(ctx, R32(kStreams + XDK_Stream_Buffer));
+    if (const XbeDrawProbeFn probe = ::XbeDrawProbe()) probe(ctx, R32(kStreams + XDK_Stream_Buffer), a[1], g_state.textures[0]);
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     Walk(Dev(kDevPush));
     SyncDeferred();
+    NoteDrawCaller(ctx);
     const uint8_t* indices = a[2] ? static_cast<const uint8_t*>(HostPtr(a[2])) : nullptr;
     if (g_backend) g_backend->Draw(g_state, a[0], 0, a[1], indices);
     g_frame_draws++;

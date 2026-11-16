@@ -4,6 +4,7 @@
 #include "gpu/vertex.h"
 
 #include <algorithm>
+#include <smmintrin.h>
 #include <bit>
 #include <cstring>
 #include <new>
@@ -347,9 +348,22 @@ bool Pretransformed(const State& s) {
 IndexBounds IndexRange(const uint8_t* ip, uint32_t count) {
     uint16_t lo16 = 0xFFFF;
     uint16_t hi16 = 0;
-    for (uint32_t i = 0; i < count; i++) {
+    uint32_t i = 0;
+    if (count >= 8) {
+        const __m128i ones = _mm_set1_epi16(-1);
+        __m128i low = ones;
+        __m128i high = _mm_setzero_si128();
+        for (; count - i >= 8; i += 8) {
+            const auto values = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ip + size_t(i) * 2));
+            low = _mm_min_epu16(low, values);
+            high = _mm_max_epu16(high, values);
+        }
+        lo16 = uint16_t(_mm_cvtsi128_si32(_mm_minpos_epu16(low)));
+        hi16 = uint16_t(~_mm_cvtsi128_si32(_mm_minpos_epu16(_mm_xor_si128(high, ones))));
+    }
+    for (; i < count; ++i) {
         uint16_t v;
-        std::memcpy(&v, ip + i * 2, 2);
+        std::memcpy(&v, ip + size_t(i) * 2, 2);
         lo16 = std::min(lo16, v);
         hi16 = std::max(hi16, v);
     }
@@ -508,7 +522,9 @@ int AddRepackedBuffer(const State& s, const Inputs& inputs, int stream, const Dr
     const uint8_t* data = static_cast<const uint8_t*>(HostPtr(mem::VirtualFromPhysical(R32(st.vb + kResData))));
     const int slot = int(out.buffer_count);
     auto& g = out.gathered[out.buffer_count];
-    g.assign(size_t(n) * packed, 0);
+    const size_t size = size_t(n) * packed;
+    if (nf == 1 && fields[0].dst == 0 && fields[0].bytes == packed) g.resize(size);
+    else g.assign(size, 0);
     for (uint32_t i = 0; i < n; i++) {
         const int64_t v = dense ? d.first_vertex + i : DrawVertex(s, d, i);
         if (v < 0) return -1;

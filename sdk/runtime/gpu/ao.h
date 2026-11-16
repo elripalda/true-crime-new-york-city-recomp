@@ -107,6 +107,64 @@ float FastAcos(float x) {
     const float r = (-0.156583 * a + 1.570796) * sqrt(1.0 - a);
     return x >= 0 ? r : 3.141593 - r;
 }
+// SSAO (app::Settings::ao_method 1, AO_SSAO): the earlier hemisphere kernel, restored as a choice beside GTAO.
+// About 17 depth reads per pixel; cheaper than GTAO but grainier. Shares the GTAO pass's blur and resolve.
+float AoFactor(float2 uv_in, uint2 pix) {
+    // Work at the centre of the depth texel actually read. At half resolution an AO pixel's
+    // centre falls between two depth texels; placing one texel's depth at that in-between spot
+    // put the point off its own surface by half a texel of depth, worst on grazing floors.
+    const float2 uv = (floor(uv_in / src.xy) + 0.5) * src.xy;
+    float z = LinearDepth(RawDepth(uv));
+    if (z >= src.w * 0.999) return 1.0;
+    float3 p = ViewAt(uv, z);
+    // Surface direction from the neighbour on the same surface: of each pair, the one with the
+    // smaller depth step. Central differences bend the normal across creases and curb edges,
+    // which sent samples into the surface and drew dark lines along every edge.
+    const float2 ox = float2(src.x, 0), oy = float2(0, src.y);
+    const float zr = LinearDepth(RawDepth(uv + ox)), zl = LinearDepth(RawDepth(uv - ox));
+    const float zd = LinearDepth(RawDepth(uv + oy)), zu = LinearDepth(RawDepth(uv - oy));
+    const float3 dx = abs(zr - z) < abs(z - zl) ? ViewAt(uv + ox, zr) - p : p - ViewAt(uv - ox, zl);
+    const float3 dy = abs(zd - z) < abs(z - zu) ? ViewAt(uv + oy, zd) - p : p - ViewAt(uv - oy, zu);
+    float3 n = normalize(cross(dx, dy));
+    if (dot(n, p) > 0.0) n = -n;
+    float3 t = normalize(cross(abs(n.z) < 0.99 ? float3(0, 0, 1) : float3(1, 0, 0), n));
+    float3 b = cross(n, t);
+    const float ang = (kRot4x4[(pix.y & 3) * 4 + (pix.x & 3)] + 0.5) / 16.0 * 6.2831853;
+    float cs = cos(ang), sn = sin(ang);
+    // 12 hemisphere directions on a spiral: three rings of four, short and steep to long and flat
+    static const float3 kernel[12] = {
+        float3(0.25, 0.0, 0.35), float3(0.0, 0.25, 0.35), float3(-0.25, 0.0, 0.35), float3(0.0, -0.25, 0.35),
+        float3(0.42, 0.42, 0.45), float3(-0.42, 0.42, 0.45), float3(-0.42, -0.42, 0.45), float3(0.42, -0.42, 0.45),
+        float3(0.0, 0.9, 0.3), float3(-0.9, 0.0, 0.3), float3(0.0, -0.9, 0.3), float3(0.9, 0.0, 0.3)
+    };
+    // The depth units are the title's w-buffer scale, not metres, so the radius is a fraction of
+    // the distance (ao.y scales it): about the same screen area near and far.
+    const float rad = ao.y * 0.05 * z;
+    float occlusion = 0.0;
+    float count = 0.0;
+    [unroll] for (int i = 0; i < 12; i++) {
+        float3 d = kernel[i];
+        d.xy = float2(d.x * cs - d.y * sn, d.x * sn + d.y * cs);
+        float3 sp = p + (t * d.x + b * d.y + n * d.z) * rad;
+        if (sp.z <= 0.001) continue;
+        float2 suv = float2(sp.x / (sp.z * ao.w * ao.z), -sp.y / (sp.z * ao.z)) * 0.5 + 0.5;
+        if (suv.x < 0 || suv.x > 1 || suv.y < 0 || suv.y > 1) continue;
+        // Test the pixel actually read, at its own 3D position: it occludes only if it rises above
+        // this surface's plane within the radius. Comparing the sample point's depth with the
+        // depth of the nearest pixel instead counted that pixel's grid offset on grazing floors
+        // as occlusion, which beat against the pixel grid as regular stripes.
+        const float2 cuv = (floor(suv / src.xy) + 0.5) * src.xy;
+        const float3 v = ViewAt(cuv, LinearDepth(RawDepth(cuv))) - p;
+        const float dist = length(v);
+        count += 1.0;
+        if (dist > 1e-6 && dist < rad) {
+            const float h = dot(v, n) / dist;  // sine of the occluder's elevation above the plane
+            if (h > 0.15) occlusion += (h - 0.15) / 0.85 * (1.0 - dist / rad);
+        }
+    }
+    return saturate(1.0 - (occlusion / max(count, 1.0)) * ao.x);
+}
+
 float AoGtao(float2 uv_in, uint2 pix) {
     // Work at the centre of the depth texel actually read. At half resolution an AO pixel's
     // centre falls between two depth texels; placing one texel's depth at that in-between spot
@@ -208,7 +266,11 @@ O vs(uint id : SV_VertexID) {
     return o;
 }
 float4 psmain(O i) : SV_Target {
+#ifdef AO_SSAO
+    float f = AoFactor(i.uv, uint2(i.p.xy));
+#else
     float f = AoGtao(i.uv, uint2(i.p.xy));
+#endif
     return float4(f, f, f, 1.0);
 }
 )";
@@ -320,8 +382,8 @@ float4 psmain(O i) : SV_Target {
 }
 )";
 
-inline std::string AoHorizonSource(uint32_t mode, bool depth_ms) {
-    return std::string("#define DEPTH_MS ") + (depth_ms ? "1\n" : "0\n") +
+inline std::string AoHorizonSource(uint32_t mode, bool depth_ms, bool ssao = false) {
+    return std::string(ssao ? "#define AO_SSAO 1\n" : "") + "#define DEPTH_MS " + (depth_ms ? "1\n" : "0\n") +
            "#define GTAO_SLICES 3\n#define GTAO_STEPS " + (mode == 1 ? "6\n" : "8\n") + kAoHlsl;
 }
 

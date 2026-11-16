@@ -23,6 +23,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <map>
 #include <mutex>
@@ -394,6 +395,7 @@ struct Tex {
     uint64_t sig_epoch = 0;       // the lock epoch with the signature
     uint64_t changed = 0;         // the frame its bytes last changed
     input::PromptStyle prompt_style = input::PromptStyle::Original;  // glyph set baked into the font atlas
+    uint32_t prompt_gen = 0;  // the bindings baked into it; 0 for any other texture
     // texture pack replacement: the key whose image is being loaded, and the ready image
     uint64_t pack_key = 0;
     uint32_t pack_gen = 0;
@@ -905,6 +907,15 @@ private:
     void LatchPackImage(Tex& tx);
     bool CreatePackTexture(Tex& r, texturedumper::Image& img);
     void ReleasePackTextures();
+    struct PaletteMemo {
+        uint32_t address = 0;
+        size_t bytes = 0;
+        uint64_t hash = 0;
+        std::array<uint32_t, 256> colours{};
+    };
+    std::array<PaletteMemo, 4> palette_memos_{};
+    const uint32_t* ReadStagePalette(const State& s, int stage, const TextureDesc& desc, uint32_t& va,
+                                     uint64_t& hash);
     VkSampler EnsureSampler(const State& s, int stage, const TexInfo& info, bool clamp, uint32_t levels);
     void WriteGuestPixels(Target* t, const uint8_t* src, uint32_t src_w, uint32_t src_h, uint32_t pitch);
 
@@ -961,6 +972,8 @@ private:
     VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
     // Pipeline creation may run concurrently. Snapshot both size and data under an exclusive lock.
     std::shared_mutex pipeline_cache_mutex_;
+    std::future<bool> pipeline_cache_write_;
+    uint32_t pipeline_cache_write_count_ = 0;
     std::atomic<uint32_t> pipeline_cache_new_{0};  // pipelines made since the last save (warm threads too)
     uint64_t pipeline_cache_quiet_since_ = 0;  // frames_ at the last one
     void OpenPipelineCache();
@@ -1002,6 +1015,8 @@ private:
     VkShaderModule PublishWarmModule(uint64_t key, VkShaderModule module);
     void LoadSavedPipelines();
     void SaveSavedPipelines(bool force);
+    std::future<bool> pipeline_keys_write_;
+    size_t pipeline_keys_drop_ = 0, pipeline_keys_count_ = 0;
     void RecordPipeline(const PsoKey& k, VkShaderModule vs, VkShaderModule ps);
     void StartPipelineWarm();
     void StopPipelineWarm();
@@ -1062,6 +1077,11 @@ private:
         return VK_IMAGE_ASPECT_DEPTH_BIT | (depth_has_stencil_ ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
     }
     VkFence fence_ = VK_NULL_HANDLE;
+    // The present pass records into its own buffer and fence, so Present can submit the scene without
+    // waiting and record the present pass while the GPU still runs it (TCNYC_VK_SYNC_PRESENT=1 waits as before).
+    VkCommandBuffer present_cmd_ = VK_NULL_HANDLE;
+    VkFence present_fence_ = VK_NULL_HANDLE;
+    void WaitSubmitted();  // waits for the last scene submission when it may still be running
     bool failed_ = false;  // a submit or acquire failure stops presenting instead of waiting on a dead fence
     bool recording_ = false;
     // dynamic state caching: these persist across render passes in one command buffer
@@ -1160,6 +1180,7 @@ private:
     VkShaderModule ao_occ_vs_ = VK_NULL_HANDLE, ao_occ_ps_ = VK_NULL_HANDLE;
     bool ao_pipe_depth_ms_ = false;
     uint32_t ao_pipe_mode_ = 0;
+    uint32_t ao_pipe_method_ = 0;  // app::Settings::ao_method the AO pipeline was built for (0 GTAO, 1 SSAO)
 
     // Progressive AO variants (as d3d12.cpp): the receiver (t4) and depth-prepass variants of the
     // draws the game is already making are compiled and their pipelines built on worker threads.
@@ -1968,11 +1989,33 @@ void VulkanBackend::OpenPipelineCache() {
     LOGR("vulkan: pipeline cache opened, %zu KB saved", data.size() / 1024);
 }
 
+namespace {
+template <typename Header>
+bool WritePipelineFile(const std::filesystem::path& file, const Header& header, const void* data, size_t size) {
+    std::error_code ec;
+    std::filesystem::create_directories(file.parent_path(), ec);
+    if (ec) return false;
+    auto temp = file;
+    temp += ".tmp." + std::to_string(::getpid());
+    FILE* out = std::fopen(temp.c_str(), "wb");
+    if (!out) return false;
+    const bool wrote = std::fwrite(&header, sizeof(header), 1, out) == 1 &&
+                       std::fwrite(data, 1, size, out) == size;
+    if (std::fclose(out) == 0 && wrote && std::rename(temp.c_str(), file.c_str()) == 0) return true;
+    std::remove(temp.c_str());
+    return false;
+}
+} // namespace
+
 // Writes the cache once a few seconds pass with no new pipeline (they come in bursts, at level loads and new
 // effects), so the copy does not land in the middle of one. force writes any change (at shutdown).
 void VulkanBackend::SavePipelineCache(bool force) {
     static std::mutex writing;  // the render thread and kernel::Shutdown's save share the temporary file
     std::lock_guard lock(writing);
+    if (pipeline_cache_write_.valid()) {
+        if (!force && pipeline_cache_write_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+        if (pipeline_cache_write_.get()) pipeline_cache_new_.fetch_sub(pipeline_cache_write_count_);
+    }
     if (!pipeline_cache_ || !pipeline_cache_new_) return;
     if (!force && frames_ - pipeline_cache_quiet_since_ < 300) return;  // 5 s at 60 FPS
     if (!force && warm_running_.load()) return;  // the warm threads are still adding; save once they finish
@@ -1991,21 +2034,22 @@ void VulkanBackend::SavePipelineCache(bool force) {
         bytes.resize(size);
         saved = pipeline_cache_new_.load();
     }
-    std::error_code ec;
-    std::filesystem::create_directories(root, ec);
-    const std::string file = (root / "pipelines.bin").string();
-    const std::string temp = file + ".tmp." + std::to_string(::getpid());
-    const PipelineFileHeader header{kPipelineCacheMagic, bytes.size(), Hash(bytes.data(), bytes.size())};
-    FILE* f = std::fopen(temp.c_str(), "wb");
-    if (!f) return;
-    const bool ok = std::fwrite(&header, sizeof(header), 1, f) == 1 &&
-                    std::fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size();
-    if (std::fclose(f) == 0 && ok && std::rename(temp.c_str(), file.c_str()) == 0) {
-        pipeline_cache_new_.fetch_sub(saved);
+    auto write = [file = root / "pipelines.bin", bytes = std::move(bytes)] {
+        const PipelineFileHeader header{kPipelineCacheMagic, bytes.size(), Hash(bytes.data(), bytes.size())};
+        if (!WritePipelineFile(file, header, bytes.data(), bytes.size())) return false;
         LOGI("vulkan: saved %zu KB of pipelines", bytes.size() / 1024);
-        return;
+        return true;
+    };
+    if (force) {
+        if (write()) pipeline_cache_new_.fetch_sub(saved);
+    } else {
+        pipeline_cache_write_count_ = saved;
+        try {
+            pipeline_cache_write_ = std::async(std::launch::async, std::move(write));
+        } catch (const std::system_error&) {
+            LOG_FIRST(2, "vulkan: could not start the pipeline cache writer");
+        }
     }
-    std::remove(temp.c_str());
 }
 
 namespace {
@@ -2049,31 +2093,36 @@ void VulkanBackend::RecordPipeline(const PsoKey& k, VkShaderModule vs, VkShaderM
 // Written once a few seconds pass with no new pipeline, like the cache; past the cap the oldest go
 void VulkanBackend::SaveSavedPipelines(bool force) {
     std::lock_guard lock(saved_mutex_);
+    const auto complete = [&] {
+        for (size_t i = 0; i < pipeline_keys_drop_; ++i) saved_pipeline_set_.erase(saved_pipelines_[i].key);
+        saved_pipelines_.erase(saved_pipelines_.begin(), saved_pipelines_.begin() + ptrdiff_t(pipeline_keys_drop_));
+        saved_pipelines_written_ = pipeline_keys_count_;
+    };
+    if (pipeline_keys_write_.valid()) {
+        if (!force && pipeline_keys_write_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+        if (pipeline_keys_write_.get()) complete();
+    }
     if (saved_pipelines_.size() == saved_pipelines_written_) return;
     if (!force && (frames_ - pipeline_cache_quiet_since_ < 300 || warm_running_.load())) return;
-    const std::filesystem::path root = CacheRoot();
+    const auto root = CacheRoot();
     if (root.empty()) return;
-    std::error_code ec;
-    std::filesystem::create_directories(root, ec);
-    const std::string file = (root / "pipelines.keys").string();
-    const std::string temp = file + ".tmp." + std::to_string(::getpid());
-    const size_t count = std::min(saved_pipelines_.size(), kMaxSavedPipelines);
-    const size_t drop = saved_pipelines_.size() - count;
-    const auto* records = saved_pipelines_.data() + drop;
-    const size_t bytes = count * sizeof(SavedPipeline);
-    const PipelineKeysHeader header{kPipelineKeysMagic, sizeof(SavedPipeline), bytes,
-                                    Hash(records, bytes)};
-    FILE* f = std::fopen(temp.c_str(), "wb");
-    if (!f) return;
-    const bool ok = std::fwrite(&header, sizeof(header), 1, f) == 1 &&
-                    std::fwrite(records, 1, bytes, f) == bytes;
-    if (std::fclose(f) == 0 && ok && std::rename(temp.c_str(), file.c_str()) == 0) {
-        for (size_t i = 0; i < drop; i++) saved_pipeline_set_.erase(saved_pipelines_[i].key);
-        saved_pipelines_.erase(saved_pipelines_.begin(), saved_pipelines_.begin() + ptrdiff_t(drop));
-        saved_pipelines_written_ = saved_pipelines_.size();
-        return;
+    pipeline_keys_count_ = std::min(saved_pipelines_.size(), kMaxSavedPipelines);
+    pipeline_keys_drop_ = saved_pipelines_.size() - pipeline_keys_count_;
+    std::vector<SavedPipeline> records(saved_pipelines_.begin() + ptrdiff_t(pipeline_keys_drop_), saved_pipelines_.end());
+    auto write = [file = root / "pipelines.keys", records = std::move(records)] {
+        const size_t bytes = records.size() * sizeof(SavedPipeline);
+        const PipelineKeysHeader header{kPipelineKeysMagic, sizeof(SavedPipeline), bytes, Hash(records.data(), bytes)};
+        return WritePipelineFile(file, header, records.data(), bytes);
+    };
+    if (force) {
+        if (write()) complete();
+    } else {
+        try {
+            pipeline_keys_write_ = std::async(std::launch::async, std::move(write));
+        } catch (const std::system_error&) {
+            LOG_FIRST(2, "vulkan: could not start the pipeline keys writer");
+        }
     }
-    std::remove(temp.c_str());
 }
 
 // TCNYC_PIPELINE_WARM=0 turns it off. The render passes are made here, on the render thread; CreatePipeline
@@ -3509,6 +3558,7 @@ bool VulkanBackend::CreateCommands() {    VkCommandPoolCreateInfo pool{VK_STRUCT
     alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     alloc.commandBufferCount = 1;
     if (vkAllocateCommandBuffers(device_, &alloc, &cmd_) != VK_SUCCESS) return false;
+    if (vkAllocateCommandBuffers(device_, &alloc, &present_cmd_) != VK_SUCCESS) return false;
     if (const char* enabled = std::getenv("TCNYC_DRAW_WORKER");
         (!enabled || std::atoi(enabled) != 0) &&
         vkCreateCommandPool(device_, &pool, nullptr, &draw_worker_pool_) == VK_SUCCESS) {
@@ -3531,6 +3581,7 @@ bool VulkanBackend::CreateCommands() {    VkCommandPoolCreateInfo pool{VK_STRUCT
     fence.flags = VK_FENCE_CREATE_SIGNALED_BIT;
     if (vkCreateSemaphore(device_, &sem, nullptr, &image_available_) != VK_SUCCESS) return false;
     if (vkCreateFence(device_, &fence, nullptr, &fence_) != VK_SUCCESS) return false;
+    if (vkCreateFence(device_, &fence, nullptr, &present_fence_) != VK_SUCCESS) return false;
     VkQueryPoolCreateInfo q{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
     q.queryType = VK_QUERY_TYPE_OCCLUSION;
     q.queryCount = kOcclusionQueries;
@@ -3864,6 +3915,7 @@ void VulkanBackend::Shutdown() {
         if (frame_image_) vkDestroyImage(device_, frame_image_, nullptr);
         if (frame_memory_) vkFreeMemory(device_, frame_memory_, nullptr);
         if (fence_) vkDestroyFence(device_, fence_, nullptr);
+        if (present_fence_) vkDestroyFence(device_, present_fence_, nullptr);
         if (query_pool_) vkDestroyQueryPool(device_, query_pool_, nullptr);
         if (image_available_) vkDestroySemaphore(device_, image_available_, nullptr);
         for (VkSemaphore s : render_done_)
@@ -3908,8 +3960,20 @@ void VulkanBackend::Shutdown() {
     if (instance_) vkDestroyInstance(instance_, nullptr);
 }
 
+void VulkanBackend::WaitSubmitted() {
+    if (failed_ || completed_serial_.load() >= submit_serial_) return;
+    const VkResult r = vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+    if (r != VK_SUCCESS) {
+        Fail("wait for scene", r);
+        return;
+    }
+    completed_serial_.store(submit_serial_);
+    draw_batch_next_ = 0;
+}
+
 void VulkanBackend::BeginRecord() {
     if (recording_) return;
+    WaitSubmitted();  // Present may have left the scene running on the GPU
     vkResetCommandBuffer(cmd_, 0);
     VkCommandBufferBeginInfo info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -4145,8 +4209,8 @@ void VulkanBackend::ResetFrame() {
 
 void VulkanBackend::GetReport(uint32_t report) {
     if (!report) return;
-    LOGR("linux: GetReport %08X recording %d pass %d queries %zu", report, int(recording_), int(pass_ != VK_NULL_HANDLE),
-         counted_.size());
+    LOG_FIRST(4, "linux: GetReport %08X recording %d pass %d queries %zu", report, int(recording_),
+              int(pass_ != VK_NULL_HANDLE), counted_.size());
     if (failed_) return;  // no submission will complete the queries
     // the console's GPU fills the report after the counted draws; finish them first
     if (recording_)
@@ -5101,11 +5165,12 @@ VkPipeline VulkanBackend::CreateAoPipeline(VkShaderModule vs, VkShaderModule ps,
 }
 
 bool VulkanBackend::EnsureAoPipelines(bool depth_ms) {
-    if (ao_gtao_pipe_ && ao_occ_pipe_ && ao_pipe_depth_ms_ == depth_ms && ao_pipe_mode_ == ao_mode_)
+    const uint32_t method = app::Snapshot().ao_method;
+    if (ao_gtao_pipe_ && ao_occ_pipe_ && ao_pipe_depth_ms_ == depth_ms && ao_pipe_mode_ == ao_mode_ && ao_pipe_method_ == method)
         return true;
     const VkRenderPass pass = AoColorPass();
     if (!pass) return false;
-    const std::string gtao = AoHorizonSource(ao_mode_, depth_ms);
+    const std::string gtao = AoHorizonSource(ao_mode_, depth_ms, method == 1);
     const std::string occ = AoResolveSource(depth_ms);
     VkShaderModule gvs = CompileShader(gtao, shaderc_vertex_shader, "vs");
     VkShaderModule gps = CompileShader(gtao, shaderc_fragment_shader, "psmain");
@@ -5134,6 +5199,7 @@ bool VulkanBackend::EnsureAoPipelines(bool depth_ms) {
     ao_occ_pipe_ = op;
     ao_pipe_depth_ms_ = depth_ms;
     ao_pipe_mode_ = ao_mode_;
+    ao_pipe_method_ = method;
     return true;
 }
 
@@ -6342,27 +6408,31 @@ std::vector<uint8_t> StagingBuffer(VkDevice dev, VkPhysicalDeviceMemoryPropertie
     return {};
 }
 
-void ReadStagePalette(const State& s, int stage, const TextureDesc& d, uint32_t colours[256], uint32_t& va,
-                      uint64_t& hash) {
-    constexpr uint32_t kFmtP8 = 0x0B;
-    va = 0;
-    hash = 0;
-    std::memset(colours, 0, 256 * 4);
-    uint32_t size_code = 0;
-    if (d.format != kFmtP8 || !s.palettes[size_t(stage)]) return;
-    const uint32_t header = s.palettes[size_t(stage)];
-    va = mem::VirtualFromPhysical(kernel::R32(header + 4));
-    if (!va || !mem::IsCommitted(va)) {
-        va = 0;
-        return;
-    }
-    size_code = kernel::R32(header) >> 30;
-    const size_t bytes = std::min<size_t>((256u >> std::min(size_code, 2u)) * sizeof(uint32_t), 1024);
-    std::memcpy(colours, kernel::HostPtr(va), bytes);
-    hash = Hash(colours, sizeof(uint32_t) * 256);
-}
-
 } // namespace
+
+const uint32_t* VulkanBackend::ReadStagePalette(const State& s, int stage, const TextureDesc& d,
+                                                uint32_t& va, uint64_t& hash) {
+    constexpr uint32_t kFmtP8 = 0x0B;
+    const uint32_t header = s.palettes[size_t(stage)];
+    if (d.format != kFmtP8 || !header) return nullptr;
+    const uint32_t address = mem::VirtualFromPhysical(kernel::R32(header + 4));
+    const size_t entries = 256u >> std::min(kernel::R32(header) >> 30, 2u);
+    const size_t bytes = entries * sizeof(uint32_t);
+    if (!address || uint64_t(address) + bytes > (1ull << 32) ||
+        !mem::IsCommitted(address) || !mem::IsCommitted(address + uint32_t(bytes - 1))) return nullptr;
+    auto& memo = palette_memos_[size_t(stage)];
+    const auto* source = kernel::HostPtr(address);
+    if (memo.address != address || memo.bytes != bytes || std::memcmp(memo.colours.data(), source, bytes)) {
+        std::memcpy(memo.colours.data(), source, bytes);
+        std::fill(memo.colours.begin() + entries, memo.colours.end(), 0u);
+        memo.address = address;
+        memo.bytes = bytes;
+        memo.hash = Hash(memo.colours.data(), sizeof(memo.colours));
+    }
+    va = address;
+    hash = memo.hash;
+    return memo.colours.data();
+}
 
 // A surface reused at another size or format: its old images, views and framebuffers may still be
 // referenced by the frame being recorded, so they are moved to the retire lists (freed after the
@@ -7162,10 +7232,9 @@ Tex* VulkanBackend::EnsureTexture(const State& s, int stage, bool* is_target) {
             return it->second;
         }
     }
-    uint32_t colours[256];
     uint32_t palette_va = 0;
     uint64_t palette_hash = 0;
-    ReadStagePalette(s, stage, d, colours, palette_va, palette_hash);
+    const uint32_t* colours = ReadStagePalette(s, stage, d, palette_va, palette_hash);
     TexKey key{};
     key.data = d.data;
     key.format = d.format;
@@ -7243,7 +7312,9 @@ Tex* VulkanBackend::EnsureTexture(const State& s, int stage, bool* is_target) {
     // a texture rewritten in place without a lock mark is still uploaded
     // the button-glyph atlas is uploaded again when the active input device changes
     const auto prompt_style = IsPromptAtlas(d) ? input::ControllerPromptStyle() : input::PromptStyle::Original;
-    if (!same || t->frame != frames_ + 1 || t->palette != palette_hash || t->prompt_style != prompt_style) {
+    const uint32_t prompt_gen = IsPromptAtlas(d) ? input::BindingGeneration() : 0;
+    if (!same || t->frame != frames_ + 1 || t->palette != palette_hash || t->prompt_style != prompt_style ||
+        t->prompt_gen != prompt_gen) {
         t->frame = frames_ + 1;
         const bool palette_changed = t->palette != palette_hash;
         t->palette = palette_hash;
@@ -7258,10 +7329,11 @@ Tex* VulkanBackend::EnsureTexture(const State& s, int stage, bool* is_target) {
                               ((frames_ + (d.data >> 8)) & 3) == 0;
         const uint64_t sig = hash_now ? MemSig(d.data, TotalSize(d)) ^ epoch ^ palette_hash : t->sig;
         t->sig_epoch = epoch;
-        if (!same || sig != t->sig || t->prompt_style != prompt_style) {
+        if (!same || sig != t->sig || t->prompt_style != prompt_style || t->prompt_gen != prompt_gen) {
             t->changed = frames_;
             t->sig = sig;
             t->prompt_style = prompt_style;
+            t->prompt_gen = prompt_gen;
 
             SplitScope upload(split_on, &splits_ms_, "  (in textures) upload");
             if (split_on) {
@@ -7273,16 +7345,16 @@ Tex* VulkanBackend::EnsureTexture(const State& s, int stage, bool* is_target) {
                 u.h = d.height;
                 u.format = d.format;
             }
-            UploadTexture(t, d, palette_va ? colours : nullptr, depth_tex);
+            UploadTexture(t, d, colours, depth_tex);
             t->pack_gen = 0;  // new bytes: the pack and dump key is taken again
             t->swap = nullptr;
         }
     }
     // texture packs: a pack image is drawn in place of the guest bytes once it has loaded
     if (t->pack_gen != texturedumper::Generation())
-        LatchPackKey(*t, d, fi, palette_va ? colours : nullptr);
+        LatchPackKey(*t, d, fi, colours);
     if (t->pack_key) LatchPackImage(*t);
-    if (!palette_va && prompt_style == input::PromptStyle::Original) tex_this_frame_[fast_key] = t;
+    if (!palette_va && !prompt_gen) tex_this_frame_[fast_key] = t;
     return t;
 }
 
@@ -7402,8 +7474,8 @@ bool VulkanBackend::CreatePackTexture(Tex& r, texturedumper::Image& img) {
     EndRecord(true);
     BeginRecord();
     Transition(r.image, r.layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, r.format, r.levels);
-    for (const VkBufferImageCopy& copy : copies)
-        vkCmdCopyBufferToImage(cmd_, buffer, r.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    vkCmdCopyBufferToImage(cmd_, buffer, r.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           uint32_t(copies.size()), copies.data());
     Transition(r.image, r.layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, r.format, r.levels);
     EndRecord(true);
     vkUnmapMemory(device_, memory);
@@ -7618,7 +7690,8 @@ void VulkanBackend::UploadTexture(Tex* t, const TextureDesc& d, const uint32_t* 
                     images.push_back({});
                 }
             } else {
-                if (t->prompt_style != input::PromptStyle::Original) ReplaceControllerGlyphs(px, pitch, t->prompt_style);
+                if (t->prompt_gen && (t->prompt_style != input::PromptStyle::Original || input::PadRemapped()))
+                    ReplaceControllerGlyphs(px, pitch, t->prompt_style);
                 images.push_back(px);
             }
             VkBufferImageCopy copy{};
@@ -7648,8 +7721,8 @@ void VulkanBackend::UploadTexture(Tex* t, const TextureDesc& d, const uint32_t* 
     FlushPass();
     BeginRecord();
     Transition(t->image, t->layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, t->format, t->levels, t->layers);
-    for (const VkBufferImageCopy& copy : copies)
-        vkCmdCopyBufferToImage(cmd_, staging.buffer, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    vkCmdCopyBufferToImage(cmd_, staging.buffer, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           uint32_t(copies.size()), copies.data());
     Transition(t->image, t->layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, t->format, t->levels, t->layers);
     tex_uploads_++;
 }
@@ -10477,7 +10550,11 @@ void VulkanBackend::Present(const Surface& front) {
     SnapshotCamera(frames_);  // the camera this frame was drawn with, for TAA (one frame ahead; see ApplyTaa)
     if (draw_log_) std::fprintf(draw_log_, "FRAME %llu\n", frames_ + 1);
     FlushPass();
-    EndRecord(true);
+    // The scene is submitted without waiting: the CPU records the present pass while the GPU runs it.
+    // Its upload ring, descriptor sets and draw batches are reused only after the present fence below,
+    // which also covers the scene (a fence signal waits for all earlier submissions on the queue).
+    static const bool sync_present = std::getenv("TCNYC_VK_SYNC_PRESENT") != nullptr;
+    EndRecord(sync_present);
     // every path must clear the per-frame rings, even when the front buffer cannot be read
     struct FrameEnd {
         VulkanBackend* self;
@@ -10486,13 +10563,17 @@ void VulkanBackend::Present(const Surface& front) {
             if (!finished) self->ResetFrame();
         }
     } frame_end{this};
+    // an early return must not reset the rings under a running scene: wait first (runs before FrameEnd)
+    struct SceneWait {
+        VulkanBackend* self;
+        ~SceneWait() { self->WaitSubmitted(); }
+    } scene_wait{this};
     if (failed_) return;  // a dead fence is never waited on again
     // a previous resize may have failed: retry before acquiring from a null or partial swapchain
     if ((!swapchain_ || swap_framebuffers_.empty() || render_done_.empty()) && !CreateSwapchain()) return;
     const float want_scale = app::RenderScale(height_);
     const float want_stretch = app::RenderStretch(width_, height_);
     if (std::fabs(want_scale - scale_) > 1e-4f || std::fabs(want_stretch - stretch_) > 1e-4f) {
-        vkDeviceWaitIdle(device_);
         scale_ = want_scale;
         stretch_ = want_stretch;
         bound_pipe_ = VK_NULL_HANDLE;
@@ -10504,7 +10585,6 @@ void VulkanBackend::Present(const Surface& front) {
             ? PickSampleCount(app::MsaaSamples(), color_samples_ & depth_samples_)
             : 1;
     if (want_msaa != msaa_) {
-        vkDeviceWaitIdle(device_);
         msaa_ = want_msaa;
         bound_pipe_ = VK_NULL_HANDLE;
         viewport_valid_ = false;
@@ -10711,13 +10791,10 @@ void VulkanBackend::Present(const Surface& front) {
     RenderUi();
 
     if (!swapchain_) return;
-    VkResult r = vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
-    if (r != VK_SUCCESS) {
-        Fail("wait for present fence", r);
-        return;
-    }
+    // Scene and readback submissions above are synchronous. The previous
+    // present retires its fence before resetting the frame's upload buffers.
     uint32_t image = 0;
-    r = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, image_available_, VK_NULL_HANDLE, &image);
+    VkResult r = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, image_available_, VK_NULL_HANDLE, &image);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         vkDeviceWaitIdle(device_);
         if (!CreateSwapchain()) LOGE("vulkan: could not rebuild the swapchain");
@@ -10734,6 +10811,16 @@ void VulkanBackend::Present(const Surface& front) {
         return;
     }
 
+    // the present pass records into its own buffer and fence; restored on every path out
+    std::swap(cmd_, present_cmd_);
+    std::swap(fence_, present_fence_);
+    struct PresentBuffers {
+        VulkanBackend* self;
+        ~PresentBuffers() {
+            std::swap(self->cmd_, self->present_cmd_);
+            std::swap(self->fence_, self->present_fence_);
+        }
+    } present_buffers{this};
     r = vkResetFences(device_, 1, &fence_);
     if (r != VK_SUCCESS) {
         Fail("reset present fence", r);
@@ -11105,7 +11192,10 @@ void VulkanBackend::Present(const Surface& front) {
             Fail("wait for present fence", wait_result);
         else
             waited = true;
-        if (waited) draw_batch_next_ = 0;
+        if (waited) {
+            draw_batch_next_ = 0;
+            completed_serial_.store(submit_serial_);  // the present fence covers the scene submitted before it
+        }
         if (perf_)
             perf_wait_ms_ +=
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_at).count();

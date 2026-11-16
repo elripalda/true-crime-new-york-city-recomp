@@ -10,6 +10,8 @@
 #include "dev/dev.h"
 #ifdef _WIN32
 #include <windows.h>
+#include "core/diag.h"
+#include "gpu/backend.h"
 #endif
 #endif
 
@@ -117,6 +119,11 @@ bool GameplayCameraActive() {
 namespace {
 bool GameMessage(void *window, uint32_t msg, uintptr_t wp, intptr_t lp, intptr_t *result) {
 #if TCNYC_DEV_TOOLS && defined(_WIN32)
+    if (msg == WM_KEYDOWN && wp == VK_F3 && !diag::CaptureDir().empty()) {
+        if (!(lp & (1 << 30))) gpu::g_capture.store(true);
+        *result = 0;
+        return true;
+    }
     if (msg == WM_KEYDOWN && wp == VK_F7 && !(lp & (1 << 30)) && game::RequestStraightDrive()) {
         *result = 0;
         return true;
@@ -149,11 +156,9 @@ const app::GameInfo app::kGame = {
                 {"mouse_sensitivity_percent", nullptr, &input::g_mouse_sensitivity_percent},
                 {"mouse_vertical_sensitivity_percent", nullptr, &input::g_mouse_vertical_sensitivity_percent},
                 {"direct_mouse_aim", &input::g_direct_mouse_aim, nullptr},
-                {"prompt_style", nullptr, &input::g_prompt_override},
-                {"reload_key", nullptr, &input::g_reload_key}, {"heavy_attack_key", nullptr, &input::g_heavy_attack_key},
-                {"use_key", nullptr, &input::g_use_key}, {"climb_key", nullptr, &input::g_climb_key}},
-    .load = nullptr,                      // reads more from the settings file's toml::table
-    .save = nullptr,                      // writes more into it
+                {"prompt_style", nullptr, &input::g_prompt_override}},
+    .load = input::LoadBindings,          // [controls], and the older letter keys
+    .save = input::SaveBindings,
     .init = InitVibrationProfile,         // after the settings load, before the window and boot
     .loaded = nullptr,                    // image in memory, before its entry point runs
     .window = nullptr,                    // the game window is up
