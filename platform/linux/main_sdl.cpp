@@ -17,6 +17,8 @@
 #include "gpu/backend.h"
 #include "image_symbols.h"
 #include "kernel/kernel.h"
+#include "launcher.h"
+#include "updater.h"
 
 namespace app {
 void SetWindow(SDL_Window* window);
@@ -26,7 +28,7 @@ void SetSuspended(bool suspended);
 }
 namespace audio {
 void SetSuspended(bool suspended);
-void DeviceChanged();
+void DeviceChanged(bool removed);
 }
 namespace input {
 void Init();
@@ -38,12 +40,20 @@ void OnSignal(int) { g_quit = 1; }
 } // namespace
 
 int main(int argc, char** argv) {
+    if (const auto handled = launcher::Updater::HandleStartup(argc > 1 ? argv[1] : "")) return *handled;
     std::string location;  // the game's folder or its disc image; empty: assets beside the executable
+    bool skip_launcher = false;
     for (int i = 1; i < argc; ++i) {
         if ((!std::strcmp(argv[i], "--assets") || !std::strcmp(argv[i], "--iso")) && i + 1 < argc) location = argv[++i];
-        else if (!std::strcmp(argv[i], "--instance") && i + 1 < argc) setenv("INSTANCE", argv[++i], 1);
+        else if (!std::strcmp(argv[i], "--instance") && i + 1 < argc) {
+            setenv("INSTANCE", argv[++i], 1);
+            skip_launcher = true;
+        } else if (!std::strcmp(argv[i], "--skip-launcher")) skip_launcher = true;
         else if (argv[i][0] != '-') location = argv[i];
     }
+
+    std::filesystem::path source = location;
+    if (!skip_launcher && source.empty() && !launcher::Run(source)) return 0;
 
     // the settings decide the window, so the log and settings load come first
     std::string log_name = app::kGame.log;
@@ -67,7 +77,7 @@ int main(int argc, char** argv) {
 
     app::GameFiles game;
     std::string game_error;
-    if (!app::FindGame(game, &game_error, location)) {
+    if (!app::FindGame(game, &game_error, source)) {
         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "True Crime NYC", game_error.c_str(), nullptr);
         SDL_Quit();
         return 1;
@@ -184,8 +194,9 @@ int main(int argc, char** argv) {
                     app::RefreshDesktop();
                     LOGR("linux: returning to foreground, game resumed");
                     break;
+                case SDL_EVENT_AUDIO_DEVICE_ADDED:
                 case SDL_EVENT_AUDIO_DEVICE_REMOVED:
-                    audio::DeviceChanged();
+                    if (!event.adevice.recording) audio::DeviceChanged(event.type == SDL_EVENT_AUDIO_DEVICE_REMOVED);
                     break;
                 default:
                     break;
