@@ -678,62 +678,70 @@ void ApplyPackage(const fs::path& root) {
     std::vector<fs::path> created_directories;
     try {
         const auto files = InspectPackage(root, staged, release);
+        // Files the previous package installed and this one no longer contains. They
+        // are backed up and journaled like replaced files, so an interrupted or failed
+        // apply restores them with the rest of the install.
+        std::map<std::string, fs::path> current;
+        std::ostringstream installed;
+        for (const auto& file : files) {
+            const std::string name = Utf8(file.relative);
+            current.emplace(AsciiLower(name), file.relative);
+            installed << name << '\n';
+        }
+        std::vector<fs::path> dropped;
+        for (const auto& name : previous) {
+            const fs::path relative = PathFromUtf8(name);
+            if (!SafeRelative(relative) || Protected(AsciiLower(Utf8(*relative.begin())))) continue;
+            const auto replacement = current.find(AsciiLower(Utf8(relative)));
+            if (replacement != current.end() && replacement->second == relative) continue;
+            if (!fs::is_regular_file(CheckTarget(root, relative))) continue;
+            if (replacement != current.end()) {
+                // A case-only rename: on a case-insensitive install both names are the same
+                // file, which the package replaces. On a case-sensitive install the new
+                // name does not exist yet, or is a different file, and the old one goes.
+                std::error_code ec;
+                const auto other = root / replacement->second;
+                const bool other_exists = fs::exists(other, ec);
+                if (ec) continue;
+                if (other_exists && (fs::equivalent(root / relative, other, ec) || ec)) continue;
+            }
+            dropped.push_back(relative);
+        }
         RemoveTree(update, "backup");
         fs::create_directory(update / "backup");
         std::ostringstream journal_text;
-        for (const auto& file : files) {
-            journal_text << file.existed << '\t' << Utf8(file.relative) << '\n';
-            if (!file.existed) continue;
-            EnsureDirectories(update / "backup", file.relative.parent_path());
-            const auto backup = update / "backup" / file.relative;
-            fs::copy_file(root / file.relative, backup);
+        auto back_up = [&](const fs::path& relative) {
+            EnsureDirectories(update / "backup", relative.parent_path());
+            const auto backup = update / "backup" / relative;
+            fs::copy_file(root / relative, backup);
             SyncFile(backup);
             SyncDirectory(backup.parent_path());
+        };
+        for (const auto& file : files) {
+            journal_text << file.existed << '\t' << Utf8(file.relative) << '\n';
+            if (file.existed) back_up(file.relative);
+        }
+        for (const auto& relative : dropped) {
+            journal_text << "1\t" << Utf8(relative) << '\n';
+            back_up(relative);
         }
         const auto temp = update / "publishing";
         if (fs::is_regular_file(CheckedStatus(temp))) fs::remove(temp);
         PublishText(update / "active", journal_text.str());
         journal = true;
+        // Dropped files go first, under the journal: a failure from here on restores them.
+        std::string kept;  // dropped files that could not be removed, for the next update to retry
+        for (const auto& relative : dropped) {
+            std::error_code ec;
+            if (fs::remove(root / relative, ec)) SyncDirectory((root / relative).parent_path());
+            else if (ec) kept += Utf8(relative) + '\n';
+        }
         for (const auto& file : files) PublishFile(staged / file.relative, root, file.relative, temp, &created_directories);
         Replace(update / "active", update / "committed");
-        // A successfully committed package can now remove what the previous one
-        // installed and this one no longer contains. The package is committed, so an
-        // interruption here never needs a rollback; the files still to remove are
-        // recorded first, so the next update removes any this one did not reach.
         try {
-            std::map<std::string, fs::path> current;
-            std::ostringstream installed;
-            for (const auto& file : files) {
-                const std::string name = Utf8(file.relative);
-                current.emplace(AsciiLower(name), file.relative);
-                installed << name << '\n';
-            }
-            std::vector<fs::path> dropped;
-            for (const auto& name : previous) {
-                const fs::path relative = PathFromUtf8(name);
-                if (!SafeRelative(relative) || Protected(AsciiLower(Utf8(*relative.begin())))) continue;
-                const auto replacement = current.find(AsciiLower(Utf8(relative)));
-                if (replacement != current.end() && replacement->second == relative) continue;
-                if (!fs::is_regular_file(CheckTarget(root, relative))) continue;
-                std::error_code ec;
-                // Case-only renames can share the same file on a case-insensitive install.
-                // On a case-sensitive install both files exist and the old one can be pruned.
-                if (replacement != current.end() &&
-                    (fs::equivalent(root / relative, root / replacement->second, ec) || ec)) continue;
-                dropped.push_back(relative);
-            }
-            if (!dropped.empty()) {
-                std::string pending = installed.str();
-                for (const auto& relative : dropped) pending += Utf8(relative) + '\n';
-                PublishText(update / "installed", pending);
-            }
-            for (const auto& relative : dropped) {
-                std::error_code ec;
-                if (fs::remove(root / relative, ec)) SyncDirectory((root / relative).parent_path());
-            }
-            PublishText(update / "installed", installed.str());
+            PublishText(update / "installed", installed.str() + kept);
         } catch (const std::exception& failure) {
-            std::fprintf(stderr, "update: could not record or prune the package files: %s\n", failure.what());
+            std::fprintf(stderr, "update: could not record the package files: %s\n", failure.what());
         }
     } catch (...) {
         // A failure after the journal starts is rolled back. A failure before it (a

@@ -290,6 +290,11 @@ shutil.copyfile(os.environ["TCNYC_FIXTURE_" + key], args[args.index("-o") + 1])
             root = install("partway apply")
             check = run(root / EXE, "--stage", valid, root / "restarted")
             expect(check.returncode == 0, check.stderr)
+            # A file the previous package installed and this one drops is removed under
+            # the journal, so the failed apply must bring it back.
+            dropped = root / "obsolete.txt"
+            dropped.write_bytes(b"old package file")
+            (root / "update" / "installed").write_text("obsolete.txt\n", encoding="ascii")
             if WINDOWS:
                 locked = root / "locked.txt"
                 locked.write_bytes(b"original")
@@ -307,6 +312,7 @@ shutil.copyfile(os.environ["TCNYC_FIXTURE_" + key], args[args.index("-o") + 1])
                 expect(not (locked / "file").exists(), "A failed apply left a partially published file.")
                 os.chmod(locked, 0o755)
             expect(not (root / "update" / "committed").exists(), "A failed apply committed the update.")
+            expect(dropped.read_bytes() == b"old package file", "A failed apply did not restore a pruned file.")
 
 
 if __name__ == "__main__":
