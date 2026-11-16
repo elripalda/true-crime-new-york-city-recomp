@@ -431,7 +431,9 @@ void PollDisplayApply() {
          g_menu.resolution.width, g_menu.resolution.height);
 }
 
-void RestoreDefaults() {
+} // namespace
+
+void RestoreGraphicsDefaults() {
     app::SettingsLock lock;
     const app::Settings d;
     app::Settings &s = app::Get();
@@ -474,6 +476,13 @@ void RestoreDefaults() {
     s.hdr_highlights = d.hdr_highlights;
     SetShowFps(false);
     g_fov_percent = 100;
+}
+
+namespace {
+
+void RestoreDefaults() {
+    RestoreGraphicsDefaults();
+    const app::Settings d;
     g_menu.mode = d.display_mode; // display changes still wait for Apply
     g_menu.resolution = {d.width, d.height};
     g_menu.dirty = true;

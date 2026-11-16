@@ -22,6 +22,7 @@ bool GameplayCameraActive();
 
 // Desktop (0 x 0), then the sizes the game window's monitor lists from 640 x 480, smallest first
 std::vector<app::Mode> DisplayModes();
+void RestoreGraphicsDefaults();  // live graphics values; display mode and resolution remain staged in each menu
 
 void DrawGraphicsMenu(double fps);             // GameInfo::ui
 void FilterMenuPad(int port, input::Pad &pad); // after the pad tools, from GameInfo::pad

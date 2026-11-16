@@ -27,6 +27,7 @@
 #include "common/graphics_menu.h"
 #include "core/log.h"
 #include "display_rows.h"
+#include "city_grid.h"
 #include "gpu/backend.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
@@ -58,6 +59,7 @@ constexpr uint32_t kFocus = 0x7C; // kTabBarFocus or kRowListFocus
 constexpr uint32_t kDisplayPage = 0x11;
 constexpr uint32_t kMainTab = 0, kOptionsTab = 4, kTopBarFocus = 0;
 constexpr uint32_t kColourSelected = 0x80808080, kColourNormal = 0x60606060; // as the game's rows
+constexpr uint32_t kColourDisabled = 0x40404040;
 constexpr uint32_t kInputEvent = 9;
 
 bool Tracing() {
@@ -186,7 +188,17 @@ Values Current() {
              applied};
     v.mode = g_pending ? g_pending_mode : applied_mode;
     v.applied_mode = applied_mode;
-    v.object_detail = s.object_detail;
+    v.object_detail = std::atomic_ref(s.object_detail).load(std::memory_order_relaxed);
+    v.ped_detail = std::atomic_ref(s.ped_detail).load(std::memory_order_relaxed);
+    v.ped_limit = std::atomic_ref(s.ped_limit).load(std::memory_order_relaxed);
+    v.ped_density = std::atomic_ref(s.ped_density).load(std::memory_order_relaxed);
+    v.traffic_density = std::atomic_ref(s.traffic_density).load(std::memory_order_relaxed);
+    v.traffic_distance = std::atomic_ref(s.traffic_distance).load(std::memory_order_relaxed);
+    v.city_inner_detail = std::atomic_ref(s.city_inner_detail).load(std::memory_order_relaxed);
+    v.city_outer_detail = std::atomic_ref(s.city_outer_detail).load(std::memory_order_relaxed);
+    v.custom_textures = s.custom_textures;
+    v.dump_textures = s.dump_textures;
+    v.texture_dump_format = s.texture_dump_format;
     v.ao = s.ao;
     v.ao_method = s.ao_method;
     v.ao_quality = s.ao_quality;
@@ -226,6 +238,16 @@ void Apply(const Values &v) {
     app::SetMsaaSamples(v.msaa);
     s.smaa = v.smaa;
     std::atomic_ref(s.object_detail).store(v.object_detail, std::memory_order_relaxed);  // read by lod.cpp
+    std::atomic_ref(s.ped_detail).store(v.ped_detail, std::memory_order_relaxed);
+    std::atomic_ref(s.ped_limit).store(v.ped_limit, std::memory_order_relaxed);
+    std::atomic_ref(s.ped_density).store(v.ped_density, std::memory_order_relaxed);
+    std::atomic_ref(s.traffic_density).store(v.traffic_density, std::memory_order_relaxed);
+    std::atomic_ref(s.traffic_distance).store(v.traffic_distance, std::memory_order_relaxed);
+    std::atomic_ref(s.city_inner_detail).store(v.city_inner_detail, std::memory_order_relaxed);
+    std::atomic_ref(s.city_outer_detail).store(v.city_outer_detail, std::memory_order_relaxed);
+    s.custom_textures = v.custom_textures;
+    s.dump_textures = v.dump_textures;
+    s.texture_dump_format = v.texture_dump_format;
     s.ao = v.ao;
     s.ao_method = v.ao_method;
     s.ao_quality = v.ao_quality;
@@ -428,6 +450,8 @@ X86_FUNC(sub_000C7B80) {
     const uint32_t self = ctx.ecx, out = X86_MEM32(ctx.esp + 4), port = X86_MEM32(ctx.esp + 8);
     const bool exiting = self && self == g_exit.owner;
     const Page row_page = exiting ? Page::Exit : g_page;
+    const bool outer_detail = game::city_grid::OuterDetailAvailable();
+    const uint32_t rows = RowCount(row_page, outer_detail);
     if (out && exiting && port == kTopTitle) {
         if (const uint32_t buffer = TextBuffer(uint32_t(Option::ExitConfirm))) {
             std::memcpy(base + buffer, "EXIT GAME", sizeof("EXIT GAME"));
@@ -442,14 +466,16 @@ X86_FUNC(sub_000C7B80) {
         // slot on screen -> logical row
         const uint32_t slot = port - (text ? kDisplayText : kDisplayColour);
         const uint32_t row = (exiting ? 0 : g_first) + slot;
+        const bool added = row >= NativeRows(row_page) && row < rows;
+        const Option option = added ? OptionAt(row_page, row, outer_detail) : Option::Count;
         if (colour) {
             const bool lit = slot == X86_MEM32(self + kRow) && X86_MEM32(self + kFocus) == kRowListFocus;
-            X86_MEM32(out) = lit ? kColourSelected : kColourNormal;
+            const bool disabled = option == Option::DumpFormat && !Enabled(Current(), option);
+            X86_MEM32(out) = disabled ? kColourDisabled : lit ? kColourSelected : kColourNormal;
             ::kernel::Return(ctx, 0, 2);
             return;
         }
-        if (row >= NativeRows(row_page) && row < RowCount(row_page)) {
-            const Option option = OptionAt(row_page, row);
+        if (added) {
             char buffer_text[kTextBytes];
             Text(Current(), option, buffer_text);
             if (const uint32_t buffer = TextBuffer(uint32_t(option))) {
@@ -468,7 +494,7 @@ X86_FUNC(sub_000C7B80) {
     if (ctx.eax != 0 || !out) return;
     if (port == kDisplayCount) {
         const bool awaiting_accept = exiting && X86_MEM32(self + kFocus) == kTopBarFocus;
-        X86_MEM32(out) = awaiting_accept ? 1 : std::min(kShownRows, RowCount(row_page));
+        X86_MEM32(out) = awaiting_accept ? 1 : std::min(kShownRows, rows);
     }
     if (Tracing() && port == kOptionsPage) {
         static thread_local uint32_t last_page = UINT32_MAX;
@@ -529,7 +555,8 @@ X86_FUNC(sub_000CB400) {
         }
     }
     if (self && event == kInputEvent && page == kDisplayPage && X86_MEM32(self + kFocus) == kRowListFocus) {
-        const Step step = Input(g_page, g_first + X86_MEM32(self + kRow), input);
+        const bool outer_detail = game::city_grid::OuterDetailAvailable();
+        const Step step = Input(g_page, g_first + X86_MEM32(self + kRow), input, outer_detail);
         if (step.handled && (!step.apply || g_pending)) {
             const Page page = g_page; // the page the input's row belongs to
             if (step.page != g_page) {
@@ -541,15 +568,27 @@ X86_FUNC(sub_000CB400) {
             X86_MEM32(self + kFocus) = step.focus;
             if (step.change) {
                 Values v = Current();
-                const Option option = OptionAt(page, step.row);
+                const Option option = OptionAt(page, step.row, outer_detail);
                 Change(v, option, step.change, g_sizes);
                 if (option == Option::Resolution || option == Option::DisplayMode) {
                     g_pending_size = v.size;
                     g_pending_mode = v.mode;
                     g_pending = DisplayPending(v);
-                } else {
+                } else if (Enabled(v, option)) {
                     Apply(v);
                 }
+            }
+            if (step.reset) {
+                game::RestoreGraphicsDefaults();
+                const app::Settings defaults;
+                const Values v = Current();
+                g_pending_mode = uint32_t(defaults.display_mode);
+                g_pending_size = Size(defaults.width, defaults.height);
+                g_pending = g_pending_mode != v.applied_mode || g_pending_size != v.applied;
+                const uint32_t row = RowOf(Page::Main, Option::Defaults, game::city_grid::OuterDetailAvailable());
+                g_first = Scroll(row, g_first);
+                X86_MEM32(self + kRow) = row - g_first;
+                MarkSave();
             }
             if (step.apply) ApplyDisplayChoice(g_pending_mode, g_pending_size);
             // Navigation (no value change) means the arrow steps have settled;
