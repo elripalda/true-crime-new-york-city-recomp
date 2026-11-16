@@ -163,6 +163,13 @@ shutil.copyfile(os.environ["TCNYC_FIXTURE_" + key], args[args.index("-o") + 1])
             return root
 
         root = install("valid install")
+        previous_library = root / "LiB" / "LibShaderc.so.1"
+        previous_library.parent.mkdir()
+        previous_library.write_bytes(b"old library")
+        removed = root / "obsolete.txt"
+        removed.write_bytes(b"old package file")
+        (root / "update").mkdir()
+        (root / "update" / "installed").write_text("LiB/LibShaderc.so.1\nobsolete.txt\n", encoding="ascii")
         result = root / "restarted"
         check = run(root / EXE, "--stage", valid, result)
         expect(check.returncode == 0, check.stderr)
@@ -171,6 +178,10 @@ shutil.copyfile(os.environ["TCNYC_FIXTURE_" + key], args[args.index("-o") + 1])
         expect(check.returncode == 0, check.stderr)
         wait_for(result, "new")
         expect((root / "BUILD.txt").read_bytes() == b"replacement", "Replacement package was not installed.")
+        library = root / "lib" / "libshaderc.so.1"
+        expect(library.is_file() and library.read_bytes() == b"fixture", "Pruning removed the case-renamed file.")
+        expect(not previous_library.exists() or previous_library.samefile(library), "The old library was not pruned.")
+        expect(not removed.exists(), "An obsolete package file was not pruned.")
         expect((root / "hdd2" / "save").read_bytes() == b"user save" and
                "HDD2" not in [path.name for path in root.iterdir()], "A protected save path was changed.")
         expect(not (root / "update" / "committed").exists(), "Replacement startup did not acknowledge the commit.")

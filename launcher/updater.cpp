@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <optional>
 #include <ranges>
 #include <regex>
@@ -695,23 +696,40 @@ void ApplyPackage(const fs::path& root) {
         journal = true;
         for (const auto& file : files) PublishFile(staged / file.relative, root, file.relative, temp, &created_directories);
         Replace(update / "active", update / "committed");
-        // A successfully committed package can now remove what the previous
-        // one installed and this one no longer contains.
+        // A successfully committed package can now remove what the previous one
+        // installed and this one no longer contains. The package is committed, so an
+        // interruption here never needs a rollback; the files still to remove are
+        // recorded first, so the next update removes any this one did not reach.
         try {
-            std::set<std::string> current;
+            std::map<std::string, fs::path> current;
             std::ostringstream installed;
             for (const auto& file : files) {
                 const std::string name = Utf8(file.relative);
-                current.insert(name);
+                current.emplace(AsciiLower(name), file.relative);
                 installed << name << '\n';
             }
+            std::vector<fs::path> dropped;
             for (const auto& name : previous) {
-                if (current.count(name)) continue;
                 const fs::path relative = PathFromUtf8(name);
                 if (!SafeRelative(relative) || Protected(AsciiLower(Utf8(*relative.begin())))) continue;
+                const auto replacement = current.find(AsciiLower(Utf8(relative)));
+                if (replacement != current.end() && replacement->second == relative) continue;
+                if (!fs::is_regular_file(CheckTarget(root, relative))) continue;
                 std::error_code ec;
-                if (fs::is_regular_file(CheckTarget(root, relative)) && fs::remove(root / relative, ec))
-                    SyncDirectory((root / relative).parent_path());
+                // Case-only renames can share the same file on a case-insensitive install.
+                // On a case-sensitive install both files exist and the old one can be pruned.
+                if (replacement != current.end() &&
+                    (fs::equivalent(root / relative, root / replacement->second, ec) || ec)) continue;
+                dropped.push_back(relative);
+            }
+            if (!dropped.empty()) {
+                std::string pending = installed.str();
+                for (const auto& relative : dropped) pending += Utf8(relative) + '\n';
+                PublishText(update / "installed", pending);
+            }
+            for (const auto& relative : dropped) {
+                std::error_code ec;
+                if (fs::remove(root / relative, ec)) SyncDirectory((root / relative).parent_path());
             }
             PublishText(update / "installed", installed.str());
         } catch (const std::exception& failure) {
