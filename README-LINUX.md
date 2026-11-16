@@ -14,15 +14,18 @@ This is the native SDL3 + Vulkan build. It does not use Proton.
 ## Install
 
 1. Extract the tarball into a folder you can write to.
-2. Put the game in `assets/` beside `TrueCrimeNYC`:
-   - extracted files: `assets/default.xbe` with the game's folders beside it, or
-   - a disc image: any `.iso` in `assets/`.
-   The extracted files are used when both are present.
-3. Run `./TrueCrimeNYC`.
+2. Run `./TrueCrimeNYC` to open the launcher.
+3. Select your Xbox ISO and choose **Launch game**. The ISO stays in its original
+   location. If you already have a disc image or extracted files in `assets/`
+   beside the executable, choose **Use local assets**.
+4. Use the **Graphics** tab to change display and rendering settings before launching.
+   **Save graphics** also saves changes without starting the game.
 
-You can also point at a folder or image directly:
+Pass a folder or image on the command line to start directly. Use
+`--skip-launcher` for direct startup with local assets:
 
 ```sh
+./TrueCrimeNYC --skip-launcher
 ./TrueCrimeNYC --assets /path/to/game
 ./TrueCrimeNYC --iso "/path/to/True Crime - New York City (USA).iso"
 ```
@@ -36,6 +39,7 @@ The package also contains:
 - `lib/libshaderc.so.1`: the bundled shader compiler, loaded from beside the
   executable.
 - `README.md`, `README-LINUX.md`, `BUILD.txt` and `THIRD_PARTY.txt`.
+- `SHA256SUMS` and `UPDATE-PROTOCOL` for verifying update packages.
 - `LICENSES/XboxXBE-Recomp-LICENSE.txt` for the SDK, plus `LICENSES/imgui-LICENSE.txt`
   and the shaderc/glslang copyright files when the build host provides them.
 - The FidelityFX 1.1.4 licence. Packages built with the optional DLSS SDK also

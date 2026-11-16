@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Controls
+- Rebind the keyboard, mouse and controller from a new Controls tab in the launcher or the Controls page
+  of the in-game menu (F10). Keyboard actions take up to four keys, with separate on-foot and driving
+  layouts; controller buttons swap with each other. Enter, the arrows and Escape always work in menus.
+- Button prompts follow the bindings: keyboard prompts show the bound key, and a remapped controller
+  shows the physical button now doing the job, in every prompt style.
+- Bindings are saved in `settings.toml` under `[controls]`. The older `reload_key`, `heavy_attack_key`,
+  `use_key` and `climb_key` settings are carried over and then replaced.
+
+### Audio
+- Custom music: songs in a folder you choose replace the Music Player's, by song number
+  (`6000.mp3`, `6001.ogg`, `6002.flac`, ...). MP3, OGG Vorbis, FLAC and WAV are decoded by the port, so no
+  conversion is needed. Set the folder in the launcher or as `music_folder` in `settings.toml`.
+- Other songs in that folder are added to the Music Player as new, already-owned songs (up to 35),
+  named from the file (`Band - Title.mp3`).
+
+### Launcher
+- A Custom Music folder field with a folder picker.
+- Redesigned in the game's night-city look, with every graphics option grouped into sections.
+- Checks GitHub for a newer release and can download, verify (SHA-256) and install it, then restart.
+  Settings, game files and textures are never touched. Turn it off on the Play tab.
+
 ### Performance
 - Windows (D3D12) and Linux (Vulkan): a draw's vertex streams and its index list now go into the upload
   ring as one block instead of one allocation per stream.
@@ -35,6 +57,7 @@
   one type no longer fills the street.
 - Crowd density (F10): 1.5x, 2x or 3x pedestrians per spawn point; 3x raises the crowd budget to 350.
 - Traffic density (F10): 1.5x to 5x the ambient car budget and each road spawn point's cap.
+- Traffic distance (F10 and launcher): Original, 1.5x (default) or 2x spawn range for ambient cars. It spreads the cars Traffic density allows over a wider area, so raise density with it.
 - Object detail now applies to moving cars as well; parked cars that have not been touched keep the game's
   own detail (they only carry low-detail textures until woken).
 

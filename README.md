@@ -38,7 +38,7 @@ The port adds a modern graphics menu, widescreen support, controller and raw mou
 | **Run** | `TrueCrimeNYC.exe` | `./TrueCrimeNYC` |
 | **Renderer** | Direct3D 12 | Vulkan (leave Proton **off** in Steam) |
 
-- **Windows launcher:** you can select your `.iso` instead of extracting it. The launcher copies the ISO into `assets/`, so allow space for one copy. If the files are already in `assets/`, click **Launch** without browsing.
+- **Windows and Linux launcher:** browse for your Xbox `.iso`, drop it onto the launcher, or choose **Use local assets** if the game is already in `assets/`. The launcher mounts your ISO from its current location and remembers it for the next launch. Open **Graphics** to set the display mode, resolution, render scale, upscaling and other options before starting.
 - **Linux:** `--assets <folder>` and `--iso <image>` also work. See the [Linux / SteamOS guide](README-LINUX.md) for SteamOS handheld steps and paths.
 - **First launch compiles the game code** and can take a while. Later launches reuse the cache.
 
@@ -90,6 +90,7 @@ MSAA is off by default because it is the most demanding option; depth of field w
 | Pedestrian limit | 15 (Original) to 75: how many full-detail pedestrians at once, and (20 and up) how many pedestrian types load at once, up to 9. Experimental above 30. |
 | Crowd density | Original, 1.5x, 2x or 3x (Experimental): how many pedestrians each spawn point keeps. 3x also raises the crowd budget from 250 to 350. |
 | Traffic density | Original, 1.5x, 2x, 3x, 4x or 5x (4x and 5x Experimental): the ambient car budget and each road spawn point's cap. |
+| Traffic distance | Original, 1.5x (default) or 2x: how far away ambient cars appear; they are removed at 4/3 of that range. The car count comes from Traffic density, so a longer distance spreads the same cars more thinly: raise density with it to keep streets busy. |
 | Anisotropic filtering | Game default, 2x, 4x, 8x or 16x. |
 | MSAA | Off, 2x, 4x or 8x. Off by default: it is the most demanding option. |
 | SMAA | SMAA 1x anti-aliasing on the finished frame. On by default. |
@@ -121,6 +122,11 @@ The 3D scene renders in higher-precision (FP16) colour on D3D12 and Vulkan when 
 
 - **Boot splash:** place `splash.png` or `splash.bmp` beside the executable.
 - **Texture replacement:** see the [Linux guide](README-LINUX.md#texture-packs) for the shared folder and naming scheme. Windows uses the same layout.
+- **Custom music:** pick a folder in the launcher (Graphics tab, Custom Music) or set `music_folder` in
+  `settings.toml`. A file named after a Music Player song (`6000` to `6092`, as `.mp3`, `.ogg`, `.flac`, `.wav` or `.wma`)
+  plays in its place; songs you don't replace stay as they are. MP3, OGG, FLAC and WAV are decoded by the port;
+  surround files play in stereo. Any other audio file in the folder is added to the
+  Music Player as a new song, already owned (up to 35). Name files `Band - Title.mp3` to show both.
 - **Keys:** use, climb, reload and the optional heavy-attack key can be changed in `settings.toml` (see [Settings file](#settings-file)).
 
 </details>
@@ -168,9 +174,13 @@ Everything in the F10 menu is saved to `settings.toml`: beside the executable on
 | `mouse_sensitivity_percent` | `100` | Mouse look speed, 10 to 400. |
 | `mouse_vertical_sensitivity_percent` | `100` | Vertical speed relative to horizontal, 10 to 400. |
 | `direct_mouse_aim` | `true` | The mouse turns the camera directly; `false` feeds it to the right stick instead. |
+| `music_folder` | `""` | Folder of replacement Music Player songs (see Customization); relative paths start beside the executable. |
 | `prompt_style` | `0` | Button prompts: 0 automatic, 1 original Xbox, 2 Xbox, 3 PlayStation, 4 Steam Deck. |
-| `use_key`, `climb_key`, `reload_key` | `E`, `G`, `R` | Letter keys for use, climb and reload. |
-| `heavy_attack_key` | `0` | An extra heavy-attack letter key; `0` keeps only Left Alt / mouse side button 2. |
+| `[controls.keyboard]` | today's layout | Keys per action, e.g. `jump = ["Space", "G"]`; mouse buttons are `MouseLeft`, `MouseMiddle`, `MouseRight`, `Mouse4`, `Mouse5`. |
+| `[controls.controller]` | standard layout | The physical button for each console input, e.g. `A = "a"` (SDL names). |
+
+Rebinding is easiest from the launcher's Controls tab or the in-game menu (F10, Controls...); the
+button prompts follow your bindings.
 
 Delete the file to return to the defaults.
 

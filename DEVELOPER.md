@@ -144,9 +144,9 @@ build-pal.bat dev
 
 Put the European `default.xbe` in `assets-pal/` first. The PAL build uses the same
 `src/game` hooks through `TC_ADDR` and aliases in `src/game/pal_addresses.h`.
-`scripts/test_pal_mappings.py` checks that every US hook has a PAL alias and a
-generated PAL entry. [docs/pal-hooks.md](docs/pal-hooks.md) lists the full mapping
-and the region-specific timing paths. The `dev` argument builds the F9 tools
+Check shared hook aliases in `src/game/pal_addresses.h` and timing in
+`src/game/timing.cpp`. The generated-code manifest ties each region's output to
+its XBE and generator inputs. The `dev` argument builds the F9 tools
 in `out/build/pal-dev`. Put the European ISO in the `assets` folder next to
 the executable you want to run. PAL cutscenes use the title's performance-counter clock.
 PAL deterministic replay records the resulting per-frame simulation ticks for
@@ -154,6 +154,25 @@ gameplay and cutscenes. Record and replay with the same region.
 
 `XBE_NO_STREAM_RING_FIX=1` runs the PAL build without the stream callback-ring
 growth, for bisecting streaming problems.
+
+## Linux builds and host tests
+
+Regenerate the guest code for the region in a Windows build shell before configuring
+Linux. Use the `release` preset for the USA build or `pal` for the European build.
+
+```bat
+cmake --preset release
+cmake --build --preset release --target recompile_TrueCrimeNYC
+```
+
+On Linux, configure `platform/linux` with SDL3, Vulkan and shaderc available. Pass
+`-DTCNYC_PAL=ON` for the PAL build. Configure compares the recorded input and output
+hashes with the files on disk and reports which region needs regeneration.
+
+With `BUILD_TESTING` enabled, build the tests and run
+`ctest --test-dir <build-directory> --output-on-failure`. The settings and release
+metadata tests run on both hosts. With Python available, the updater test creates
+temporary installs, mocks network downloads and exercises restart and recovery.
 
 ## Switches for testing
 
