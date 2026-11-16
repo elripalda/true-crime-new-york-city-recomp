@@ -66,7 +66,7 @@
   one type no longer fills the street.
 - Crowd density (F10): 1.5x, 2x or 3x pedestrians per spawn point; 3x raises the crowd budget to 350.
 - Traffic density (F10): 1.5x to 5x the ambient car budget and each road spawn point's cap.
-- Traffic distance (F10 and launcher): Original, 1.5x (default) or 2x spawn range for ambient cars. It spreads the cars Traffic density allows over a wider area, so raise density with it.
+- Traffic distance (F10 and launcher): Original (default), 1.5x or 2x spawn range for ambient cars. It spreads the cars Traffic density allows over a wider area, so raise density with it.
 - Object detail now applies to moving cars as well; parked cars that have not been touched keep the game's
   own detail (they only carry low-detail textures until woken).
 

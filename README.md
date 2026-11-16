@@ -90,7 +90,7 @@ MSAA is off by default because it is the most demanding option; depth of field w
 | Pedestrian limit | 15 (Original) to 75: how many full-detail pedestrians at once, and (20 and up) how many pedestrian types load at once, up to 9. Experimental above 30. |
 | Crowd density | Original, 1.5x, 2x or 3x (Experimental): how many pedestrians each spawn point keeps. 3x also raises the crowd budget from 250 to 350. |
 | Traffic density | Original, 1.5x, 2x, 3x, 4x or 5x (4x and 5x Experimental): the ambient car budget and each road spawn point's cap. |
-| Traffic distance | Original, 1.5x (default) or 2x: how far away ambient cars appear; they are removed at 4/3 of that range. The car count comes from Traffic density, so a longer distance spreads the same cars more thinly: raise density with it to keep streets busy. |
+| Traffic distance | Original (default), 1.5x or 2x: how far away ambient cars appear; they are removed at 4/3 of that range. The car count comes from Traffic density, so a longer distance spreads the same cars more thinly: raise density with it to keep streets busy. |
 | Anisotropic filtering | Game default, 2x, 4x, 8x or 16x. |
 | MSAA | Off, 2x, 4x or 8x. Off by default: it is the most demanding option. |
 | SMAA | SMAA 1x anti-aliasing on the finished frame. On by default. |

@@ -733,7 +733,7 @@ const char *Help(Row row) {
     case Row::CityOuterDetail:
         return "Draws detailed buildings and props beyond the inner 5 x 5 when the experimental city ring is active.";
     case Row::TrafficDistance:
-        return "How far away ambient cars appear and stay. Original is the game's own; 1.5x is the default. "
+        return "How far away ambient cars appear and stay. Original, the game's own, is the default. "
                "This spreads the same cars over a wider area, so higher distances look emptier nearby "
                "unless Traffic density is raised too.";
     case Row::TrafficDensity:

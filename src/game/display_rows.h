@@ -139,7 +139,7 @@ struct Values {
     uint64_t size, applied;
     uint32_t mode = 1, applied_mode = 1; // app::DisplayMode: 0 fullscreen, 1 borderless, 2 windowed
     uint32_t object_detail = 0, ao = 0, ao_method = 0, ao_quality = 2, city_range = 0;
-    uint32_t ped_detail = 0, ped_limit = 0, ped_density = 0, traffic_density = 0, traffic_distance = 1;
+    uint32_t ped_detail = 0, ped_limit = 0, ped_density = 0, traffic_density = 0, traffic_distance = 0;
     uint32_t city_inner_detail = 1, city_outer_detail = 0;
     bool custom_textures = true, dump_textures = false;
     uint32_t texture_dump_format = 0;
@@ -505,7 +505,7 @@ inline void Text(const Values &v, Option option, char (&text)[kTextBytes]) {
     }
     case Option::TrafficDistance: {
         constexpr const char *kNames[] = {"ORIG", "1.5X", "2X"};
-        std::snprintf(text, kTextBytes, "CAR RANGE %s", kNames[v.traffic_distance < 3 ? v.traffic_distance : 1]);
+        std::snprintf(text, kTextBytes, "CAR RANGE %s", kNames[v.traffic_distance < 3 ? v.traffic_distance : 0]);
         break;
     }
     case Option::CityInnerDetail:

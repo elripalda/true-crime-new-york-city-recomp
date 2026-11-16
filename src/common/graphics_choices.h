@@ -120,7 +120,7 @@ inline const char *PedDensityName(uint32_t level) {
 inline constexpr uint32_t kTrafficDistances[] = {0, 1, 2};
 inline const char *TrafficDistanceName(uint32_t level) {
     static const char *const names[] = {"Original", "1.5x", "2x"};
-    return names[level < 3 ? level : 1];
+    return names[level < 3 ? level : 0];
 }
 inline float TrafficSpawnScale(uint32_t level) {
     constexpr float kScales[] = {1.0f, 1.5f, 2.0f};
