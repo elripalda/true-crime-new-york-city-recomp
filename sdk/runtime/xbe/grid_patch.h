@@ -129,7 +129,9 @@ inline constexpr uint32_t kInstSites[] = {0x001390BF, 0x00139610, 0x00140170, 0x
                                           0x00149350, 0x0014935C, 0x00149391, 0x0014B029, 0x0014B056, 0x0014B153,
                                           0x0014B165, 0x0014B16B, 0x0014B1B0, 0x0014B1B5,
                                           0x001488C3, 0x001488DF, 0x001488F6, 0x00148900, 0x0014890D, 0x00147E13,
-                                          0x00147E1F, 0x00147E44};  // PAL: matched against the USA sites below
+                                          0x00147E1F, 0x00147E44,
+                                          0x0014B174, 0x0014B198, 0x0014B1CD, 0x0014B1FD, 0x0014B20E, 0x0014B218,
+                                          0x0014B225, 0x001430F5, 0x00143145};  // PAL: matched against the USA sites below
 inline constexpr uint32_t kInstSiteCount = sizeof(kInstSites) / sizeof(kInstSites[0]);
 #else
 inline constexpr uint32_t kInstSites[] = {0x0013882F, 0x00138D80, 0x0013F8E0, 0x00144590, 0x00148BBA, 0x00148BE7,
@@ -137,7 +139,11 @@ inline constexpr uint32_t kInstSites[] = {0x0013882F, 0x00138D80, 0x0013F8E0, 0x
                                           0x0014AA75, 0x0014AA7B, 0x0014AAC0, 0x0014AAC5,
                                           // insert 0x1481D0 / evict 0x147720 read the count at list base + 0x960
                                           0x001481D3, 0x001481EF, 0x00148206, 0x00148210, 0x0014821D, 0x00147723,
-                                          0x0014772F, 0x00147754};
+                                          0x0014772F, 0x00147754,
+                                          // the visible-list update 0x14A240 and its sift-down 0x142A00 also reach the
+                                          // count through the list base; with the list moved that read entry 300
+                                          0x0014AA84, 0x0014AAA8, 0x0014AADD, 0x0014AB0D, 0x0014AB1E, 0x0014AB28,
+                                          0x0014AB35, 0x00142A05, 0x00142A55};
 inline constexpr uint32_t kInstSiteCount = sizeof(kInstSites) / sizeof(kInstSites[0]);
 #endif
 inline const char kInstMacro[] =
@@ -245,9 +251,15 @@ inline bool IsInstSite(uint32_t address) {
 
 // Rewrites one generated statement; false if it has none of the three expected shapes.
 inline bool RewriteInstSite(std::string& code) {
-    if (const size_t at = code.find("(uint32_t)(ctx.esi + 0x960u)"); at != std::string::npos) {  // count via list base
-        code.replace(at, 28, "(uint32_t)(XBE_CNT(ctx.esi))");
+    for (const char* reg : {"esi", "ecx"}) {  // count via list base: [esi+0x960] or [ecx+0x960]
+        const std::string from = std::string("(uint32_t)(ctx.") + reg + " + 0x960u)";
+        const size_t at = code.find(from);
+        if (at == std::string::npos) continue;
+        code.replace(at, from.size(), std::string("(uint32_t)(XBE_CNT(ctx.") + reg + "))");
         if (const size_t cap = code.find("(0x12Cu)"); cap != std::string::npos) code.replace(cap, 8, "(xbe_inst_cap)");
+        // the full-list path stores cap - 1 before re-inserting
+        if (const size_t last = code.find("(0x12Bu)"); last != std::string::npos)
+            code.replace(last, 8, "(xbe_inst_cap - 1u)");
         return true;
     }
     for (const auto& [from, to] : {std::pair<std::string, std::string>{"(uint32_t)(0x5AD0u)", "(uint32_t)(XBE_INST(a) - a)"},
@@ -453,7 +465,8 @@ inline GridPatchResult PatchGridSources(const std::filesystem::path& dir, uint32
                 while (target < lines.size() && lines[target].find_first_not_of(" \t\r") == std::string::npos)
                     target++;
                 std::string& code = lines[target < lines.size() ? target : i];
-                if (code.find("XBE_INST(") == std::string::npos && code.find("xbe_inst_cap") == std::string::npos) {
+                if (code.find("XBE_INST(") == std::string::npos && code.find("XBE_CNT(") == std::string::npos &&
+                    code.find("xbe_inst_cap") == std::string::npos) {
                     if (!RewriteInstSite(code)) {
                         result.error = "instance site " + ToHex(address) + " does not match";
                         return result;
