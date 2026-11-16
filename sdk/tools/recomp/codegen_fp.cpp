@@ -226,11 +226,12 @@ bool CodeGen::EmitX87(uint32_t va, const ZydisDecodedInstruction& in, const Zydi
                  "std::memset(X86_PTR(uint8_t, ea + 12), 0, 16);");
             return true;
         case ZYDIS_MNEMONIC_FNSAVE: {
+            // In 32-bit mode the 28-byte environment is immediately followed by eight 10-byte registers.
             std::string s = "X86_MEM32(ea) = ctx.fcw; X86_MEM32(ea + 4) = x87_status(ctx); "
                             "X86_MEM32(ea + 8) = 0xFFFF; std::memset(X86_PTR(uint8_t, ea + 12), 0, 16);";
             for (int i = 0; i < 8; ++i)
-                s += F(" x87_store80(X86_PTR(uint8_t, ea + %du), X87_ST(%d));", 32 + i * 10, i);
-            s += " ctx.top = 0; ctx.fsw = uint16_t(ctx.fsw & ~0x3800);";
+                s += F(" x87_store80(X86_PTR(uint8_t, ea + %du), X87_ST(%d));", 28 + i * 10, i);
+            s += " ctx.fcw = 0x37F; ctx.fsw = 0; ctx.top = 0;";
             emit(s);
             return true;
         }
@@ -241,7 +242,7 @@ bool CodeGen::EmitX87(uint32_t va, const ZydisDecodedInstruction& in, const Zydi
             std::string s = "ctx.fcw = (uint16_t)X86_MEM32(ea); ctx.fsw = (uint16_t)X86_MEM32(ea + 4); "
                             "ctx.top = (ctx.fsw >> 11) & 7;";
             for (int i = 0; i < 8; ++i)
-                s += F(" X87_ST(%d) = x87_load80(X86_PTR(uint8_t, ea + %du));", i, 32 + i * 10);
+                s += F(" X87_ST(%d) = x87_load80(X86_PTR(uint8_t, ea + %du));", i, 28 + i * 10);
             emit(s);
             return true;
         }

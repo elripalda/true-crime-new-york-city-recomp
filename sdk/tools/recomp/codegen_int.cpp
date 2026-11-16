@@ -416,11 +416,16 @@ bool CodeGen::EmitInteger(uint32_t va, const ZydisDecodedInstruction& in, const 
         case ZYDIS_MNEMONIC_STD: Line("\tctx.df = 1;"); return true;
 
         case ZYDIS_MNEMONIC_PUSH:
-            if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-                ops[0].reg.value >= ZYDIS_REGISTER_ES && ops[0].reg.value <= ZYDIS_REGISTER_GS) {
+            // The stack slot follows the instruction's operand size, not the operand's:
+            // 16 only with the 0x66 prefix (push imm16, push r/m16, push seg as 16).
+            if (in.operand_width == 16) {
+                emit(F("uint16_t v = (uint16_t)(%s); ctx.esp -= 2; X86_MEM16(ctx.esp) = v;", Read(ops[0], ea).c_str()));
+            } else if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                       ops[0].reg.value >= ZYDIS_REGISTER_ES && ops[0].reg.value <= ZYDIS_REGISTER_GS) {
                 // push segment zero-extends the selector to 32 bits in 32-bit mode
                 emit(F("uint32_t v = (uint32_t)(%s); X86_PUSH32(v);", Read(ops[0], ea).c_str()));
             } else if (ops[0].size == 16 && ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                // a 32-bit push of a sign-extended immediate the decoder reports as 16 bits wide
                 emit(F("uint32_t v = (uint32_t)(int32_t)(int16_t)(%s); X86_PUSH32(v);",
                        Read(ops[0], ea).c_str()));
             } else if (ops[0].size == 16) {
@@ -434,7 +439,10 @@ bool CodeGen::EmitInteger(uint32_t va, const ZydisDecodedInstruction& in, const 
                 Line("\tctx.esp += 4;");
                 return true;
             }
-            if (mem)
+            if (mem && in.operand_width == 16)  // pop m16 (0x66 8F /0) takes two bytes
+                Line(F("\t{ uint16_t v = X86_MEM16(ctx.esp); ctx.esp += 2; uint32_t ea = %s; %s }", AddrExpr(ops[0]).c_str(),
+                       Write(ops[0], "ea", "v").c_str()));
+            else if (mem)
                 Line(F("\t{ uint32_t v = X86_MEM32(ctx.esp); ctx.esp += 4; uint32_t ea = %s; %s }", AddrExpr(ops[0]).c_str(),
                        Write(ops[0], "ea", "v").c_str()));
             else if (ops[0].size == 16)
