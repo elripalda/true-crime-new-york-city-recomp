@@ -17,18 +17,24 @@
 #include <toml++/toml.hpp>
 
 #include "app/app.h"
+#include "app/settings_store.h"
 #include "core/log.h"
 
 namespace app {
 
 namespace {
 
+toml::table Table();
+toml::table g_saved_settings;
+std::mutex g_save_lock;
+
 const char* kModes[] = {"fullscreen", "borderless", "windowed"};
 
-std::filesystem::path File() { return ExeDir() / kGame.settings; }
 std::recursive_mutex g_settings_lock;
 
 }  // namespace
+
+std::filesystem::path SettingsPath() { return ExeDir() / kGame.settings; }
 
 uint32_t FrameCap() {
     return std::atomic_ref(Get().fps_cap).load(std::memory_order_relaxed);
@@ -73,9 +79,15 @@ Settings Snapshot() {
     s.shadow_softness = g.shadow_softness;
     s.dof = g.dof;
     s.ao = g.ao;
+    s.ao_method = g.ao_method;
+    s.ao_quality = g.ao_quality;
+    s.city_range = std::atomic_ref(Get().city_range).load(std::memory_order_relaxed);
+    s.city_inner_detail = std::atomic_ref(Get().city_inner_detail).load(std::memory_order_relaxed);
+    s.city_outer_detail = std::atomic_ref(Get().city_outer_detail).load(std::memory_order_relaxed);
     s.building_seam_fix = g.building_seam_fix;
     s.object_detail = std::atomic_ref(Get().object_detail).load(std::memory_order_relaxed);  // stored atomically
     s.traffic_density = std::atomic_ref(Get().traffic_density).load(std::memory_order_relaxed);
+    s.traffic_distance = std::atomic_ref(Get().traffic_distance).load(std::memory_order_relaxed);
     s.ped_density = std::atomic_ref(Get().ped_density).load(std::memory_order_relaxed);
     s.ped_limit = std::atomic_ref(Get().ped_limit).load(std::memory_order_relaxed);
     s.ped_detail = std::atomic_ref(Get().ped_detail).load(std::memory_order_relaxed);  // stored atomically
@@ -88,6 +100,7 @@ Settings Snapshot() {
     s.hdr_peak = g.hdr_peak;
     s.hdr_highlights = g.hdr_highlights;
     s.join_ip = g.join_ip;
+    s.music_folder = g.music_folder;
     // these two are written atomically, so read them atomically
     s.fps_cap = FrameCap();
     s.msaa = MsaaSamples();
@@ -102,8 +115,14 @@ void Load() {
     Settings& s = Get();
     toml::table t;
     try {
-        t = toml::parse_file(File().string());
+        std::ifstream in(SettingsPath(), std::ios::binary);
+        if (!in) {
+            g_saved_settings = Table();
+            return;
+        }
+        t = toml::parse(in);
     } catch (...) {
+        g_saved_settings = Table();
         return;
     }
     std::string mode = t["display_mode"].value_or(std::string(kModes[uint32_t(s.display_mode)]));
@@ -139,11 +158,16 @@ void Load() {
     s.shadow_resolution = uint32_t(std::clamp<int64_t>(t["shadow_resolution"].value_or(int64_t(s.shadow_resolution)), 0, 2));
     s.shadow_softness = uint32_t(std::clamp<int64_t>(t["shadow_softness"].value_or(int64_t(s.shadow_softness)), 0, 2));
     s.dof = t["dof"].value_or(s.dof);
-    if (t["ao"].is_boolean()) {
-        s.ao = t["ao"].value_or(false) ? 2u : 0u;  // older settings stored a boolean
-    } else {
-        s.ao = uint32_t(std::clamp<int64_t>(t["ao"].value_or(int64_t(s.ao)), 0, 2));
-    }
+    LoadOcclusionSettings(s, t);
+    // read by the city ring on the game thread (city_grid.cpp)
+    // City draw distance is no longer offered in the menus: keep the game's 3x3 whatever an older file saved.
+    std::atomic_ref(s.city_range).store(0, std::memory_order_relaxed);
+    std::atomic_ref(s.city_inner_detail).store(
+        uint32_t(std::clamp<int64_t>(t["city_inner_detail"].value_or(int64_t(s.city_inner_detail)), 1, 3)),
+        std::memory_order_relaxed);
+    std::atomic_ref(s.city_outer_detail).store(
+        uint32_t(std::clamp<int64_t>(t["city_outer_detail"].value_or(int64_t(s.city_outer_detail)), 0, 3)),
+        std::memory_order_relaxed);
     s.building_seam_fix = t["building_seam_fix"].value_or(s.building_seam_fix);
     // the LOD hooks read it on the game thread (lod.cpp)
     std::atomic_ref(s.object_detail)
@@ -151,6 +175,9 @@ void Load() {
                std::memory_order_relaxed);
     std::atomic_ref(s.traffic_density)
         .store(uint32_t(std::clamp<int64_t>(t["traffic_density"].value_or(int64_t(s.traffic_density)), 0, 5)),
+               std::memory_order_relaxed);
+    std::atomic_ref(s.traffic_distance)
+        .store(uint32_t(std::clamp<int64_t>(t["traffic_distance"].value_or(int64_t(s.traffic_distance)), 0, 2)),
                std::memory_order_relaxed);
     std::atomic_ref(s.ped_density)
         .store(uint32_t(std::clamp<int64_t>(t["ped_density"].value_or(int64_t(s.ped_density)), 0, 3)),
@@ -172,6 +199,7 @@ void Load() {
     if (s.hdr_peak && s.hdr_peak < 400) s.hdr_peak = 400;
     s.hdr_highlights = std::min(t["hdr_highlights"].value_or(s.hdr_highlights), 100u);
     s.join_ip = t["join_ip"].value_or(s.join_ip);
+    s.music_folder = t["music_folder"].value_or(s.music_folder);
     for (const Option& o : kGame.options) {
         if (o.flag) {
             auto flag = std::atomic_ref(*o.flag);
@@ -184,6 +212,7 @@ void Load() {
         }
     }
     if (kGame.load) kGame.load(&t);
+    g_saved_settings = Table();
 }
 
 namespace {
@@ -210,9 +239,15 @@ toml::table Table() {
                   {"shadow_softness", int64_t(s.shadow_softness)},
                   {"dof", s.dof},
                   {"ao", int64_t(s.ao)},
+                  {"ao_method", int64_t(s.ao_method)},
+                  {"ao_quality", int64_t(s.ao_quality)},
+                  {"city_range", int64_t(std::atomic_ref(Get().city_range).load(std::memory_order_relaxed))},
+                  {"city_inner_detail", int64_t(std::atomic_ref(Get().city_inner_detail).load(std::memory_order_relaxed))},
+                  {"city_outer_detail", int64_t(std::atomic_ref(Get().city_outer_detail).load(std::memory_order_relaxed))},
                   {"building_seam_fix", s.building_seam_fix},
                   {"object_detail", int64_t(std::atomic_ref(Get().object_detail).load(std::memory_order_relaxed))},
                   {"traffic_density", int64_t(std::atomic_ref(Get().traffic_density).load(std::memory_order_relaxed))},
+                  {"traffic_distance", int64_t(std::atomic_ref(Get().traffic_distance).load(std::memory_order_relaxed))},
                   {"ped_density", int64_t(std::atomic_ref(Get().ped_density).load(std::memory_order_relaxed))},
                   {"ped_limit", int64_t(std::atomic_ref(Get().ped_limit).load(std::memory_order_relaxed))},
                   {"ped_detail", int64_t(std::atomic_ref(Get().ped_detail).load(std::memory_order_relaxed))},
@@ -224,7 +259,8 @@ toml::table Table() {
                   {"hdr_paper_white", int64_t(s.hdr_paper_white)},
                   {"hdr_peak", int64_t(s.hdr_peak)},
                   {"hdr_highlights", int64_t(s.hdr_highlights)},
-                  {"join_ip", s.join_ip}};
+                  {"join_ip", s.join_ip},
+                  {"music_folder", s.music_folder}};
     for (const Option& o : kGame.options) {
         if (o.flag) t.insert(o.key, std::atomic_ref(*o.flag).load(std::memory_order_relaxed));
         else t.insert(o.key, int64_t(*o.value));
@@ -235,70 +271,26 @@ toml::table Table() {
 
 }  // namespace
 
-void Save() {
-    // Two menus can save at once, and a failed write must not leave the live file truncated.
-    // Separate game instances share this file: every save uses its own exclusively created temporary
-    // file and publications are serialized by a named mutex. The last writer wins.
-    // Build the snapshot under the settings lock, then write without holding it:
-    // a slow or cross-process-locked save must not stall render-thread snapshots.
-    std::string text;
-    std::filesystem::path path;
-    {
-        SettingsLock guard;
-        std::ostringstream out;
-        out << Table() << "\n";
-        text = out.str();
-        path = File();
-    }
-    const std::wstring path_text = path.wstring();
-
-    // Serialize publication between processes in this session.
-    uint32_t hash = 2166136261u;
-    for (wchar_t c : path_text) hash = (hash ^ uint32_t(c)) * 16777619u;
-    const std::wstring mutex_name = L"Local\\TrueCrimeNYCSettings-" + std::to_wstring(hash);
-    HANDLE mutex = CreateMutexW(nullptr, FALSE, mutex_name.c_str());
-    const DWORD wait = mutex ? WaitForSingleObject(mutex, 5000) : WAIT_FAILED;
-    // WAIT_ABANDONED also grants ownership: the previous owner died while holding the mutex.
-    const bool locked = wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED;
-    if (mutex && !locked) LOGE("Settings: could not serialize publishing %s", path.string().c_str());
-
-    std::filesystem::path temp;
-    HANDLE file = INVALID_HANDLE_VALUE;
-    static std::atomic<uint32_t> serial{0};
-    const DWORD pid = GetCurrentProcessId();
-    for (int attempt = 0; attempt < 64 && file == INVALID_HANDLE_VALUE; attempt++) {
-        temp = path_text + L".tmp." + std::to_wstring(pid) + L"." + std::to_wstring(serial.fetch_add(1));
-        file = CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (file == INVALID_HANDLE_VALUE && GetLastError() != ERROR_FILE_EXISTS) break;
-    }
-    if (file == INVALID_HANDLE_VALUE) {
-        LOGE("Settings: could not create a temporary file for %s (error %lu)", path.string().c_str(), GetLastError());
-        if (mutex) {
-            if (locked) ReleaseMutex(mutex);
-            CloseHandle(mutex);
+bool Save() {
+    try {
+        const std::lock_guard save_guard(g_save_lock);
+        toml::table current, changes;
+        const auto path = SettingsPath();
+        {
+            SettingsLock guard;
+            current = Table();
+            changes = ChangedSettings(g_saved_settings, current);
         }
-        return;
-    }
-    DWORD written = 0;
-    const bool wrote = WriteFile(file, text.data(), DWORD(text.size()), &written, nullptr) &&
-                       written == DWORD(text.size()) && FlushFileBuffers(file);
-    CloseHandle(file);
-    if (!wrote) {
-        LOGE("Settings: could not write %s (error %lu)", temp.string().c_str(), GetLastError());
-        DeleteFileW(temp.c_str());
-        if (mutex) {
-            if (locked) ReleaseMutex(mutex);
-            CloseHandle(mutex);
+        if (!std::filesystem::exists(path)) changes = current;
+        MergeSettingsTable(path, changes, &current);
+        {
+            SettingsLock guard;
+            g_saved_settings = std::move(current);
         }
-        return;
-    }
-    if (!MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        LOGE("Settings: could not replace %s (error %lu)", path.string().c_str(), GetLastError());
-        DeleteFileW(temp.c_str());
-    }
-    if (mutex) {
-        if (locked) ReleaseMutex(mutex);
-        CloseHandle(mutex);
+        return true;
+    } catch (const std::exception& failure) {
+        LOGE("Settings: %s", failure.what());
+        return false;
     }
 }
 

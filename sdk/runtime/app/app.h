@@ -34,14 +34,20 @@ struct Settings {
     uint32_t bloom_strength = 100;    // bloom brightness, percent of the original
     bool dof = true;                  // distance blur on the finished frame
     uint32_t ao = 0;                  // ambient occlusion: 0 off, 1 half resolution, 2 full resolution
+    uint32_t ao_method = 0;           // ambient occlusion method: 0 GTAO, 1 SSAO
+    uint32_t ao_quality = 2;          // ambient occlusion quality kept while it is off: 1 half, 2 full resolution
     uint32_t shadow_resolution = 0;   // shadow maps: 0 the game's, 1 twice, 2 four times as sharp
     uint32_t shadow_softness = 0;     // shadow edges: 0 the game's single compare, 1 soft, 2 softer
     bool building_seam_fix = true;   // experimental priority for detailed city geometry
     uint32_t object_detail = 0;      // mesh LOD distance: 0 original, 1 high (2x), 2 very high (4x), 3 maximum
     uint32_t ped_limit = 0;          // full pedestrians at once: 0 the game's 15, then 20, 25, 30, 40, 50, 75
+    uint32_t traffic_distance = 1;   // ambient car spawn range: 0 the game's, 1 1.5x, 2 2x
     uint32_t traffic_density = 0;    // ambient cars: 0 the game's, 1 1.5x, 2 2x, 3 3x, 4 4x, 5 5x
     uint32_t ped_density = 0;        // crowd density: 0 the game's, 1 1.5x, 2 2x, 3 3x (experimental)
     uint32_t ped_detail = 0;         // stand-in -> full pedestrian swap distance: 0 original, 1 2x, 2 4x, 3 maximum
+    uint32_t city_range = 0;         // real city drawn around the player: 0 the game's 3x3, 1 5x5, 2 7x7, 3 9x9 (experimental)
+    uint32_t city_inner_detail = 1;  // inner-grid instance distance multiplier
+    uint32_t city_outer_detail = 0;  // outer-ring instance distance multiplier, 0 uses the distant meshes alone
     bool pc_contrast = true;         // PC contrast curve on the finished frame
     bool custom_textures = true;     // images in textures\replacement\ beside the exe replace the game's
     bool dump_textures = false;      // each texture once into textures\dumps\ beside the exe
@@ -51,6 +57,7 @@ struct Settings {
     uint32_t hdr_peak = 0;           // highlight peak in nits; 0 uses the display's reported peak, else 1000
     uint32_t hdr_highlights = 40;    // inverse tone map strength, percent
     std::string join_ip;                   // co-op: a host past the LAN the system link search also asks
+    std::string music_folder;              // UTF-8; <track>.wma/.mp3/.ogg here replace Music Player songs
 };
 
 Settings& Get();
@@ -68,8 +75,9 @@ uint32_t FrameCap();
 void SetFrameCap(uint32_t cap);
 uint32_t MsaaSamples();
 void SetMsaaSamples(uint32_t samples);
+std::filesystem::path SettingsPath();
 void Load();
-void Save();
+bool Save();
 void LogSettings();  // every setting, as the settings file has them
 void LogSystem();    // the machine and the settings, at a run's start
 void ApplyDisplay();  // any thread
@@ -92,6 +100,7 @@ float RenderStretch(uint32_t guest_width, uint32_t guest_height);
 bool Widescreen();
 
 std::filesystem::path ExeDir();
+std::string ValidateGameIso(const std::filesystem::path& path);
 // the game in assets (game_files.cpp): its folder and this executable's xbe, from the extracted files or a disc
 // image (.iso), which it mounts as D:; false after telling the player what is missing, with error set for hosts
 // that show it themselves

@@ -103,7 +103,7 @@ void MarkSave() {
 void FlushSettings() {
     if (g_display_request) return;  // saved once the display change is answered
     if (!g_save_dirty.exchange(false, std::memory_order_acq_rel)) return;
-    app::Save();
+    if (!app::Save()) MarkSave();
 }
 
 void PostRestoreDisplayChoice() {
@@ -188,6 +188,9 @@ Values Current() {
     v.applied_mode = applied_mode;
     v.object_detail = s.object_detail;
     v.ao = s.ao;
+    v.ao_method = s.ao_method;
+    v.ao_quality = s.ao_quality;
+    v.city_range = std::atomic_ref(s.city_range).load(std::memory_order_relaxed);
     v.bloom = s.bloom;
     v.dof = s.dof;
     v.building_seam_fix = s.building_seam_fix;
@@ -224,6 +227,9 @@ void Apply(const Values &v) {
     s.smaa = v.smaa;
     std::atomic_ref(s.object_detail).store(v.object_detail, std::memory_order_relaxed);  // read by lod.cpp
     s.ao = v.ao;
+    s.ao_method = v.ao_method;
+    s.ao_quality = v.ao_quality;
+    std::atomic_ref(s.city_range).store(v.city_range, std::memory_order_relaxed);  // read by city_grid.cpp
     s.bloom = v.bloom;
     s.dof = v.dof;
     s.building_seam_fix = v.building_seam_fix;

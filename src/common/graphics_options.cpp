@@ -10,6 +10,7 @@
 #include "graphics_menu.h"
 
 #include "app/app.h"
+#include "game/city_grid.h"
 #include "core/log.h"
 #include "graphics_choices.h"
 #include "gpu/backend.h"
@@ -84,6 +85,10 @@ enum class Row {
     PedLimit,
     PedDensity,
     TrafficDensity,
+    TrafficDistance,
+    CityRange,
+    CityInnerDetail,
+    CityOuterDetail,
     Anisotropic,
     Msaa,
     Smaa,
@@ -92,6 +97,7 @@ enum class Row {
     BloomStrength,
     DepthOfField,
     AmbientOcclusion,
+    AoQuality,
     ShadowQuality,
     ShadowSoftness,
     BuildingSeamFix,
@@ -107,6 +113,7 @@ enum class Row {
     TextureReplacement,
     TextureDumping,
     DumpFormat,
+    Controls,
     Defaults,
     Close,
 };
@@ -123,6 +130,12 @@ constexpr Row kRows[] = {Row::DisplayMode,
                          Row::PedLimit,
                          Row::PedDensity,
                          Row::TrafficDensity,
+                         Row::TrafficDistance,
+                         // Row::CityRange: hidden; the ring code stays, the setting stays at the game's 3 x 3.
+#ifdef _WIN32
+                         Row::CityInnerDetail,
+                         Row::CityOuterDetail,
+#endif
                          Row::Anisotropic,
                          Row::Msaa,
                          Row::Smaa,
@@ -131,6 +144,7 @@ constexpr Row kRows[] = {Row::DisplayMode,
                          Row::BloomStrength,
                          Row::DepthOfField,
                          Row::AmbientOcclusion,
+                         Row::AoQuality,
                          Row::ShadowQuality,
                          Row::ShadowSoftness,
                          Row::BuildingSeamFix,
@@ -146,6 +160,7 @@ constexpr Row kRows[] = {Row::DisplayMode,
                          Row::TextureReplacement,
                          Row::TextureDumping,
                          Row::DumpFormat,
+                         Row::Controls,
                          Row::Defaults,
                          Row::Close};
 constexpr int kRowCount = int(std::size(kRows));
@@ -158,6 +173,7 @@ struct Menu {
     int selected = 0;
     bool dirty = false; // settings changed since the menu opened or last saved
     bool apply_pending = false; // the window thread has not reported the display apply yet
+    bool save_failed = false;
     bool apply_failed = false;  // the last display apply was refused
     uint64_t apply_seq = 0;
     app::DisplayMode mode{};
@@ -166,7 +182,146 @@ struct Menu {
     app::Mode desktop{};
     uint32_t output_height = 0;
     Repeater repeater;
+    bool controls = false;  // the Controls page is showing
 } g_menu;
+
+// The Controls page: one row per keyboard action and controller input, then the resets and Back.
+struct ControlsPage {
+    input::KeyBinding keys[input::kKeyBindingCount];
+    input::PadBinding pad[input::kPadBindingCount];
+    int selected = 0;
+    int capture = -1;          // the row waiting for a key or button
+    bool pad_released = false; // a controller capture waits for every button to be let go first
+    int first_frame = 0;       // the frame the capture started: its own Enter/click is not the answer
+} g_controls;
+
+constexpr int kKeyRows = input::kKeyBindingCount - 1;  // Start stays on Escape
+constexpr int kPadRows = input::kPadBindingCount;
+constexpr int kControlRows = kKeyRows + kPadRows + 3;  // + Reset keyboard, Reset controller, Back
+constexpr const char *kKeyActions[kKeyRows] = {
+    "Move forward", "Move back", "Move left", "Move right",
+    "Light attack", "Grapple / human shield", "Heavy attack", "Jump / climb",
+    "Car: accelerate", "Car: handbrake", "Car: brake / reverse", "Car: Y action",
+    "Reload / block", "Use / enter vehicle", "Aim / lock on", "Fire",
+    "Badge / horn / siren", "Left stick click", "Right stick click"};
+constexpr const char *kPadActions[kPadRows] = {
+    "D-pad up", "D-pad down", "D-pad left", "D-pad right", "Pause", "Badge / horn / siren",
+    "Left stick click", "Right stick click", "A: light attack / accelerate", "B: grapple / handbrake",
+    "X: heavy attack / brake", "Y: jump / climb", "Black: reload / block", "White: use / enter vehicle",
+    "Left trigger: aim", "Right trigger: fire"};
+
+void OpenControls() {
+    input::KeyBindings(g_controls.keys);
+    input::PadBindings(g_controls.pad);
+    g_controls.selected = 0;
+    g_controls.capture = -1;
+    g_menu.controls = true;
+}
+
+void CommitControls() {
+    input::SetBindings(g_controls.keys, g_controls.pad);
+    g_menu.dirty = true;  // saved with the other settings when the menu closes
+}
+
+// ImGui's keys as SDL keycodes (input::KeyBinding), for the ones a binding can use
+uint32_t KeycodeOf(ImGuiKey key) {
+    if (key >= ImGuiKey_A && key <= ImGuiKey_Z) return 'a' + (key - ImGuiKey_A);
+    if (key >= ImGuiKey_0 && key <= ImGuiKey_9) return '0' + (key - ImGuiKey_0);
+    if (key >= ImGuiKey_F1 && key <= ImGuiKey_F12) return 0x4000003Au + uint32_t(key - ImGuiKey_F1);  // SDLK_F1..
+    switch (key) {
+    case ImGuiKey_Space: return ' ';
+    case ImGuiKey_Tab: return '\t';
+    case ImGuiKey_LeftCtrl: return 0x400000E0u;
+    case ImGuiKey_LeftShift: return 0x400000E1u;
+    case ImGuiKey_LeftAlt: return 0x400000E2u;
+    case ImGuiKey_RightCtrl: return 0x400000E4u;
+    case ImGuiKey_RightShift: return 0x400000E5u;
+    case ImGuiKey_RightAlt: return 0x400000E6u;
+    default: return 0;
+    }
+}
+
+// a capture in progress: true while it owns the input
+bool CaptureControls() {
+    auto &c = g_controls;
+    if (c.capture < 0) return false;
+    if (ImGui::GetFrameCount() == c.first_frame) return true;
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        c.capture = -1;
+        return true;
+    }
+    if (c.capture < kKeyRows) {
+        uint32_t key = 0;
+        if (ImGui::IsKeyPressed(ImGuiKey_Delete, false)) {
+            std::fill(std::begin(c.keys[c.capture].keys), std::end(c.keys[c.capture].keys), 0u);
+            c.capture = -1;
+            CommitControls();
+            return true;
+        }
+        for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END && !key; ++k)
+            if (ImGui::IsKeyPressed(ImGuiKey(k), false)) key = KeycodeOf(ImGuiKey(k));
+        for (int b = 0; b < 5 && !key; ++b)
+            if (ImGui::IsMouseClicked(b)) key = input::MouseKey(b == 1 ? 2 : b == 2 ? 1 : b);  // ImGui: 1 right, 2 middle
+        if (!input::CanBindKey(key)) return true;
+        // the new key becomes the main one (the one the prompts show); the others stay
+        auto &slots = c.keys[c.capture].keys;
+        const auto end = std::remove(std::begin(slots), std::end(slots), key);
+        std::fill(end, std::end(slots), 0u);
+        std::move_backward(std::begin(slots), std::end(slots) - 1, std::end(slots));
+        slots[0] = key;
+    } else {
+        const int source = input::HeldPadSource();
+        if (!c.pad_released) {
+            c.pad_released = source < 0;
+            return true;
+        }
+        if (source < 0) return true;
+        auto &target = c.pad[c.capture - kKeyRows];
+        // a swap: the input that had this button takes the old one, so nothing is left unbound
+        for (auto &binding : c.pad)
+            if (binding.source == source) binding.source = target.source;
+        target.source = source;
+    }
+    c.capture = -1;
+    CommitControls();
+    return true;
+}
+
+void ActivateControl(int row) {
+    auto &c = g_controls;
+    if (row < kKeyRows + kPadRows) {
+        if (row == kKeyRows + int(input::PadInput::Start)) return;  // Pause stays on Start
+        c.capture = row;
+        c.pad_released = false;
+        c.first_frame = ImGui::GetFrameCount();
+    } else if (row == kKeyRows + kPadRows) {
+        input::DefaultKeys(c.keys);
+        CommitControls();
+    } else if (row == kKeyRows + kPadRows + 1) {
+        input::DefaultPadBindings(c.pad);
+        CommitControls();
+    } else {
+        g_menu.controls = false;
+    }
+}
+
+std::string ControlValue(int row) {
+    char name[32];
+    if (row < kKeyRows) {
+        std::string value;
+        for (uint32_t key : g_controls.keys[row].keys) {
+            if (!key) continue;
+            input::KeyDisplayName(key, name);
+            value += (value.empty() ? "" : ", ") + std::string(name);
+        }
+        return value.empty() ? "-" : value;
+    }
+    if (row < kKeyRows + kPadRows) {
+        input::PadSourceDisplayName(g_controls.pad[row - kKeyRows].source, name);
+        return name;
+    }
+    return "";
+}
 
 bool SameMode(app::Mode a, app::Mode b) { return a.width == b.width && a.height == b.height; }
 
@@ -210,7 +365,6 @@ void OpenMenu() {
     app::SettingsLock lock;
     const app::Settings &s = app::Get();
     g_menu.open = true;
-    g_menu.dirty = false;
     if (!g_menu.apply_pending) g_menu.apply_failed = false;
     g_menu.mode = s.display_mode;
     g_menu.resolution = {s.width, s.height};
@@ -220,6 +374,7 @@ void OpenMenu() {
     g_menu.desktop = app::Desktop();
     g_menu.output_height = app::Output().height;
     g_menu.repeater = {};
+    g_menu.controls = false;
     g_pad_nav.store(0); // drop any keyboard-derived bits from before the overlay owned the keys
     g_open.store(true);
     input::SetUiActive(true);
@@ -228,7 +383,12 @@ void OpenMenu() {
 
 void CloseMenu() {
     if (g_menu.apply_pending) return; // keep the menu up until the mode apply is answered
-    if (g_menu.dirty) app::Save();
+    if (g_menu.dirty) {
+        const bool already_notified = g_menu.save_failed;
+        g_menu.dirty = !app::Save();
+        g_menu.save_failed = g_menu.dirty;
+        if (g_menu.save_failed && !already_notified) return;
+    }
     g_menu.open = false;
     g_open.store(false);
     input::SetUiActive(false);
@@ -247,8 +407,7 @@ void SaveOnExit() {
     if (saved) return;
     saved = true;
     g_menu.apply_pending = false;
-    app::Save();
-    g_menu.dirty = false;
+    g_menu.dirty = !app::Save();
 }
 #endif
 
@@ -275,8 +434,8 @@ void PollDisplayApply() {
     if (!app::DisplayApplyResult(g_menu.apply_seq, ok)) return;
     g_menu.apply_pending = false;
     if (ok) {
-        app::Save();
-        g_menu.dirty = false;
+        g_menu.save_failed = !app::Save();
+        g_menu.dirty = g_menu.save_failed;
         g_menu.output_height = app::Output().height;
         g_menu.apply_failed = false;
         return;
@@ -309,12 +468,18 @@ void RestoreDefaults() {
     s.shadow_softness = d.shadow_softness;
     s.dof = d.dof;
     s.ao = d.ao;
+    s.ao_method = d.ao_method;
+    s.ao_quality = d.ao_quality;
     s.building_seam_fix = d.building_seam_fix;
     std::atomic_ref(s.object_detail).store(d.object_detail, std::memory_order_relaxed);  // read by lod.cpp
     std::atomic_ref(s.ped_detail).store(d.ped_detail, std::memory_order_relaxed);  // read by ped_detail.cpp
     std::atomic_ref(s.ped_limit).store(d.ped_limit, std::memory_order_relaxed);
     std::atomic_ref(s.ped_density).store(d.ped_density, std::memory_order_relaxed);
     std::atomic_ref(s.traffic_density).store(d.traffic_density, std::memory_order_relaxed);
+    std::atomic_ref(s.traffic_distance).store(d.traffic_distance, std::memory_order_relaxed);
+    std::atomic_ref(s.city_range).store(d.city_range, std::memory_order_relaxed);
+    std::atomic_ref(s.city_inner_detail).store(d.city_inner_detail, std::memory_order_relaxed);
+    std::atomic_ref(s.city_outer_detail).store(d.city_outer_detail, std::memory_order_relaxed);
     s.pc_contrast = d.pc_contrast;
     s.custom_textures = d.custom_textures;
     s.dump_textures = d.dump_textures;
@@ -347,11 +512,16 @@ Kind KindOf(Row row) {
     case Row::PedLimit:
     case Row::PedDensity:
     case Row::TrafficDensity:
+    case Row::TrafficDistance:
+    case Row::CityRange:
+    case Row::CityInnerDetail:
+    case Row::CityOuterDetail:
     case Row::Anisotropic:
     case Row::FrameCap:
     case Row::DumpFormat:
     case Row::Msaa:
     case Row::AmbientOcclusion:
+    case Row::AoQuality:
     case Row::HdrPaperWhite:
     case Row::HdrPeak:
     case Row::HdrHighlights:
@@ -380,6 +550,7 @@ bool Enabled(Row row) {
     if (row == Row::DumpFormat) return app::Get().dump_textures;
     if (row == Row::Upscaler) return app::Get().render_percent <= 100;
     if (row == Row::BloomStrength) return app::Get().bloom;
+    if (row == Row::CityOuterDetail) return game::city_grid::OuterDetailAvailable();
 #ifndef _WIN32
     if (row == Row::LowLatency) return false;  // Direct3D 12 only
 #endif
@@ -414,6 +585,14 @@ const char *Label(Row row) {
         return "Crowd density";
     case Row::TrafficDensity:
         return "Traffic density";
+    case Row::TrafficDistance:
+        return "Traffic distance";
+    case Row::CityRange:
+        return "City draw distance";
+    case Row::CityInnerDetail:
+        return "Inner city detail distance";
+    case Row::CityOuterDetail:
+        return "Outer city detail distance";
     case Row::Anisotropic:
         return "Anisotropic filtering";
     case Row::Msaa:
@@ -428,6 +607,8 @@ const char *Label(Row row) {
         return "Depth of field";
     case Row::AmbientOcclusion:
         return "Ambient occlusion";
+    case Row::AoQuality:
+        return "Occlusion quality";
     case Row::BuildingSeamFix:
         return "Building seam fix (Experimental)";
     case Row::PcContrast:
@@ -464,6 +645,8 @@ const char *Label(Row row) {
         return "Texture dumping";
     case Row::DumpFormat:
         return "Dump format";
+    case Row::Controls:
+        return "Controls...";
     case Row::Defaults:
         return "Restore defaults";
     case Row::Close:
@@ -483,6 +666,8 @@ const char *Section(Row row) {
         return "HDR output";
     case Row::TextureReplacement:
         return "Textures";
+    case Row::Controls:
+        return "CONTROLS";
     case Row::Defaults:
         return "";
     default:
@@ -515,9 +700,22 @@ const char *Help(Row row) {
                "loads characters from their single full-detail files, so they no longer step through a middle "
                "level. Applies to characters loaded after the change. The game still "
                "keeps at most Pedestrian limit full pedestrians at once.";
+    case Row::CityRange:
+        return "Experimental: loads and draws real city tiles beyond the game's own 3 x 3 around the player. Normal is "
+               "the game's; 5 x 5, 7 x 7 and 9 x 9 show more distant streets and cost memory and performance. "
+               "The city detail controls set the range of detailed models across this grid.";
+    case Row::CityInnerDetail:
+        return "Changes how far detailed buildings and props appear in the central tiles. On an expanded city grid, this covers 5 x 5.";
+    case Row::CityOuterDetail:
+        return "Draws detailed buildings and props beyond the inner 5 x 5 when the experimental city ring is active.";
+    case Row::TrafficDistance:
+        return "How far away ambient cars appear and stay. Original is the game's own; 1.5x is the default. "
+               "This spreads the same cars over a wider area, so higher distances look emptier nearby "
+               "unless Traffic density is raised too.";
     case Row::TrafficDensity:
         return "How many cars drive around. Original is the game's own; higher levels allow more ambient "
-               "traffic in each area. Experimental: busier roads cost performance.";
+               "traffic in each area. Traffic distance spreads these cars further out, so raise both together "
+               "to keep streets busy. Experimental: busier roads cost performance.";
     case Row::PedDensity:
         return "How many pedestrians fill the streets. Original is the game's own; higher levels spawn more "
                "people at each spawn point. 3x also raises the game's crowd budget and is experimental. Busier "
@@ -546,7 +744,10 @@ const char *Help(Row row) {
     case Row::DepthOfField:
         return "Adds distance blur to the finished 3D frame.";
     case Row::AmbientOcclusion:
-        return "Off, half or full resolution depth-based ambient occlusion. Half is cheaper and softer.";
+        return "Depth-based ambient occlusion. SSAO is a little cheaper but grainier; GTAO is the higher quality. "
+               "Set the resolution with Occlusion quality.";
+    case Row::AoQuality:
+        return "Resolution of the ambient occlusion. Half is cheaper and softer; Full is sharper. Kept while occlusion is off.";
     case Row::BuildingSeamFix:
         return "Experimental: keeps detailed buildings visible where simplified city meshes overlap. Takes effect immediately.";
     case Row::PcContrast:
@@ -606,6 +807,8 @@ const char *Help(Row row) {
                "loading while on.";
     case Row::DumpFormat:
         return "File format for dumped textures.";
+    case Row::Controls:
+        return "Rebind the keyboard, mouse and controller. The button prompts follow your choices.";
     case Row::Defaults:
         return "Resets every option in this menu. Display changes still need Apply.";
     case Row::Close:
@@ -665,6 +868,22 @@ std::string Value(Row row) {
         return choices::PedDensityName(s.ped_density);
     case Row::TrafficDensity:
         return choices::TrafficDensityName(s.traffic_density);
+    case Row::TrafficDistance:
+        return choices::TrafficDistanceName(s.traffic_distance);
+    case Row::CityRange: {
+        constexpr const char* kNames[] = {"Normal", "5 x 5", "7 x 7", "9 x 9"};
+        const uint32_t r = std::atomic_ref(s.city_range).load(std::memory_order_relaxed);
+        return kNames[r < 4 ? r : 0];
+    }
+    case Row::CityInnerDetail:
+    case Row::CityOuterDetail: {
+        const uint32_t scale = row == Row::CityInnerDetail
+            ? std::atomic_ref(s.city_inner_detail).load(std::memory_order_relaxed)
+            : std::atomic_ref(s.city_outer_detail).load(std::memory_order_relaxed);
+        if (!scale) return "Off";
+        std::snprintf(text, sizeof(text), "%ux", scale);
+        return text;
+    }
     case Row::Anisotropic:
         if (!s.aniso) return "Game default";
         std::snprintf(text, sizeof(text), "%ux", s.aniso);
@@ -687,7 +906,12 @@ std::string Value(Row row) {
     case Row::DepthOfField:
         return s.dof ? "On" : "Off";
     case Row::AmbientOcclusion:
-        return s.ao == 1 ? "Half" : s.ao == 2 ? "Full" : "Off";
+        {
+            constexpr const char* kNames[] = {"Off", "SSAO", "GTAO"};
+            return kNames[choices::AoMethodChoice(s.ao, s.ao_method)];
+        }
+    case Row::AoQuality:
+        return s.ao_quality == 1 ? "Half" : "Full";
     case Row::BuildingSeamFix:
         return s.building_seam_fix ? "On" : "Off";
     case Row::PcContrast:
@@ -839,6 +1063,29 @@ bool Change(Row row, int direction) {
         // read by the traffic hook on the game thread: a single aligned 32-bit store
         changed = set(s.traffic_density, choices::Step(choices::kTrafficDensities, s.traffic_density, direction));
         break;
+    case Row::TrafficDistance:
+        // read by the traffic hooks on the game thread: a single aligned 32-bit store
+        changed = set(s.traffic_distance, choices::Step(choices::kTrafficDistances, s.traffic_distance, direction));
+        break;
+    case Row::CityRange: {
+        // read by the city ring on the game thread: a single aligned 32-bit store
+        const uint32_t r = std::atomic_ref(s.city_range).load(std::memory_order_relaxed);
+        const uint32_t next = choices::Step(choices::kCityRanges, r, direction);
+        changed = next != r;
+        std::atomic_ref(s.city_range).store(next, std::memory_order_relaxed);
+        break;
+    }
+    case Row::CityInnerDetail:
+    case Row::CityOuterDetail: {
+        const bool inner = row == Row::CityInnerDetail;
+        std::atomic_ref scale(inner ? s.city_inner_detail : s.city_outer_detail);
+        const uint32_t old = scale.load(std::memory_order_relaxed);
+        const uint32_t next = inner ? choices::Step(choices::kCityInnerDetail, old, direction)
+                                    : choices::Step(choices::kCityOuterDetail, old, direction);
+        changed = next != old;
+        if (changed) scale.store(next, std::memory_order_relaxed);
+        break;
+    }
     case Row::ShadowQuality:
         changed = set(s.shadow_resolution, choices::Step(choices::kShadowLevels, s.shadow_resolution, direction));
         break;
@@ -858,7 +1105,19 @@ bool Change(Row row, int direction) {
         changed = set(s.aniso, choices::Step(choices::kAnisoLevels, s.aniso, direction));
         break;
     case Row::AmbientOcclusion:
-        changed = set(s.ao, choices::Step(choices::kAoModes, s.ao, direction));
+        {
+            const uint32_t c = choices::Step(choices::kAoMethodChoices, choices::AoMethodChoice(s.ao, s.ao_method), direction);
+            uint32_t method = s.ao_method;
+            const uint32_t ao = choices::ApplyAoMethodChoice(c, s.ao_quality, method);
+            const bool m = set(s.ao_method, method);
+            changed = set(s.ao, ao) || m;
+        }
+        break;
+    case Row::AoQuality:
+        {
+            const bool q = set(s.ao_quality, choices::Step(choices::kAoQualities, s.ao_quality, direction));
+            changed = (s.ao ? set(s.ao, s.ao_quality) : false) || q;
+        }
         break;
     case Row::Msaa: {
         const auto current = app::MsaaSamples();
@@ -950,6 +1209,8 @@ void Activate(Row row) {
     case Kind::Action:
         if (row == Row::ApplyDisplay)
             ApplyDisplayChanges();
+        else if (row == Row::Controls)
+            OpenControls();
         else if (row == Row::Defaults)
             RestoreDefaults();
         else if (row == Row::Close)
@@ -985,7 +1246,20 @@ uint32_t NavPresses() {
     return pressed;
 }
 
+void HandleControlsNavigation(uint32_t pressed) {
+    auto &c = g_controls;
+    if (pressed & kBack) g_menu.controls = false;
+    if (pressed & kUp) c.selected = (c.selected + kControlRows - 1) % kControlRows;
+    if (pressed & kDown) c.selected = (c.selected + 1) % kControlRows;
+    if (pressed & kAccept) ActivateControl(c.selected);
+}
+
 void HandleNavigation() {
+    if (g_menu.controls) {
+        const uint32_t pressed = NavPresses();  // also keeps the repeater current during a capture
+        if (!CaptureControls()) HandleControlsNavigation(pressed);
+        return;
+    }
     const uint32_t pressed = NavPresses();
     if (pressed & kBack) {
         CloseMenu();
@@ -1040,6 +1314,7 @@ void DrawRows(float scale) {
 
     for (int i = 0; i < kRowCount; ++i) {
         const Row row = kRows[i];
+        if (row == Row::CityOuterDetail && !game::city_grid::OuterDetailAvailable()) continue;
         if (const char *section = Section(row)) {
             ImGui::Spacing();
             if (*section)
@@ -1088,6 +1363,35 @@ void DrawRows(float scale) {
     scrolled_to = g_menu.selected;
 }
 
+void DrawControls(float scale) {
+    auto &c = g_controls;
+    const float value_x = ImGui::GetWindowContentRegionMax().x - 260.0f * scale;
+    for (int row = 0; row < kControlRows; ++row) {
+        if (row == 0) ImGui::SeparatorText("KEYBOARD AND MOUSE");
+        if (row == kKeyRows) ImGui::SeparatorText("CONTROLLER");
+        if (row == kKeyRows + kPadRows) ImGui::Separator();
+        const char *label = row < kKeyRows             ? kKeyActions[row]
+                            : row < kKeyRows + kPadRows ? kPadActions[row - kKeyRows]
+                            : row == kKeyRows + kPadRows ? "Reset keyboard"
+                            : row == kKeyRows + kPadRows + 1 ? "Reset controller"
+                                                             : "Back";
+        ImGui::PushID(row);
+        if (ImGui::Selectable(label, c.selected == row, ImGuiSelectableFlags_AllowOverlap) && c.capture < 0) {
+            c.selected = row;
+            ActivateControl(row);
+        }
+        if (c.selected == row && !ImGui::IsItemVisible()) ImGui::SetScrollHereY(0.5f);
+        const std::string value = c.capture == row ? (row < kKeyRows ? "Press a key..." : "Press a button...")
+                                                   : ControlValue(row);
+        if (!value.empty()) {
+            ImGui::SameLine(value_x);
+            if (c.capture == row) ImGui::TextColored({1.0f, 0.8f, 0.35f, 1.0f}, "%s", value.c_str());
+            else ImGui::TextUnformatted(value.c_str());
+        }
+        ImGui::PopID();
+    }
+}
+
 void DrawMenu(double fps) {
     const ImGuiViewport *viewport = ImGui::GetMainViewport();
     const float scale = std::clamp(viewport->Size.y / 720.0f, 1.0f, 4.0f);
@@ -1109,7 +1413,7 @@ void DrawMenu(double fps) {
                            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav;
     if (ImGui::Begin("Graphics", nullptr, flags)) {
         ImGui::SetWindowFontScale(scale);
-        ImGui::TextUnformatted("GRAPHICS");
+        ImGui::TextUnformatted(g_menu.controls ? "CONTROLS" : "GRAPHICS");
         char rate[32];
         std::snprintf(rate, sizeof(rate), "%.1f FPS", fps);
         ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - ImGui::CalcTextSize(rate).x);
@@ -1121,7 +1425,8 @@ void DrawMenu(double fps) {
         const float rows_max = std::max(line * 4, viewport->Size.y * 0.92f - line * 7 - 40 * scale);
         ImGui::SetNextWindowSizeConstraints({0, 0}, {FLT_MAX, rows_max});
         ImGui::BeginChild("rows", {0, 0}, ImGuiChildFlags_AutoResizeY, ImGuiWindowFlags_NoNav);
-        DrawRows(scale);
+        if (g_menu.controls) DrawControls(scale);
+        else DrawRows(scale);
         ImGui::EndChild();
 
         ImGui::Spacing();
@@ -1130,9 +1435,14 @@ void DrawMenu(double fps) {
         const float help_height = ImGui::GetTextLineHeightWithSpacing() * 2;
         ImGui::BeginChild("help", {0, help_height}, ImGuiChildFlags_None, ImGuiWindowFlags_NoNav);
         ImGui::PushTextWrapPos(0);
-        ImGui::TextDisabled("%s", Help(kRows[g_menu.selected]));
+        ImGui::TextDisabled("%s", g_menu.controls ? "Enter / A on a row, then press the new key or button. A new key "
+                                                    "becomes the main one; Delete clears the row, Escape cancels. "
+                                                    "Taking a controller button from another action swaps them."
+                                                  : Help(kRows[g_menu.selected]));
         ImGui::PopTextWrapPos();
         ImGui::EndChild();
+        if (g_menu.save_failed)
+            ImGui::TextColored({1.0f, 0.45f, 0.35f, 1.0f}, "Could not save settings. Close again to return to the game.");
         if (g_menu.apply_failed)
             ImGui::TextColored({1.0f, 0.45f, 0.35f, 1.0f}, "Display change failed; the previous mode is still in use.");
         ImGui::Separator();

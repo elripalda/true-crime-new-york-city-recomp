@@ -18,11 +18,16 @@
 #include <toml++/toml.hpp>
 
 #include "app/app.h"
+#include "app/settings_store.h"
 #include "core/log.h"
 
 namespace app {
 
 namespace {
+
+toml::table Table();
+toml::table g_saved_settings;
+std::mutex g_save_lock;
 
 const char* kModes[] = {"fullscreen", "borderless", "windowed"};
 
@@ -38,7 +43,9 @@ std::filesystem::path ConfigDir() {
     return ExeDir();
 }
 
-std::filesystem::path File() {
+} // namespace
+
+std::filesystem::path SettingsPath() {
     if (const char* override = std::getenv("TCNYC_SETTINGS"); override && *override) {
         std::filesystem::path p(override);
         if (p.has_filename()) return p;
@@ -46,8 +53,6 @@ std::filesystem::path File() {
     }
     return ConfigDir() / kGame.settings;
 }
-
-} // namespace
 
 void LogSystem() {
     LOGR("Linux: SDL3 host");
@@ -58,9 +63,10 @@ void Load() {
     Settings& s = Get();
     toml::table t;
     try {
-        t = toml::parse_file(File().string());
+        t = toml::parse_file(SettingsPath().string());
     } catch (...) {
-        LOGR("Settings: no file at %s, using defaults", File().string().c_str());
+        LOGR("Settings: no readable file at %s, using defaults", SettingsPath().string().c_str());
+        g_saved_settings = Table();
         return;
     }
     std::string mode = t["display_mode"].value_or(std::string(kModes[uint32_t(s.display_mode)]));
@@ -98,11 +104,7 @@ void Load() {
     s.shadow_resolution = uint32_t(std::clamp<int64_t>(t["shadow_resolution"].value_or(int64_t(s.shadow_resolution)), 0, 2));
     s.shadow_softness = uint32_t(std::clamp<int64_t>(t["shadow_softness"].value_or(int64_t(s.shadow_softness)), 0, 2));
     s.dof = t["dof"].value_or(s.dof);
-    if (t["ao"].is_boolean()) {
-        s.ao = t["ao"].value_or(false) ? 2u : 0u;  // older settings stored a boolean
-    } else {
-        s.ao = uint32_t(std::clamp<int64_t>(t["ao"].value_or(int64_t(s.ao)), 0, 2));
-    }
+    LoadOcclusionSettings(s, t);
     s.building_seam_fix = t["building_seam_fix"].value_or(s.building_seam_fix);
     // the LOD hooks read it on the game thread (lod.cpp)
     std::atomic_ref(s.object_detail)
@@ -110,6 +112,9 @@ void Load() {
                std::memory_order_relaxed);
     std::atomic_ref(s.traffic_density)
         .store(uint32_t(std::clamp<int64_t>(t["traffic_density"].value_or(int64_t(s.traffic_density)), 0, 5)),
+               std::memory_order_relaxed);
+    std::atomic_ref(s.traffic_distance)
+        .store(uint32_t(std::clamp<int64_t>(t["traffic_distance"].value_or(int64_t(s.traffic_distance)), 0, 2)),
                std::memory_order_relaxed);
     std::atomic_ref(s.ped_density)
         .store(uint32_t(std::clamp<int64_t>(t["ped_density"].value_or(int64_t(s.ped_density)), 0, 3)),
@@ -131,6 +136,7 @@ void Load() {
     if (s.hdr_peak && s.hdr_peak < 400) s.hdr_peak = 400;
     s.hdr_highlights = std::min(t["hdr_highlights"].value_or(s.hdr_highlights), 100u);
     s.join_ip = t["join_ip"].value_or(s.join_ip);
+    s.music_folder = t["music_folder"].value_or(s.music_folder);
     for (const Option& o : kGame.options) {
         if (o.flag) {
             auto flag = std::atomic_ref(*o.flag);
@@ -140,6 +146,7 @@ void Load() {
         }
     }
     if (kGame.load) kGame.load(&t);
+    g_saved_settings = Table();
 }
 
 namespace {
@@ -166,12 +173,15 @@ toml::table Table() {
                   {"shadow_softness", int64_t(s.shadow_softness)},
                   {"dof", s.dof},
                   {"ao", int64_t(s.ao)},
+                  {"ao_method", int64_t(s.ao_method)},
+                  {"ao_quality", int64_t(s.ao_quality)},
                   {"building_seam_fix", s.building_seam_fix},
                   {"object_detail", int64_t(s.object_detail)},
                   {"ped_detail", int64_t(s.ped_detail)},
                   {"ped_limit", int64_t(s.ped_limit)},
                   {"ped_density", int64_t(s.ped_density)},
                   {"traffic_density", int64_t(s.traffic_density)},
+                  {"traffic_distance", int64_t(s.traffic_distance)},
                   {"pc_contrast", s.pc_contrast},
                   {"custom_textures", s.custom_textures},
                   {"dump_textures", s.dump_textures},
@@ -180,7 +190,8 @@ toml::table Table() {
                   {"hdr_paper_white", int64_t(s.hdr_paper_white)},
                   {"hdr_peak", int64_t(s.hdr_peak)},
                   {"hdr_highlights", int64_t(s.hdr_highlights)},
-                  {"join_ip", s.join_ip}};
+                  {"join_ip", s.join_ip},
+                  {"music_folder", s.music_folder}};
     for (const Option& o : kGame.options) {
         if (o.flag) t.insert(o.key, std::atomic_ref(*o.flag).load(std::memory_order_relaxed));
         else t.insert(o.key, int64_t(*o.value));
@@ -191,39 +202,26 @@ toml::table Table() {
 
 } // namespace
 
-void Save() {
-    SettingsLock guard;
-    std::ostringstream out;
-    out << Table() << "\n";
-    const std::string text = out.str();
-    const std::filesystem::path path = File();
-
-    std::error_code ec;
-    if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path(), ec);
-
-    // a lock beside the settings file serializes instances of the same user
-    const std::string lock_path = path.string() + ".lock";
-    const int lock_fd = ::open(lock_path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0666);
-    if (lock_fd >= 0) ::flock(lock_fd, LOCK_EX);
-
-    const std::string temp = path.string() + ".tmp." + std::to_string(::getpid());
-    bool ok = false;
-    if (FILE* f = std::fopen(temp.c_str(), "wb")) {
-        ok = std::fwrite(text.data(), 1, text.size(), f) == text.size();
-        ok = std::fflush(f) == 0 && ok;
-        ok = ::fsync(::fileno(f)) == 0 && ok;
-        std::fclose(f);
-    }
-    if (!ok) {
-        LOGE("Settings: could not write %s", temp.c_str());
-        std::remove(temp.c_str());
-    } else if (std::rename(temp.c_str(), path.c_str()) != 0) {
-        LOGE("Settings: could not replace %s (%d)", path.c_str(), errno);
-        std::remove(temp.c_str());
-    }
-    if (lock_fd >= 0) {
-        ::flock(lock_fd, LOCK_UN);
-        ::close(lock_fd);
+bool Save() {
+    try {
+        const std::lock_guard save_guard(g_save_lock);
+        toml::table current, changes;
+        const auto path = SettingsPath();
+        {
+            SettingsLock guard;
+            current = Table();
+            changes = ChangedSettings(g_saved_settings, current);
+        }
+        if (!std::filesystem::exists(path)) changes = current;
+        MergeSettingsTable(path, changes, &current);
+        {
+            SettingsLock guard;
+            g_saved_settings = std::move(current);
+        }
+        return true;
+    } catch (const std::exception& failure) {
+        LOGE("Settings: %s", failure.what());
+        return false;
     }
 }
 
@@ -231,7 +229,7 @@ void LogSettings() {
     std::ostringstream text;
     text << Table();
     std::istringstream lines(text.str());
-    LOGR("Settings: %s", File().string().c_str());
+    LOGR("Settings: %s", SettingsPath().string().c_str());
     for (std::string line; std::getline(lines, line);)
         if (!line.empty()) LOGR("  %s", line.c_str());
 }

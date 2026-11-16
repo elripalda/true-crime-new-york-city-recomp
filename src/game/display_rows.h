@@ -33,6 +33,7 @@ enum class Option {
     Sharpening,
     FieldOfView,
     ObjectDetail,
+    CityRange,
     Anisotropic,
     Msaa,
     Smaa,
@@ -41,6 +42,7 @@ enum class Option {
     BloomStrength,
     DepthOfField,
     AmbientOcclusion,
+    AoQuality,
     ShadowQuality,
     ShadowSoftness,
     BuildingSeamFix,
@@ -67,7 +69,7 @@ inline constexpr Option kMainOptions[] = {
     Option::Upscaler,    Option::Sharpening,
     Option::FieldOfView, Option::ObjectDetail,     Option::Anisotropic,     Option::Msaa,
     Option::Smaa,        Option::Taa,              Option::Bloom,            Option::BloomStrength,
-    Option::DepthOfField,    Option::AmbientOcclusion, Option::ShadowQuality, Option::ShadowSoftness,
+    Option::DepthOfField,    Option::AmbientOcclusion, Option::AoQuality, Option::ShadowQuality, Option::ShadowSoftness,
     Option::BuildingSeamFix, Option::PcContrast,   Option::VSync,
 #ifdef _WIN32
     Option::LowLatency,
@@ -107,7 +109,7 @@ struct Values {
     bool vsync, smaa, show_fps;
     uint64_t size, applied;
     uint32_t mode = 1, applied_mode = 1; // app::DisplayMode: 0 fullscreen, 1 borderless, 2 windowed
-    uint32_t object_detail = 0, ao = 0;
+    uint32_t object_detail = 0, ao = 0, ao_method = 0, ao_quality = 2, city_range = 0;
     bool bloom = true, dof = true, building_seam_fix = true, pc_contrast = true, hdr = false;
     uint32_t hdr_paper_white = 200, hdr_peak = 0, hdr_highlights = 40;  // app::Settings defaults
     uint32_t display_peak = 0; // the HDR display's reported peak in nits, 0 when unknown (read only)
@@ -276,8 +278,17 @@ inline void Change(Values &v, Option option, int direction, std::span<const uint
     case Option::DepthOfField:
         v.dof = !v.dof;
         break;
-    case Option::AmbientOcclusion:
-        v.ao = choices::Step(choices::kAoModes, v.ao, direction);
+    case Option::AmbientOcclusion: {
+        const uint32_t c = choices::Step(choices::kAoMethodChoices, choices::AoMethodChoice(v.ao, v.ao_method), direction);
+        v.ao = choices::ApplyAoMethodChoice(c, v.ao_quality, v.ao_method);
+        break;
+    }
+    case Option::AoQuality:
+        v.ao_quality = choices::Step(choices::kAoQualities, v.ao_quality, direction);
+        if (v.ao) v.ao = v.ao_quality;
+        break;
+    case Option::CityRange:
+        v.city_range = choices::Step(choices::kCityRanges, v.city_range, direction);
         break;
     case Option::BuildingSeamFix:
         v.building_seam_fix = !v.building_seam_fix;
@@ -422,9 +433,19 @@ inline void Text(const Values &v, Option option, char (&text)[kTextBytes]) {
     case Option::DepthOfField:
         std::snprintf(text, kTextBytes, "DEPTH OF FIELD %s", OnOff(v.dof));
         break;
-    case Option::AmbientOcclusion:
-        std::snprintf(text, kTextBytes, "OCCLUSION %s", v.ao == 1 ? "HALF" : v.ao == 2 ? "FULL" : "OFF");
+    case Option::AmbientOcclusion: {
+        constexpr const char *kNames[] = {"OFF", "SSAO", "GTAO"};
+        std::snprintf(text, kTextBytes, "OCCLUSION %s", kNames[choices::AoMethodChoice(v.ao, v.ao_method)]);
         break;
+    }
+    case Option::AoQuality:
+        std::snprintf(text, kTextBytes, "AO QUALITY %s", v.ao_quality == 1 ? "HALF" : "FULL");
+        break;
+    case Option::CityRange: {  // experimental outer city ring
+        constexpr const char *kNames[] = {"NORMAL", "5X5", "7X7", "9X9"};
+        std::snprintf(text, kTextBytes, "CITY RANGE %s", kNames[v.city_range < 4 ? v.city_range : 0]);
+        break;
+    }
     case Option::BuildingSeamFix:
         std::snprintf(text, kTextBytes, "SEAM FIX %s", OnOff(v.building_seam_fix));
         break;

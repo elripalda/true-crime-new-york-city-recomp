@@ -14,6 +14,21 @@ inline constexpr uint32_t kMinRenderPercent = 20, kMaxRenderPercent = 200;
 inline constexpr uint32_t kAnisoLevels[] = {0, 2, 4, 8, 16}; // 0: as the game asks
 inline constexpr uint32_t kMsaaSamples[] = {0, 2, 4, 8};     // 0: off
 inline constexpr uint32_t kAoModes[] = {0, 1, 2};            // off, half resolution, full resolution
+// Two menu rows. Ambient occlusion: 0 off, 1 SSAO (listed first: the lighter one), 2 GTAO; it sets
+// app::Settings::ao_method (0 GTAO, 1 SSAO) and turns ao on at ao_quality. Occlusion quality: 1 half, 2 full.
+inline constexpr uint32_t kAoMethodChoices[] = {0, 1, 2};
+inline constexpr uint32_t kAoQualities[] = {1, 2};
+inline constexpr uint32_t AoMethodChoice(uint32_t ao, uint32_t method) { return ao == 0 ? 0 : method == 1 ? 1 : 2; }
+// applies a method choice: returns the new ao, writes the new method
+inline constexpr uint32_t ApplyAoMethodChoice(uint32_t choice, uint32_t quality, uint32_t &method) {
+    if (choice == 0) return 0;
+    method = choice == 1 ? 1 : 0;
+    return quality == 1 ? 1 : 2;
+}
+// City draw distance (app::Settings::city_range): 0 the game's 3x3 tiles, then a 5x5, 7x7 or 9x9 ring.
+inline constexpr uint32_t kCityRanges[] = {0, 1, 2, 3};
+inline constexpr uint32_t kCityInnerDetail[] = {1, 2, 3};
+inline constexpr uint32_t kCityOuterDetail[] = {0, 1, 2, 3};
 inline constexpr uint32_t kFsr3 = 2;
 // Keep DLSS's setting value even when the optional backend was omitted.
 inline constexpr uint32_t kDlss = 3;
@@ -82,6 +97,19 @@ inline const char *PedDensityName(uint32_t level) {
     static const char *const names[] = {"Original", "1.5x", "2x", "3x (Experimental)"};
     return names[level < 4 ? level : 0];
 }
+// Traffic distance (app::Settings::traffic_distance): how far out ambient cars spawn. Cars are removed at 4/3 of
+// that range so a new car is not removed straight away (Original keeps the game's own ranges).
+inline constexpr uint32_t kTrafficDistances[] = {0, 1, 2};
+inline const char *TrafficDistanceName(uint32_t level) {
+    static const char *const names[] = {"Original", "1.5x", "2x"};
+    return names[level < 3 ? level : 1];
+}
+inline float TrafficSpawnScale(uint32_t level) {
+    constexpr float kScales[] = {1.0f, 1.5f, 2.0f};
+    return kScales[level < 3 ? level : 1];
+}
+inline float TrafficDespawnScale(uint32_t level) { return level == 0 ? 1.0f : TrafficSpawnScale(level) * 4.0f / 3.0f; }
+
 // Traffic density (app::Settings::traffic_density): multiplier on the ambient car budget.
 inline constexpr uint32_t kTrafficDensities[] = {0, 1, 2, 3, 4, 5};
 inline const char *TrafficDensityName(uint32_t level) {
