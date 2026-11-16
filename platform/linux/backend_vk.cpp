@@ -4056,6 +4056,14 @@ void VulkanBackend::ResetFrame() {
     upload_used_ = 0;
     draw_set_next_ = 0;
     draw_set_cache_.clear();
+    // Present waits for submitted draws before resetting the frame, including
+    // early returns through SceneWait. Keep samplers while a recording still
+    // references them or a failed fence wait leaves completion uncertain.
+    if (samplers_.size() >= 4096 && !failed_ && !recording_ && !DeferredPending()) {
+        for (const auto& [key, sampler] : samplers_) vkDestroySampler(device_, sampler, nullptr);
+        samplers_.clear();
+        sampler_memo_valid_ = 0;
+    }
     // the upload ring starts over: cached constant offsets and dynamic-state memos are stale
     vsc_valid_ = dc_valid_ = false;
     RefreshAoReadyView();  // the AO workers' progress, for this frame's draws to read without locking
@@ -7812,15 +7820,6 @@ VkSampler VulkanBackend::EnsureSampler(const State& s, int stage, const TexInfo&
     }
     VkSampler sampler = VK_NULL_HANDLE;
     if (vkCreateSampler(device_, &info_vk, nullptr, &sampler) != VK_SUCCESS) return white_sampler_;
-    if (samplers_.size() >= 4096) {
-        // Guest border colours make a new sampler per distinct state. Trim the cache
-        // instead of growing it for the life of the process.
-        vkDeviceWaitIdle(device_);
-        for (auto& [old_key, old_sampler] : samplers_)
-            if (old_sampler && old_sampler != white_sampler_) vkDestroySampler(device_, old_sampler, nullptr);
-        samplers_.clear();
-        sampler_memo_valid_ = 0;
-    }
     samplers_[key] = sampler;
     if (stage < 4) {
         sampler_memo_key_[stage] = key;

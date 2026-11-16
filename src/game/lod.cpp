@@ -174,17 +174,15 @@ X86_FUNC(sub_0021E1A0) {
     // The distant instance draw passes the car object too. Read it only after the
     // caller check: [esp+8] is not a valid object pointer on every other path.
     const bool distant = ret0 == TC_ADDR(0x1388AF);
-    uint32_t obj = 0, vt = 0;
-    if ((body || distant) && mem::IsCommitted(ctx.esp + 8)) {
-        obj = X86_MEM32(ctx.esp + 8);
-        if (obj && mem::IsCommitted(obj)) vt = X86_MEM32(obj);
-    }
+    const uint32_t obj = (body || distant) && mem::IsCommitted(ctx.esp + 8) ? X86_MEM32(ctx.esp + 8) : 0;
+    const bool valid_object = obj && mem::IsCommitted(obj);
     const bool was = t_allowed;
-    const bool allowed = (body || distant) && AllowedType(vt);
     if (body) {
-        t_allowed = allowed;
+        const uint32_t vt = valid_object ? X86_MEM32(obj) : 0;
+        t_allowed = valid_object && AllowedType(vt);
         static const bool trace = std::getenv("XBE_TRACE_VEHICLES") != nullptr;
-        if (trace) {  // vtable census of objects drawn by the dynamic-object body draw (execution plan 4.1)
+        if (trace && valid_object && mem::IsCommitted(obj + 0x448)) {
+            // Vtable census of objects drawn by the dynamic-object body draw (execution plan 4.1).
             static uint32_t vts[32] = {}, counts[32] = {}, n = 0, total = 0;
             uint32_t k = 0;
             while (k < n && vts[k] != vt) ++k;
@@ -199,9 +197,9 @@ X86_FUNC(sub_0021E1A0) {
     }
     // The callers that set the lamp bit from a moving value: the two body draws of the dynamic-object draw, and the
     // city instance draw 0x1387F0 for an instance carrying an object (distant traffic cars, model 0x2DA270), whose
-    // bit comes from 0x136E70's test of the instance's +8 against the same night amount. Gate on the car type so a
-    // non-car at one of these sites does not get a synthetic lamp threshold.
-    if (allowed)
+    // bit comes from 0x136E70's test of the instance's +8 against the same night amount. The LOD allowlist
+    // only identifies objects that can safely use a higher-detail mesh. These callers also draw cars outside it.
+    if (valid_object)
         DrawWithStableLamps(ctx, base, obj);
     else
         __imp__sub_0021E1A0(ctx, base);
