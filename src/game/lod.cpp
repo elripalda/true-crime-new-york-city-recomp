@@ -31,6 +31,8 @@
 #include "kernel/kernel.h"
 #include "xdk/hle.h"
 
+X86_EXTERN_FUNC(__imp__sub_0021E1A0);
+
 namespace {
 
 float Scale() {
@@ -48,14 +50,21 @@ thread_local uint32_t t_vehicle = 0;
 // their low-detail textures and drew bare with the detailed mesh, so other types keep the game's own depth.
 // XBE_VEHICLE_LOD (comma-separated hex vtables) replaces the list, for testing other types.
 thread_local bool t_allowed = false;
+constexpr uint32_t kActiveCarVtable = TC_ADDR(0x2D5A7C);
+constexpr uint32_t kTrafficCarVtable = TC_ADDR(0x2D9654);
+constexpr uint32_t kNight = TC_ADDR(0x363D3C);
+constexpr uint32_t kMaterialFlags = TC_ADDR(0x3F54CC);
+constexpr uint16_t kNightLights = 0x8000;
+
 bool AllowedType(uint32_t vtable) {
     static uint32_t list[16];
     static int n = -1;
     if (n < 0) {
         n = 0;
         if (const char *env = std::getenv("XBE_VEHICLE_LOD"); !env) {
-            list[n++] = TC_ADDR(0x2D5A7C);  // the active car
-            list[n++] = TC_ADDR(0x2D9654);  // ambient traffic: checked at Maximum, no bare or black cars (2026-11-15)        } else {
+            list[n++] = kActiveCarVtable;
+            list[n++] = kTrafficCarVtable;
+        } else {
             const char *p = env;
             while (*p && n < 16) {
                 char *end;
@@ -69,6 +78,19 @@ bool AllowedType(uint32_t vtable) {
     for (int i = 0; i < n; ++i)
         if (list[i] == vtable) return true;
     return false;
+}
+
+void ApplyCarNightLights(uint8_t *base) {
+    // Match the day/night switch used by the guest's separate lamp effects.
+    const uint16_t lights = X86_MEM8(kNight) ? kNightLights : 0;
+    X86_MEM16(kMaterialFlags) = (X86_MEM16(kMaterialFlags) & ~kNightLights) | lights;
+}
+
+void DrawCarWithStableLights(X86Context &ctx, uint8_t *base) {
+    const uint16_t flags = X86_MEM16(kMaterialFlags);
+    ApplyCarNightLights(base);
+    __imp__sub_0021E1A0(ctx, base);
+    X86_MEM16(kMaterialFlags) = flags;
 }
 
 // scales the float argument at esp + offset unless the call comes from inside a walker
@@ -102,6 +124,15 @@ X86_FUNC(sub_00142DB0) {
     t_vehicle--;
 }
 
+X86_EXTERN_FUNC(__imp__sub_0009DDB0);
+X86_FUNC(sub_0009DDB0) {
+    // Message 16 with a render context sets up the car material before the mesh walk.
+    // The guest can replace the entire mask here, including the night bit set at draw entry.
+    const bool setup_draw = X86_MEM32(ctx.esp + 4) == 16 && X86_MEM32(ctx.esp + 8) != 0;
+    __imp__sub_0009DDB0(ctx, base);
+    if (setup_draw) ApplyCarNightLights(base);
+}
+
 X86_EXTERN_FUNC(__imp__sub_0021C330);
 X86_FUNC(sub_0021C330) {
     ScaleDepth(ctx, base, 0x04);
@@ -121,12 +152,11 @@ X86_FUNC(sub_0021DC00) {
 }
 
 // sets which object the selectors below 0x21E1A0 belong to while the dynamic-object draw runs
-X86_EXTERN_FUNC(__imp__sub_0021E1A0);
 X86_FUNC(sub_0021E1A0) {
     const uint32_t ret0 = X86_MEM32(ctx.esp);
     const bool was = t_allowed;
+    const uint32_t obj = X86_MEM32(ctx.esp + 8), vt = X86_MEM32(obj);
     if (ret0 == TC_ADDR(0x13F5CA) || ret0 == TC_ADDR(0x13F7C2)) {
-        const uint32_t obj = X86_MEM32(ctx.esp + 8), vt = X86_MEM32(obj);
         t_allowed = AllowedType(vt);
         static const bool trace = std::getenv("XBE_TRACE_VEHICLES") != nullptr;
         if (trace) {  // vtable census of objects drawn by the dynamic-object body draw (execution plan 4.1)
@@ -142,7 +172,10 @@ X86_FUNC(sub_0021E1A0) {
                 for (uint32_t i = 0; i < n; ++i) LOGR("vehicles: vtable %08X drawn %u times", vts[i], counts[i]);
         }
     }
-    __imp__sub_0021E1A0(ctx, base);
+    if (vt == kActiveCarVtable || vt == kTrafficCarVtable)
+        DrawCarWithStableLights(ctx, base);
+    else
+        __imp__sub_0021E1A0(ctx, base);
     t_allowed = was;
 }
 
@@ -160,11 +193,11 @@ X86_FUNC(sub_00137C00) {
     }();
     const uint32_t ret = X86_MEM32(ctx.esp);
     __imp__sub_00137C00(ctx, base);
-    if (ret == 0x00144670 && std::getenv("XBE_INSTANCE_TRACE")) {
+    if (ret == TC_ADDR(0x00144670) && std::getenv("XBE_INSTANCE_TRACE")) {
         static uint32_t calls = 0, small = 0;
         ++calls;
         if (X87_ST(0) < 1.0) ++small;
         if ((calls & 0xFFFF) == 0) LOGR("instance cull: %u calls, last size %.3f, %u under 1.0", calls, X87_ST(0), small);
     }
-    if (factor != 1.0 && ret == 0x00144670) X87_ST(0) *= factor;
+    if (factor != 1.0 && ret == TC_ADDR(0x00144670)) X87_ST(0) *= factor;
 }

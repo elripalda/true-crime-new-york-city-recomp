@@ -87,7 +87,7 @@ struct FrameSite {
     uint32_t to;
 };
 #if defined(TCNYC_PAL) && TCNYC_PAL
-inline constexpr FrameSite kFrameSites[] = {{0x0013F086, 0x204, 0x804}};
+inline constexpr FrameSite kFrameSites[] = {{0x0013F086, 0x204, 0x1004}};
 #else
 inline constexpr FrameSite kFrameSites[] = {{0x0013E7F6, 0x204, 0x1004}};
 #endif
@@ -123,10 +123,14 @@ inline const char kLightFromMinus4[] = "0x34937Cu";
 // at city + 0x6430, filled by 0x14A240/0x148A00 from the game's 3x3 tiles only and drawn by 0x144250 and
 // 0x1387F0. Every site that addresses it (base +0x5AD0/+0x5AD4) or checks its 300 cap (0x12C) goes through
 // XBE_INST(city) / xbe_inst_cap, so the host can move it to a larger array for the outer ring. Until it does,
-// XBE_INST(city) is city + 0x5AD0 and the cap is 300: unchanged behaviour. NTSC addresses only.
+// XBE_INST(city) is city + 0x5AD0 and the cap is 300: unchanged behaviour. USA and PAL sites.
 #if defined(TCNYC_PAL) && TCNYC_PAL
-inline constexpr uint32_t kInstSites[] = {0};
-inline constexpr uint32_t kInstSiteCount = 0;
+inline constexpr uint32_t kInstSites[] = {0x001390BF, 0x00139610, 0x00140170, 0x00144C80, 0x001492AA, 0x001492D7,
+                                          0x00149350, 0x0014935C, 0x00149391, 0x0014B029, 0x0014B056, 0x0014B153,
+                                          0x0014B165, 0x0014B16B, 0x0014B1B0, 0x0014B1B5,
+                                          0x001488C3, 0x001488DF, 0x001488F6, 0x00148900, 0x0014890D, 0x00147E13,
+                                          0x00147E1F, 0x00147E44};  // PAL: matched against the USA sites below
+inline constexpr uint32_t kInstSiteCount = sizeof(kInstSites) / sizeof(kInstSites[0]);
 #else
 inline constexpr uint32_t kInstSites[] = {0x0013882F, 0x00138D80, 0x0013F8E0, 0x00144590, 0x00148BBA, 0x00148BE7,
                                           0x00148C60, 0x00148C6C, 0x00148CA1, 0x0014A939, 0x0014A966, 0x0014AA63,
@@ -149,37 +153,56 @@ inline const char kInstDef[] =
 // table ([[esp+0x44]+0x50][idx], 0x13EC93) but then reads the city's table ([[0x37F8FC]+0x50][idx], 0x13ECB6)
 // and dereferences it at 0x13ECB9. In the normal game both are the same object; with the outer ring they can
 // differ, the city entry is null, and the pass crashed reading guest 0x30. Take the game's own skip path
-// (0x13EE8A, the target of the first check) when that entry is null. NTSC only.
+// (0x13EE8A, the target of the first check) when that entry is null. Unused (reverted).
 struct AppendSite {
     uint32_t address;
     const char* text;
 };
+// The leaf test applies its size-dependent cutoff before the stock frustum, detail and sorted-list tests.
+// The original slots default to 1x for both tests.
+inline constexpr char kRingInstanceRadius[] =
+    " ctx.xmm[1].f[0] *= X86_MEM32(ctx.edi + 0xA50u) >= 0x70000000u"
+    " ? xbe_ring_instance_scale : xbe_inner_instance_scale;";
+inline constexpr char kRingInstanceLeafRadius[] =
+    " if (!cf) cf = ctx.xmm[0].f[0] < ctx.xmm[2].f[0] * (X86_MEM32(ctx.esp + 0x18u) >= 0x70000000u"
+    " ? xbe_ring_instance_scale : xbe_inner_instance_scale);";
 #if defined(TCNYC_PAL) && TCNYC_PAL
-inline constexpr AppendSite kAppendSites[] = {{0, ""}};
-inline constexpr uint32_t kAppendSiteCount = 0;
+inline constexpr AppendSite kAppendSites[] = {{0x0013F628, " ctx.xmm[0].f[0] *= xbe_draw_radius_scale;"},
+                                               {0x0013F3AB, " xbe_portal_slot_hits[ctx.edx >= 0x70000000u ? 1 : 0]++;"},
+                                               {0x001494F5, kRingInstanceRadius},
+                                               {0x00149296, kRingInstanceLeafRadius}};
 #else
-inline constexpr AppendSite kAppendSites[] = {{0, ""}};  // 0x13ECB6 null skip reverted: crashed sooner (181 s)
-inline constexpr uint32_t kAppendSiteCount = 0;
+inline constexpr AppendSite kAppendSites[] = {{0x0013ED98, " ctx.xmm[0].f[0] *= xbe_draw_radius_scale;"},
+                                               {0x0013EB1B, " xbe_portal_slot_hits[ctx.edx >= 0x70000000u ? 1 : 0]++;"},
+                                               {0x00148E05, kRingInstanceRadius},
+                                               {0x00148BA6, kRingInstanceLeafRadius}};
 #endif
+inline constexpr uint32_t kAppendSiteCount = sizeof(kAppendSites) / sizeof(kAppendSites[0]);
 
 // Constants replaced at a guest instruction. 0x13E7F0 also keeps a byte array of portal flags at esp+0xA0+i next to
 // its pointer list at esp+0x190+i*4: only 240 bytes before the flags overwrite portal pointers. The 9x9 ring pushes
 // more portals than that; a corrupted pointer then gave an object with a null table (+0x54) and a crash at
 // 0x13EB1E (read of guest 0x30, ~17 min into the attract screen). With the frame at 0x1004 the flags move to
-// esp+0xC00 (1028 entries) and the pointer list keeps 0x190..0xC00 (668 entries). NTSC only.
+// esp+0xC00 (1028 entries) and the pointer list keeps 0x190..0xC00 (668 entries). USA and PAL.
 struct ReplaceSite {
     uint32_t address;
     const char* from;
     const char* to;
 };
 #if defined(TCNYC_PAL) && TCNYC_PAL
-inline constexpr ReplaceSite kReplaceSites[] = {{0, "", ""}};
-inline constexpr uint32_t kReplaceSiteCount = 0;
+inline constexpr ReplaceSite kReplaceSites[] = {{0x0013F2C8, "0xA0u", "0xC00u"}, {0x0013F2E0, "0xA0u", "0xC00u"},
+                                                {0x0013F300, "0xA0u", "0xC00u"}, {0x0013F318, "0xA0u", "0xC00u"},
+                                                {0x0013F32F, "0xA0u", "0xC00u"},
+                                                {0x0013F795, "(uint32_t)(0x8B0u)", "(uint32_t)(XBE_NEXT_SLOT)"},
+                                                {0x0013F79A, "(uint32_t)(0x9u)", "(uint32_t)(9u + xbe_extra_slot_count)"}};  // PAL
+inline constexpr uint32_t kReplaceSiteCount = 7;
 #else
 inline constexpr ReplaceSite kReplaceSites[] = {{0x0013EA38, "0xA0u", "0xC00u"}, {0x0013EA50, "0xA0u", "0xC00u"},
                                                 {0x0013EA70, "0xA0u", "0xC00u"}, {0x0013EA88, "0xA0u", "0xC00u"},
-                                                {0x0013EA9F, "0xA0u", "0xC00u"}};
-inline constexpr uint32_t kReplaceSiteCount = 5;
+                                                {0x0013EA9F, "0xA0u", "0xC00u"},
+                                                {0x0013EF05, "(uint32_t)(0x8B0u)", "(uint32_t)(XBE_NEXT_SLOT)"},
+                                                {0x0013EF0A, "(uint32_t)(0x9u)", "(uint32_t)(9u + xbe_extra_slot_count)"}};
+inline constexpr uint32_t kReplaceSiteCount = 7;
 #endif
 
 inline const ReplaceSite* ReplaceSiteAt(uint32_t address) {
@@ -187,6 +210,26 @@ inline const ReplaceSite* ReplaceSiteAt(uint32_t address) {
         if (kReplaceSites[i].address == address) return &kReplaceSites[i];
     return nullptr;
 }
+
+// 0x13E7F0 also skips a sector object beyond its own draw radius (0x13ED98..0x13EDAD: r = [esp+0x68], skipped when
+// r * r <= squared distance to the camera). The appended statement scales r by xbe_draw_radius_scale (1 = the
+// game's), so objects stay drawn farther out.
+// The portal pass loops over the game's nine slots (0x13E8FB..0x13EF15: [esp+0x28] = slot + 0x1C, stepped by
+// 0x8B0, nine times). Past the ninth it continues with xbe_extra_slots (each a ring slot + 0x1C, filled by the
+// host every frame), so loaded ring tiles are walked and drawn by the game's own pass. ecx holds the new index.
+inline const char kAppendDecl[] =
+    "extern \"C\" float xbe_draw_radius_scale; extern \"C\" uint32_t xbe_portal_slot_hits[2];\n"
+    "extern \"C\" float xbe_ring_instance_scale; extern \"C\" float xbe_inner_instance_scale;\n"
+    "extern \"C\" uint32_t xbe_extra_slot_count; extern \"C\" uint32_t xbe_extra_slots[128];\n"
+    "#define XBE_NEXT_SLOT (ctx.ecx < 9u ? 0x8B0u : (ctx.ecx - 9u < xbe_extra_slot_count ? "
+    "xbe_extra_slots[ctx.ecx - 9u] - ctx.eax : 0u))";
+inline const char kAppendDef[] =
+    "#ifdef _WIN32\n__declspec(dllexport)\n#endif\nextern \"C\" float xbe_draw_radius_scale = 1.0f;\n"
+    "#ifdef _WIN32\n__declspec(dllexport)\n#endif\nextern \"C\" float xbe_ring_instance_scale = 4.0f;\n"
+    "#ifdef _WIN32\n__declspec(dllexport)\n#endif\nextern \"C\" float xbe_inner_instance_scale = 1.0f;\n"
+    "#ifdef _WIN32\n__declspec(dllexport)\n#endif\nextern \"C\" uint32_t xbe_portal_slot_hits[2] = {0, 0};\n"
+    "#ifdef _WIN32\n__declspec(dllexport)\n#endif\nextern \"C\" uint32_t xbe_extra_slot_count = 0;\n"
+    "#ifdef _WIN32\n__declspec(dllexport)\n#endif\nextern \"C\" uint32_t xbe_extra_slots[128] = {};";
 
 inline const AppendSite* AppendSiteAt(uint32_t address) {
     for (uint32_t i = 0; i < kAppendSiteCount; ++i)
@@ -333,6 +376,7 @@ inline GridPatchResult PatchGridSources(const std::filesystem::path& dir, uint32
         bool changed = false;
         bool light_here = false;
         bool inst_here = false;
+        bool append_here = false;
         for (size_t i = 0; i < lines.size(); i++) {
             const std::string& line = lines[i];
             const size_t comment = line.find("// ");
@@ -371,8 +415,9 @@ inline GridPatchResult PatchGridSources(const std::filesystem::path& dir, uint32
                     return result;
                 }
                 std::string& code = lines[target];
-                const std::string from = std::string("+ ") + site->from + ")";
-                const std::string to = std::string("+ ") + site->to + ")";
+                const bool raw = site->from[0] == '(';  // a literal expression, else the "+ <const>)" form
+                const std::string from = raw ? std::string(site->from) : std::string("+ ") + site->from + ")";
+                const std::string to = raw ? std::string(site->to) : std::string("+ ") + site->to + ")";
                 if (const size_t at = code.find(from); at != std::string::npos) {
                     code.replace(at, from.size(), to);
                     changed = true;
@@ -399,6 +444,7 @@ inline GridPatchResult PatchGridSources(const std::filesystem::path& dir, uint32
                     if (cr) code += '\r';
                     changed = true;
                 }
+                append_here = true;
                 append_occurrences++;
                 continue;
             }
@@ -496,6 +542,13 @@ inline GridPatchResult PatchGridSources(const std::filesystem::path& dir, uint32
         if ((part == 0 || light_here) && text.find(want) == std::string::npos && !lines.empty()) {
             lines.insert(lines.begin() + 1, want);
             changed = true;
+        }
+        if (kAppendSiteCount && (part == 0 || append_here) && !lines.empty()) {
+            const std::string want_append = part == 0 ? kAppendDef : kAppendDecl;
+            if (text.find(want_append) == std::string::npos) {
+                lines.insert(lines.begin() + 1, want_append);
+                changed = true;
+            }
         }
         if (kInstSiteCount && (part == 0 || inst_here) && !lines.empty()) {
             const std::string inst = part == 0 ? kInstDef : kInstDecl;

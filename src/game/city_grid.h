@@ -32,6 +32,8 @@ uint32_t Cells();
 uint32_t Requests();
 uint32_t Table();
 bool RingCell(int idx);
+bool InInnerDetailZone(uint8_t *base, uint32_t slot);
 bool Ring();
+bool OuterDetailAvailable();
 
 } // namespace game::city_grid

@@ -24,8 +24,9 @@ X86_FUNC(sub_00014120) {
     if (level == 0 || level > 5) return;
     const int32_t budget = int32_t(ctx.eax);
     const int32_t scaled = game::choices::TrafficScale(budget, level);
+    static const bool trace = std::getenv("XBE_TRACE_TRAFFIC_RANGE") != nullptr;
     static uint32_t ticks = 0;
-    if ((++ticks & 0x3FFF) == 0) {
+    if (trace && (++ticks & 0x3FFF) == 0) {
         const uint32_t g = X86_MEM32(TC_ADDR(0x360E00));
         LOGR("traffic: cars now %d of budget %d", g ? int32_t(X86_MEM32(g + 0xC0)) : -1, scaled);
     }
@@ -72,6 +73,40 @@ X86_FUNC(sub_00017BE0) {
     __imp__sub_00017BE0(ctx, base);
 }
 
+// Scales the spawn/despawn limits ([0x2E3500], [0x2E3504]) for one handler call. The scale always applies
+// to the game's own values, so a handler reached from inside the other one (the spawn handler messaging a
+// new car, say) sees its own scale rather than the two multiplied together; leaving restores the caller's.
+namespace {
+int g_range_depth = 0;
+float g_base_near = 0.0f, g_base_far = 0.0f;
+
+class RangeScale {
+public:
+    RangeScale(uint8_t *base, float scale) : base_(base) {
+        if (g_range_depth++ == 0) {
+            g_base_near = X86_MEMF32(TC_ADDR(0x2E3500));
+            g_base_far = X86_MEMF32(TC_ADDR(0x2E3504));
+        }
+        prev_near_ = X86_MEMF32(TC_ADDR(0x2E3500));
+        prev_far_ = X86_MEMF32(TC_ADDR(0x2E3504));
+        X86_MEMF32(TC_ADDR(0x2E3500)) = g_base_near * scale;
+        X86_MEMF32(TC_ADDR(0x2E3504)) = g_base_far * scale;
+    }
+    ~RangeScale() {
+        uint8_t *base = base_;
+        X86_MEMF32(TC_ADDR(0x2E3500)) = prev_near_;
+        X86_MEMF32(TC_ADDR(0x2E3504)) = prev_far_;
+        --g_range_depth;
+    }
+    RangeScale(const RangeScale &) = delete;
+    RangeScale &operator=(const RangeScale &) = delete;
+
+private:
+    uint8_t *base_;
+    float prev_near_, prev_far_;
+};
+} // namespace
+
 // XBE_TRACE_TRAFFIC_RANGE: the ambient car handler 0x44090 removes a car (returns -2) when its distance from the
 // player passes [0x2E3500] (scaled) or [0x2E3504] (0x45181..0x4519B). Log those ranges, the far-flag ranges
 // [0x2D3D9C]/[0x2D3DB4], and despawns per 5 s: a high count while cruising is cars vanishing in view.
@@ -82,20 +117,18 @@ X86_FUNC(sub_00044090) {
     // own flicker). Only traffic code reads these two constants and only this handler despawns, so they are
     // widened for its duration. Spawning is widened less (sub_00018C80), keeping the gap. Default 2.0, override
     // with XBE_TRAFFIC_DESPAWN_SCALE.
-    static const float scale = [] {
+    // Traffic distance setting (default 1.5x spawn, 2x despawn); XBE_TRAFFIC_DESPAWN_SCALE overrides it.
+    static const float env_scale = [] {
         const char *e = std::getenv("XBE_TRAFFIC_DESPAWN_SCALE");
-        const float s = e ? float(std::atof(e)) : 2.0f;
-        return s > 0.0f ? s : 1.0f;
+        const float s = e ? float(std::atof(e)) : 0.0f;
+        return s > 0.0f ? s : 0.0f;
     }();
-    const float near_limit = X86_MEMF32(0x2E3500), far_limit = X86_MEMF32(0x2E3504);
-    if (scale != 1.0f) {
-        X86_MEMF32(0x2E3500) = near_limit * scale;
-        X86_MEMF32(0x2E3504) = far_limit * scale;
-    }
-    __imp__sub_00044090(ctx, base);
-    if (scale != 1.0f) {
-        X86_MEMF32(0x2E3500) = near_limit;
-        X86_MEMF32(0x2E3504) = far_limit;
+    const float scale = env_scale > 0.0f ? env_scale
+                                         : game::choices::TrafficDespawnScale(
+                                               std::atomic_ref(app::Get().traffic_distance).load(std::memory_order_relaxed));
+    {
+        const RangeScale range(base, scale);
+        __imp__sub_00044090(ctx, base);
     }
     static const bool trace = std::getenv("XBE_TRACE_TRAFFIC_RANGE") != nullptr;
     if (!trace) return;
@@ -105,9 +138,9 @@ X86_FUNC(sub_00044090) {
     const auto now = std::chrono::steady_clock::now();
     if (now - last < std::chrono::seconds(5)) return;
     last = now;
-    const uint32_t game = X86_MEM32(0x360E00);
+    const uint32_t game = X86_MEM32(TC_ADDR(0x360E00));
     LOGR("traffic range: despawn %.1f / %.1f, far flag %.1f / %.1f, despawns %u per 5 s, cars %d",
-         X86_MEMF32(0x2E3500), X86_MEMF32(0x2E3504), X86_MEMF32(0x2D3D9C), X86_MEMF32(0x2D3DB4), despawns,
+         X86_MEMF32(TC_ADDR(0x2E3500)), X86_MEMF32(TC_ADDR(0x2E3504)), X86_MEMF32(TC_ADDR(0x2D3D9C)), X86_MEMF32(TC_ADDR(0x2D3DB4)), despawns,
          game ? int32_t(X86_MEM32(game + 0xC0)) : -1);
     despawns = 0;
 }
@@ -118,18 +151,17 @@ X86_FUNC(sub_00044090) {
 // Static constants only, restored after the call. XBE_TRAFFIC_SPAWN_SCALE overrides 1.5.
 X86_EXTERN_FUNC(__imp__sub_00018C80);
 X86_FUNC(sub_00018C80) {
-    static const float scale = [] {
+    // Traffic distance setting; XBE_TRAFFIC_SPAWN_SCALE overrides it.
+    static const float env_scale = [] {
         const char *e = std::getenv("XBE_TRAFFIC_SPAWN_SCALE");
-        const float s = e ? float(std::atof(e)) : 1.5f;
-        return s > 0.0f ? s : 1.0f;
+        const float s = e ? float(std::atof(e)) : 0.0f;
+        return s > 0.0f ? s : 0.0f;
     }();
-    if (scale == 1.0f) return __imp__sub_00018C80(ctx, base);
-    const float near_limit = X86_MEMF32(0x2E3500), far_limit = X86_MEMF32(0x2E3504);
-    X86_MEMF32(0x2E3500) = near_limit * scale;
-    X86_MEMF32(0x2E3504) = far_limit * scale;
+    const float scale = env_scale > 0.0f ? env_scale
+                                         : game::choices::TrafficSpawnScale(
+                                               std::atomic_ref(app::Get().traffic_distance).load(std::memory_order_relaxed));
+    const RangeScale range(base, scale);
     __imp__sub_00018C80(ctx, base);
-    X86_MEMF32(0x2E3500) = near_limit;
-    X86_MEMF32(0x2E3504) = far_limit;
 }
 
 // Minimum spawn distance. In 0x18C80 a road spawn point closer than the near limit [0x2E3500] always spawns a car
@@ -140,10 +172,10 @@ X86_EXTERN_FUNC(__imp__sub_00015420);
 X86_FUNC(sub_00015420) {
     const uint32_t ret = X86_MEM32(ctx.esp), out = X86_MEM32(ctx.esp + 4);
     __imp__sub_00015420(ctx, base);
-    if (ret != 0x00018E46u || !out) return;
+    if (ret != TC_ADDR(0x00018E46u) || !out) return;
     static const float min_distance = [] {
         const char *e = std::getenv("XBE_TRAFFIC_MIN_SPAWN");
         return e ? float(std::atof(e)) : 0.0f;
     }();
-    if (min_distance > 0.0f && X86_MEMF32(out) < min_distance) X86_MEMF32(out) = X86_MEMF32(0x2E3504) + 1.0f;
+    if (min_distance > 0.0f && X86_MEMF32(out) < min_distance) X86_MEMF32(out) = X86_MEMF32(TC_ADDR(0x2E3504)) + 1.0f;
 }

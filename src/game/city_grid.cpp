@@ -14,6 +14,7 @@
 #include <atomic>
 #include <vector>
 
+#include "app/app.h"
 #include "core/log.h"
 #include "game/city_grid.h"
 #include "kernel/kernel.h"
@@ -43,10 +44,14 @@ struct Store {
     int n = 0;
     bool ready = false, test = false, attempted = false, cell_test = false, cell_test_done = false;
     std::vector<uint32_t> orphan_requests;  // stream requests to release at the next DriveRing
+    bool from_setting = false;  // allocated for app::Settings::city_range (no XBE_CITY_GRID); the setting drives the ring
+    int last_radius = 0;
     bool ring = false, ring_init[128] = {}, ring_cell[128] = {}, ring_pending[128] = {}, ring_blocked[128] = {},
          ring_freeze = false, ring_center = false, ring_nodraw = false, ring_slotonly = false,
          ring_cellonly = false, ring_nodrive = false, keep_objects = false, scanned = false, no_unlink = false;
     int32_t ring_cx = 0, ring_cy = 0;
+    bool ring_requested[128] = {};
+    int32_t ring_target_x[128] = {}, ring_target_y[128] = {};
     int ring_rr = 0;
     // Last tile each of the nine game cells held, kept while the cell still owns its object. A tile is
     // locked to the game through the unload window (tile cleared, object not yet released). Slots and
@@ -340,6 +345,7 @@ void ClearRingCell(uint8_t *base, X86Context &ctx, uint32_t city, int idx) {
     X86_MEM32(cell + 0x2C) = 1;
     g.ring_cell[idx] = false;
     g.ring_pending[idx] = false;
+    g.ring_requested[idx] = false;
 
     // The tile's slot is deliberately left loaded. Releasing it here (tried 2026-11-15) left game slots linked to an
     // empty ring slot: the portal pass 0x13E7F0 then walked into it and crashed on its null portal table (+0x54) at
@@ -488,7 +494,8 @@ void DriveRing(uint8_t *base, X86Context &ctx, uint32_t city, uint32_t manager) 
     if (GameBusy(base, city, manager)) return;
     if (!EnsureTemplates(base, city, manager)) return;
     static bool locks_logged = false;
-    if (!locks_logged && std::getenv("XBE_CITY_DIAG")) {
+    static const bool diag = std::getenv("XBE_CITY_DIAG") != nullptr;
+    if (!locks_logged && diag) {
         locks_logged = true;
         for (int i = 0; i < 27; ++i)
             if (g.game_lock[i])
@@ -525,9 +532,21 @@ void DriveRing(uint8_t *base, X86Context &ctx, uint32_t city, uint32_t manager) 
     }
     const int32_t cx = g.ring_cx, cy = g.ring_cy;
 
-    const int radius = (g.n - 1) / 2;  // 2 for 5x5, 3 for 7x7, 4 for 9x9
+    // 2 for 5x5, 3 for 7x7, 4 for 9x9: from the store, or live from the City draw distance setting
+    int radius = (g.n - 1) / 2;
+    if (g.from_setting) {
+        const int range = int(std::atomic_ref(app::Get().city_range).load(std::memory_order_relaxed));
+        radius = std::min(radius, range + 1);
+    }
+    if (radius != g.last_radius) {  // the setting changed: release the ring cells and drive the new size
+        if (g.last_radius)
+            for (int i = 0; i < g.n * g.n && i < 128; ++i)
+                if (g.ring_init[i]) ClearRingCell(base, ctx, city, i);
+        LOGR("city: ring radius %d -> %d", g.last_radius, radius);
+        g.last_radius = radius;
+    }
     const int max_outer = g.n * g.n - 9;
-    const int requested = [] {
+    static const int requested = [] {
         const char *value = std::getenv("XBE_CITY_RING_LIMIT");
         return value ? std::atoi(value) : 0;
     }();
@@ -540,31 +559,47 @@ void DriveRing(uint8_t *base, X86Context &ctx, uint32_t city, uint32_t manager) 
     };
     std::memset(g.ring_cell, 0, sizeof(g.ring_cell));
     int driven = 0;
-    for (int dx = -radius; dx <= radius && driven < drive_limit; ++dx) {
-        for (int dy = -radius; dy <= radius && driven < drive_limit; ++dy) {
-            if (std::abs(dx) <= 1 && std::abs(dy) <= 1) continue;
-            const int32_t x = cx + dx, y = cy + dy;
-            const int idx = SideIndex(x, y, g.n);
-            if (GameOwnsTile(x, y + 6)) {
-                if (g.ring_init[idx]) ClearRingCell(base, ctx, city, idx);
-                continue;
+    int new_tiles = 0;
+    constexpr int kNewTilesPerDrive = 8;
+    // Walk the closest shell first. Keep polling already requested tiles even
+    // after the new-request budget has been used for this update.
+    for (int shell = 2; shell <= radius && driven < drive_limit; ++shell) {
+        for (int dx = -shell; dx <= shell && driven < drive_limit; ++dx) {
+            for (int dy = -shell; dy <= shell && driven < drive_limit; ++dy) {
+                if (std::max(std::abs(dx), std::abs(dy)) != shell) continue;
+                const int32_t x = cx + dx, y = cy + dy;
+                const int idx = SideIndex(x, y, g.n);
+                if (GameOwnsTile(x, y + 6)) {
+                    if (g.ring_init[idx]) ClearRingCell(base, ctx, city, idx);
+                    continue;
+                }
+                if (g.ring_blocked[idx]) continue;
+                static const int min_x_allowed = [] {
+                    const char* value = std::getenv("XBE_CITY_RING_MINX");
+                    return value ? std::atoi(value) : INT32_MIN;
+                }();
+                if (x < min_x_allowed) {
+                    if (g.ring_init[idx]) ClearRingCell(base, ctx, city, idx);
+                    continue;
+                }
+                if (!g.ring_init[idx]) InitRingObject(base, idx);
+                const uint32_t slot = g.slots + uint32_t(idx) * kSlotBytes;
+                const uint32_t cell = g.cells + uint32_t(idx) * kCellBytes;
+                if (!g.ring_requested[idx] || g.ring_target_x[idx] != x || g.ring_target_y[idx] != y) {
+                    if (new_tiles >= kNewTilesPerDrive) continue;
+                    ++new_tiles;
+                    g.ring_requested[idx] = true;
+                    g.ring_target_x[idx] = x;
+                    g.ring_target_y[idx] = y;
+                }
+                X86_MEM32(slot + 0x2C) = 1;
+                X86_MEM32(cell + 0x2C) = 1;
+                if (!g.ring_cellonly && !g.ring_nodrive) call(slot, x, y);
+                if (!g.ring_slotonly && !g.ring_nodrive) call(cell, x, y + 6);
+                if (g.ring_nodrive) continue;
+                g.ring_cell[idx] = true;
+                ++driven;
             }
-            if (g.ring_blocked[idx]) continue;
-            static const char *minx_env = std::getenv("XBE_CITY_RING_MINX");
-            if (minx_env && x < std::atoi(minx_env)) {
-                if (g.ring_init[idx]) ClearRingCell(base, ctx, city, idx);
-                continue;
-            }
-            if (!g.ring_init[idx]) InitRingObject(base, idx);
-            const uint32_t slot = g.slots + uint32_t(idx) * kSlotBytes;
-            const uint32_t cell = g.cells + uint32_t(idx) * kCellBytes;
-            X86_MEM32(slot + 0x2C) = 1;
-            X86_MEM32(cell + 0x2C) = 1;
-            if (!g.ring_cellonly && !g.ring_nodrive) call(slot, x, y);
-            if (!g.ring_slotonly && !g.ring_nodrive) call(cell, x, y + 6);
-            if (g.ring_nodrive) continue;
-            g.ring_cell[idx] = true;
-            ++driven;
         }
     }
 }
@@ -653,10 +688,14 @@ void Init(uint8_t *base, uint32_t manager) {
         const char *value = std::getenv("XBE_CITY_GRID");
         return value;
     }();
-    if (!env) return;
+    // The in-game City draw distance setting allocates a 9x9 store the first time it is above Normal; the
+    // setting then drives the ring live (Ring(), DriveRing). XBE_CITY_GRID keeps the old fixed configuration.
+    const uint32_t range = std::atomic_ref(app::Get().city_range).load(std::memory_order_relaxed);
+    if (!env && range == 0) return;
     if (g.attempted && !g.ready) return;
     g.attempted = true;
-    int n = std::atoi(env);
+    g.from_setting = !env;
+    int n = env ? std::atoi(env) : 9;
     if (n != 3 && n != 5 && n != 7 && n != 9) {
         LOGR("city: grid store: XBE_CITY_GRID=%s is not 3/5/7/9; using 5", env);
         n = 5;
@@ -693,6 +732,7 @@ void Init(uint8_t *base, uint32_t manager) {
         std::memset(g.ring_init, 0, sizeof(g.ring_init));
         std::memset(g.ring_cell, 0, sizeof(g.ring_cell));
         std::memset(g.ring_pending, 0, sizeof(g.ring_pending));
+        std::memset(g.ring_requested, 0, sizeof(g.ring_requested));
         std::memset(g.ring_blocked, 0, sizeof(g.ring_blocked));
         std::memset(g.game_lock, 0, sizeof(g.game_lock));
         g.game_tracked = false;
@@ -732,7 +772,7 @@ void Init(uint8_t *base, uint32_t manager) {
     g.test = std::getenv("XBE_CITY_MIRROR_TEST") != nullptr;
     g.cell_test = std::getenv("XBE_CITY_CELL_TEST") != nullptr;
     g.ring = std::getenv("XBE_CITY_RING") != nullptr || std::getenv("XBE_CITY_RING_DIAG") != nullptr ||
-             std::getenv("XBE_CITY_DIAG") != nullptr;
+             std::getenv("XBE_CITY_DIAG") != nullptr || g.from_setting;
     LOGR("city: slot type %08X -> %08X %08X %08X %08X; cell type %08X -> %08X %08X %08X %08X", TC_ADDR(0x2D9C44),
          X86_MEM32(TC_ADDR(0x2D9C44)), X86_MEM32(TC_ADDR(0x2D9C48)), X86_MEM32(TC_ADDR(0x2D9C4C)), X86_MEM32(TC_ADDR(0x2D9C50)), TC_ADDR(0x2D9E0C),
          X86_MEM32(TC_ADDR(0x2D9E0C)), X86_MEM32(TC_ADDR(0x2D9E10)), X86_MEM32(TC_ADDR(0x2D9E14)), X86_MEM32(TC_ADDR(0x2D9E18)));
@@ -756,7 +796,7 @@ void MaybeSync(uint8_t *base) {
     const auto now = std::chrono::steady_clock::now();
     if (now - g.last < std::chrono::milliseconds(100)) return;
     g.last = now;
-    if (!g.cell_test && !g.ring) {
+    if (!g.cell_test && !g.ring && !g.from_setting) {  // the mirror aliases ring indices: never with a ring store
         SyncFromGame(base);
         ++g.syncs;
     }
@@ -819,6 +859,24 @@ uint32_t Cells() { return g.cells; }
 uint32_t Requests() { return g.requests; }
 uint32_t Table() { return g.table; }
 bool RingCell(int idx) { return idx >= 0 && idx < 128 && g.ring_cell[idx]; }
-bool Ring() { return g.ready && g.ring; }
+bool InInnerDetailZone(uint8_t *base, uint32_t slot) {
+    const int64_t dx = int64_t(int32_t(X86_MEM32(slot + 0x04))) - g.ring_cx;
+    const int64_t dy = int64_t(int32_t(X86_MEM32(slot + 0x08))) - g.ring_cy;
+    return g.ring_center && dx >= -2 && dx <= 2 && dy >= -2 && dy <= 2;
+}
+bool OuterDetailAvailable() {
+    static const bool fixed_outer_ring = [] {
+        const char* grid = std::getenv("XBE_CITY_GRID");
+        return grid && (std::atoi(grid) == 7 || std::atoi(grid) == 9) &&
+               (std::getenv("XBE_CITY_RING") || std::getenv("XBE_CITY_RING_DIAG") || std::getenv("XBE_CITY_DIAG"));
+    }();
+    return fixed_outer_ring || std::atomic_ref(app::Get().city_range).load(std::memory_order_relaxed) >= 2;
+}
+
+bool Ring() {
+    if (!g.ready) return false;
+    if (!g.from_setting) return g.ring;
+    return std::atomic_ref(app::Get().city_range).load(std::memory_order_relaxed) > 0;
+}
 
 } // namespace game::city_grid

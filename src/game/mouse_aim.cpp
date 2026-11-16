@@ -464,3 +464,18 @@ X86_FUNC(sub_00029A40) { RunControllerAim(ctx, base, __imp__sub_00029A40); }
 
 X86_EXTERN_FUNC(__imp__sub_00025910);
 X86_FUNC(sub_00025910) { RunControllerAim(ctx, base, __imp__sub_00025910); }
+
+// The blend from the car to the on-foot camera after leaving a vehicle (about 2.5 s). While 0x348988 is set, the
+// on-foot controller's update (0x28C50) asks this routine first and, when it returns true, skips its whole look and
+// orientation step, so the mouse moves the yaw global but the view ignores it. The routine ends the blend itself by
+// clearing that flag and its counter at 0x348B9C; when the mouse moves, end it the same way so the mouse takes the
+// camera straight away. Untouched, the game's own blend plays as before.
+X86_EXTERN_FUNC(__imp__sub_00021C10);
+X86_FUNC(sub_00021C10) {
+    constexpr uint32_t kExitBlend = TC_ADDR(0x348988), kExitBlendCount = TC_ADDR(0x348B9C);
+    if (input::g_direct_mouse_aim && base[kExitBlend] && input::MouseMovedRecently()) {
+        base[kExitBlend] = 0;
+        X86_MEM32(kExitBlendCount) = 0;
+    }
+    __imp__sub_00021C10(ctx, base);
+}

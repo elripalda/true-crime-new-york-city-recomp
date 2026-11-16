@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -21,13 +22,9 @@
 #include <mutex>
 #include <unordered_map>
 #include <vector>
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#endif
+#include "guest_exports.h"
 
+#include "app/app.h"
 #include "core/log.h"
 #include "game/city_grid.h"
 #include "kernel/kernel.h"
@@ -546,23 +543,137 @@ uint32_t g_game_cell_ctx = 0;
 // Move the 16-entry light table (0x349380, count 0x3493CC) to a 256-entry guest array. grid_patch routes all
 // nine table sites through xbe_light_table (exported by the game code DLL); lights are addressed by index
 // only, so copying the entries and switching the base on the game thread is safe.
+// Sector object draw radius (grid_patch kAppendSites): 0x13E7F0 skips an object beyond its own radius; the
+// exported xbe_draw_radius_scale multiplies that radius. XBE_DRAW_RADIUS=<scale> for testing.
+// XBE_CITY_PORTAL_OWNERS: grid_patch counts the slots whose sector tables the portal pass reads (0x13EB1B: game slot
+// vs ring store slot); log and reset every 5 s.
+// XBE_CITY_RING_PORTALS: hand the loaded ring slots to the portal pass (grid_patch: past the game's nine slots its
+// loop continues with xbe_extra_slots, each a slot + 0x1C), so ring tiles are walked and drawn in full detail.
+void FillRingPortalSlots() {
+    static const bool on = std::getenv("XBE_CITY_RING_PORTALS") != nullptr;
+    if (!on) return;
+    static uint32_t *count = nullptr, *slots = nullptr;
+    static bool looked = false;
+    if (!looked) {
+        looked = true;
+        count = game::GuestExport<uint32_t>("xbe_extra_slot_count");
+        slots = game::GuestExport<uint32_t>("xbe_extra_slots");
+        LOGR("ring portals: %s", count && slots ? "ring slots join the portal pass" : "exports missing");
+    }
+    if (!count || !slots) return;
+    uint32_t n = 0;
+    if (game::city_grid::Ring() && game::city_grid::Ready()) {
+        uint8_t *base = mem::Base();
+        const int cells = game::city_grid::N() * game::city_grid::N();
+        for (int i = 0; i < cells && n < 128; ++i) {
+            if (!game::city_grid::RingCell(i)) continue;
+            const uint32_t slot = game::city_grid::Slots() + uint32_t(i) * 0x8B0u;
+            if (X86_MEM32(slot + 0x50) && X86_MEM32(slot + 0x1C)) slots[n++] = slot + 0x1C;
+        }
+    }
+    {
+        static auto last = std::chrono::steady_clock::now();
+        if (std::chrono::steady_clock::now() - last > std::chrono::seconds(5) && game::city_grid::Ready()) {
+            last = std::chrono::steady_clock::now();
+            uint8_t *base = mem::Base();
+            const int cells = game::city_grid::N() * game::city_grid::N();
+            int ring = 0, loaded = 0;
+            uint32_t sample = 0;
+            for (int i = 0; i < cells; ++i) {
+                if (!game::city_grid::RingCell(i)) continue;
+                ++ring;
+                const uint32_t s = game::city_grid::Slots() + uint32_t(i) * 0x8B0u;
+                if (X86_MEM32(s + 0x50)) { ++loaded; if (!sample) sample = s; }
+            }
+            if (sample)
+                LOGR("ring portals: %u listed; ring cells %d, slots with root %d; sample slot %08X +0C %08X +14 %08X +1C %08X +50 %08X",
+                     n, ring, loaded, sample, X86_MEM32(sample + 0x0C), X86_MEM32(sample + 0x14), X86_MEM32(sample + 0x1C), X86_MEM32(sample + 0x50));
+            else
+                LOGR("ring portals: %u listed; ring cells %d, none with a root", n, ring);
+        }
+    }
+    *count = n;
+}
+
+void LogPortalSlots() {
+    static const bool on = std::getenv("XBE_CITY_PORTAL_OWNERS") != nullptr;
+    if (!on) return;
+    static auto last = std::chrono::steady_clock::now();
+    if (std::chrono::steady_clock::now() - last < std::chrono::seconds(5)) return;
+    last = std::chrono::steady_clock::now();
+    static uint32_t *hits = game::GuestExport<uint32_t>("xbe_portal_slot_hits");
+    if (!hits) return;
+    LOGR("portal slots: game %u, ring %u (per 5 s)", hits[0], hits[1]);
+    hits[0] = hits[1] = 0;
+}
+
+void ApplyDrawRadius() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    const char *e = std::getenv("XBE_DRAW_RADIUS");
+    if (!e) return;
+    auto *scale = game::GuestExport<float>("xbe_draw_radius_scale");
+    if (!scale) {
+        LOGR("draw radius: xbe_draw_radius_scale not exported");
+        return;
+    }
+    *scale = float(std::atof(e));
+    LOGR("draw radius: sector objects drawn to %.2fx their radius", *scale);
+}
+
+struct CityInstanceDistances {
+    float inner = 1.0f, outer = 0.0f;
+} g_instance_distances;
+bool g_instance_table_ready = false;
+float *g_ring_instance_cutoff = nullptr;
+
+void ApplyCityInstanceDistances() {
+    static const auto exports = std::array{game::GuestExport<float>("xbe_inner_instance_scale"),
+                                           game::GuestExport<float>("xbe_ring_instance_scale")};
+    if (!exports[0] || !exports[1]) return;
+    g_ring_instance_cutoff = exports[1];
+
+    // Keep the old environment-driven configuration for diagnostic runs.
+    static const CityInstanceDistances override = [] {
+        if (!std::getenv("XBE_CITY_RING_INSTANCES")) return CityInstanceDistances{0.0f, 0.0f};
+        auto read = [](const char *name, float fallback) {
+            const char *value = std::getenv(name);
+            if (!value) return fallback;
+            char *end;
+            const float requested = std::strtof(value, &end);
+            return end != value && *end == '\0' && requested >= 1.0f && requested <= 8.0f ? requested : fallback;
+        };
+        return CityInstanceDistances{read("XBE_CITY_INNER_INSTANCE_DISTANCE", 8.0f),
+                                     read("XBE_CITY_RING_INSTANCE_DISTANCE", 4.0f)};
+    }();
+    auto &settings = app::Get();
+    const auto distances = override.inner != 0.0f ? override : CityInstanceDistances{
+        float(std::atomic_ref(settings.city_inner_detail).load(std::memory_order_relaxed)),
+        float(std::atomic_ref(settings.city_outer_detail).load(std::memory_order_relaxed))};
+    if (distances.inner == g_instance_distances.inner && distances.outer == g_instance_distances.outer) return;
+    *exports[0] = distances.inner;
+    *exports[1] = distances.outer;
+    g_instance_distances = distances;
+    LOGR("city instances: distance scale %.2fx inner, %.2fx ring", distances.inner, distances.outer);
+}
+
 // Move the 300-entry visible instance list (city + 0x5AD0, see grid_patch.h kInstSites) to a 4096-entry guest
 // array so the outer ring can add its tiles. The list is rebuilt every frame, so switching at the city draw
 // entry is safe; the entries already there are copied for that frame.
-void RelocateInstTable(uint32_t city) {
+uint32_t g_inst_entries = 0;  // relocated list: entry i at g_inst_entries + i * 8 (city + 0x5AD4 before)
+void RelocateInstTable(uint32_t city, bool enabled) {
     static uint32_t *count_ref = nullptr;
     if (count_ref) {  // insert/evict reach the count through the list base (XBE_CNT); keep it on this city
         *count_ref = city + 0x6430;
         return;
     }
     static bool done = false;
-    if (done || !city) return;
+    if (done || !enabled) return;
     done = true;
-#ifdef _WIN32
-    HMODULE m = GetModuleHandleW(L"TrueCrimeNYC.dll");
-    auto *table = m ? reinterpret_cast<uint32_t *>(GetProcAddress(m, "xbe_inst_table")) : nullptr;
-    auto *cap = m ? reinterpret_cast<uint32_t *>(GetProcAddress(m, "xbe_inst_cap")) : nullptr;
-    auto *count = m ? reinterpret_cast<uint32_t *>(GetProcAddress(m, "xbe_inst_count")) : nullptr;
+    auto *table = game::GuestExport<uint32_t>("xbe_inst_table");
+    auto *cap = game::GuestExport<uint32_t>("xbe_inst_cap");
+    auto *count = game::GuestExport<uint32_t>("xbe_inst_count");
     if (!table || !cap || !count) {
         LOGR("instances: xbe_inst_table not exported; list stays at 300");
         return;
@@ -579,18 +690,17 @@ void RelocateInstTable(uint32_t city) {
     *count = city + 0x6430;
     count_ref = count;
     *table = at;
+    g_inst_entries = at + 4;
     *cap = kEntries;
+    g_instance_table_ready = true;
     LOGR("instances: visible list moved to %08X (%u entries)", at, kEntries);
-#endif
 }
 
 void RelocateLightTable() {
     static bool done = false;
     if (done) return;
     done = true;
-#ifdef _WIN32
-    HMODULE m = GetModuleHandleW(L"TrueCrimeNYC.dll");
-    auto *table = m ? reinterpret_cast<uint32_t *>(GetProcAddress(m, "xbe_light_table")) : nullptr;
+    auto *table = game::GuestExport<uint32_t>("xbe_light_table");
     if (!table) {
         LOGR("lights: xbe_light_table not exported; table stays at 16");
         return;
@@ -605,7 +715,6 @@ void RelocateLightTable() {
     for (uint32_t i = 0; i < 16; ++i) X86_MEM32(at + 4 + i * 4) = X86_MEM32(TC_ADDR(0x349380u) + i * 4);
     *table = at + 4;  // keep one spare word below for the [base-4] read
     LOGR("lights: table moved to %08X (1023 entries)", at + 4);
-#endif
 }
 extern int g_ring_draw_idx;
 X86_EXTERN_FUNC(__imp__sub_00142CE0);
@@ -619,7 +728,10 @@ X86_FUNC(sub_00142CE0) {
         DiagEffectLists(base, "drive", false);
     }
     if (city && game::city_grid::Ring()) RelocateLightTable();
-    if (city && game::city_grid::Ring()) RelocateInstTable(city);
+    if (city) RelocateInstTable(city, game::city_grid::Ring() || g_instance_distances.inner > 1.0f);
+    ApplyDrawRadius();
+    LogPortalSlots();
+    FillRingPortalSlots();
     { void InstallTileDrawProbe(); InstallTileDrawProbe(); }
     if (std::getenv("XBE_CITY_DRAWPROBE") && city && game::city_grid::Ready()) {
         // Scene list at city + 0x6B48 (walked by 0x144250 -> 0x13F400): who owns its nodes?
@@ -730,12 +842,16 @@ X86_FUNC(sub_0013C4C0) {
 }
 
 // Phase 1 trace hooks. Each counts calls and records the first caller; the original body is untouched.
+#if TCNYC_DEV_TOOLS
 #define TRACE_HOOK(addr, index)                                                                       \
     X86_EXTERN_FUNC(__imp__sub_##addr);                                                               \
     X86_FUNC(sub_##addr) {                                                                            \
         if (Trace()) TraceHit(index, ctx, base);                                                      \
         __imp__sub_##addr(ctx, base);                                                                 \
     }
+#else
+#define TRACE_HOOK(addr, index)  // trace hooks are developer-build only
+#endif
 
 TRACE_HOOK(00146CA0, 0)
 TRACE_HOOK(00146CC8, 1)
@@ -760,8 +876,14 @@ TRACE_HOOK(0013EB08, 19)
 #if defined(TCNYC_PAL) && TCNYC_PAL
 // The PAL body for this hook is the one the USA 0x13F840 function became.
 TRACE_HOOK(001400D0, 20)
-#else
-TRACE_HOOK(0013F840, 20)
+#elif TCNYC_DEV_TOOLS
+void SignPassCensus(uint8_t *base);
+X86_EXTERN_FUNC(__imp__sub_0013F840);
+X86_FUNC(sub_0013F840) {
+    if (Trace()) TraceHit(20, ctx, base);
+    SignPassCensus(base);
+    __imp__sub_0013F840(ctx, base);
+}
 #endif
 TRACE_HOOK(00138B90, 21)
 TRACE_HOOK(0013ABB0, 22)
@@ -846,10 +968,12 @@ X86_FUNC(sub_00137600) {
 
 // Effect-list insert. Log inserts made while a ring cell is being drawn (DrawRing sets g_ring_draw_idx).
 int g_ring_draw_idx = -1;
+#if TCNYC_DEV_TOOLS  // developer traces: XBE_CITY_NODEGUARD, XBE_TRACE_HEAP, XBE_TRACE_RELEASE, XBE_CITY_SLOTDRAW_TRACE
 X86_EXTERN_FUNC(__imp__sub_0013EFB0);
 X86_FUNC(sub_0013EFB0) {
     static int logged = 0;
-    if (g_ring_draw_idx >= 0 && logged < 40 && std::getenv("XBE_CITY_NODEGUARD")) {
+    static const bool node_guard = std::getenv("XBE_CITY_NODEGUARD") != nullptr;
+    if (node_guard && g_ring_draw_idx >= 0 && logged < 40) {
         ++logged;
         LOGR("effinsert ring %d node %08X linked %08X cb %08X key %08X ret %08X", g_ring_draw_idx, ctx.ecx,
              X86_MEM32(ctx.ecx), X86_MEM32(ctx.ecx + 0xC), X86_MEM32(ctx.ecx + 0x10), X86_MEM32(ctx.esp));
@@ -976,7 +1100,8 @@ X86_FUNC(sub_002688F9) {
 
 X86_EXTERN_FUNC(__imp__sub_0021FC00);
 X86_FUNC(sub_0021FC00) {
-    if (std::getenv("XBE_TRACE_RELEASE")) {
+    static const bool release_trace = std::getenv("XBE_TRACE_RELEASE") != nullptr;
+    if (release_trace) {
         // Release twice without a new allocation at that address in between = double release; log both.
         static std::map<uint32_t, std::array<uint32_t, 5>> released;
         std::array<uint32_t, 5> chain{};
@@ -1054,13 +1179,14 @@ X86_FUNC(sub_0013D100) {
     }
     __imp__sub_0013D100(ctx, base);
 }
+#endif  // TCNYC_DEV_TOOLS
 
 // XBE_CITY_DRAWPROBE: which guest code draws tile (.g) geometry? A draw whose vertex buffer header lies inside a
 // game slot's .g block (slot + 0x30, the next 4 MB) is tile geometry; log its distinct caller chains.
-using XbeDrawProbeFn = void (*)(X86Context &, uint32_t vertex_buffer);
+using XbeDrawProbeFn = void (*)(X86Context &, uint32_t vertex_buffer, uint32_t count, uint32_t texture0);
 XbeDrawProbeFn &XbeDrawProbe();
 namespace {
-void TileDrawProbe(X86Context &ctx, uint32_t vb) {
+void TileDrawProbe(X86Context &ctx, uint32_t vb, uint32_t, uint32_t) {
     uint8_t *base = mem::Base();
     const uint32_t city = X86_MEM32(kCityPtr);
     if (!city || !vb) return;
@@ -1088,9 +1214,80 @@ void TileDrawProbe(X86Context &ctx, uint32_t vb) {
     }
 }
 } // namespace
+namespace {
+// XBE_CITY_DRAWPROBE=quads: which guest path submits small (4-vertex) draws such as the façade sign quads?
+// Groups 4-vertex draws by caller chain and every 2 s logs each chain's draw count with a sample texture data
+// address (the D3D resource's +4), so a walk across a detail transition shows which chain gains the signs.
+struct QuadChain { uint32_t chain[8]; uint32_t count; uint32_t tex; };
+void QuadDrawProbe(X86Context &ctx, uint32_t, uint32_t count, uint32_t tex0) {
+    if (count != 4) return;
+    uint8_t *base = mem::Base();
+    {
+        // Draws reached from 0x1387F0's object branch: 0x21E1A0(ctx, object, matrix) returns to 0x1388AF.
+        // Its frame is the ebp frame whose return address is 0x1388AF; log each new object it draws.
+        for (uint32_t ebp = ctx.ebp, n = 0; n < 10; ++n) {
+            if (ebp < 0x10000u || (ebp & 3u) || !mem::IsCommitted(ebp) || !mem::IsCommitted(ebp + 0x13)) break;
+            if (X86_MEM32(ebp + 4) == TC_ADDR(0x1388AF)) {
+                const uint32_t obj = X86_MEM32(ebp + 0xC), mtx = X86_MEM32(ebp + 0x10);
+                static std::map<uint32_t, uint32_t> objs;
+                static std::mutex olock;
+                std::lock_guard<std::mutex> g(olock);
+                if (objs.size() < 400 && objs.emplace(obj, 0).second) {
+                    const bool okm = mtx && mem::IsCommitted(mtx + 0x3F), oko = obj && mem::IsCommitted(obj + 0x3F);
+                    LOGR("signobj: obj %08X vtable %08X +4 %08X +8 %08X +0x30 %08X +0x38 %08X pos %.0f,%.0f,%.0f tex %08X",
+                         obj, oko ? X86_MEM32(obj) : 0, oko ? X86_MEM32(obj + 4) : 0, oko ? X86_MEM32(obj + 8) : 0,
+                         oko ? X86_MEM32(obj + 0x30) : 0, oko ? X86_MEM32(obj + 0x38) : 0,
+                         okm ? float(X86_MEMF32(mtx + 0x30)) : 0.f, okm ? float(X86_MEMF32(mtx + 0x34)) : 0.f,
+                         okm ? float(X86_MEMF32(mtx + 0x38)) : 0.f,
+                         (tex0 && mem::IsCommitted(tex0 + 4)) ? X86_MEM32(tex0 + 4) : 0);
+                }
+                break;
+            }
+            const uint32_t next = X86_MEM32(ebp);
+            if (next <= ebp) break;
+            ebp = next;
+        }
+    }
+    QuadChain q{};
+    q.chain[0] = X86_MEM32(ctx.esp);
+    for (uint32_t ebp = ctx.ebp, n = 1; n < 8; ++n) {
+        if (ebp < 0x10000u || (ebp & 3u) || !mem::IsCommitted(ebp) || !mem::IsCommitted(ebp + 7)) break;
+        q.chain[n] = X86_MEM32(ebp + 4);
+        const uint32_t next = X86_MEM32(ebp);
+        if (next <= ebp) break;
+        ebp = next;
+    }
+    const uint32_t tex = (tex0 && mem::IsCommitted(tex0 + 4)) ? X86_MEM32(tex0 + 4) : 0;
+    uint64_t key = 0;
+    for (uint32_t c : q.chain) key = key * 0x100000001B3ull ^ c;
+    static std::unordered_map<uint64_t, QuadChain> chains;
+    static std::mutex lock;
+    static auto last = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> g(lock);
+    auto it = chains.find(key);
+    if (it == chains.end()) {
+        if (chains.size() >= 64) return;
+        it = chains.emplace(key, q).first;
+        it->second.count = 0;
+    }
+    it->second.count++;
+    if (tex) it->second.tex = tex;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(2)) return;
+    last = now;
+    for (auto &[k, c] : chains) {
+        if (!c.count) continue;
+        LOGR("quadprobe: %6u draws tex %08X from %08X<%08X<%08X<%08X<%08X<%08X<%08X<%08X", c.count, c.tex,
+             c.chain[0], c.chain[1], c.chain[2], c.chain[3], c.chain[4], c.chain[5], c.chain[6], c.chain[7]);
+        c.count = 0;
+    }
+    LOGR("quadprobe: ----");
+}
+} // namespace
 void InstallTileDrawProbe() {
-    static const bool on = std::getenv("XBE_CITY_DRAWPROBE") != nullptr;
-    if (on && !::XbeDrawProbe()) ::XbeDrawProbe() = TileDrawProbe;
+    const char *v = std::getenv("XBE_CITY_DRAWPROBE");
+    if (!v || ::XbeDrawProbe()) return;
+    ::XbeDrawProbe() = std::strcmp(v, "quads") == 0 ? QuadDrawProbe : TileDrawProbe;
 }
 
 bool g_ring_instances_done = false;
@@ -1098,14 +1295,19 @@ bool g_ring_instances_done = false;
 // Ring instances: 0x14A240 calls 0x148D10(this = its visibility context, slot root [slot + 0x50], planes,
 // plane count, 0, 0) to add a slot's visible instances to the visible list (moved and enlarged, see
 // RelocateInstTable). After the game's own call (return 0x14A73B), run it again once per frame with the same
-// context for each loaded ring slot, so their full-detail instances are drawn. XBE_CITY_RING_INSTANCES=1.
+// context for each loaded ring slot, so their full-detail instances are drawn when enabled in F10.
 X86_EXTERN_FUNC(__imp__sub_00148D10);
 X86_FUNC(sub_00148D10) {
-    static const bool on = std::getenv("XBE_CITY_RING_INSTANCES") != nullptr;
+#if !TCNYC_PAL && TCNYC_DEV_TOOLS
+    { extern bool g_ring_walk; extern void CountRingWalk(); if (g_ring_walk) CountRingWalk(); }
+#endif
     const uint32_t ret = X86_MEM32(ctx.esp);
-    const uint32_t self = ctx.ecx, planes = X86_MEM32(ctx.esp + 8), nplanes = X86_MEM32(ctx.esp + 12);
+    const bool game_slot_walk = ret == TC_ADDR(0x0014A73Bu);
+    const uint32_t self = ctx.ecx;
+    if (game_slot_walk) ApplyCityInstanceDistances();
     __imp__sub_00148D10(ctx, base);
-    if (std::getenv("XBE_CITY_INSTCTX")) {
+    static const bool inst_ctx = std::getenv("XBE_CITY_INSTCTX") != nullptr;
+    if (inst_ctx) {
         static auto t = std::chrono::steady_clock::now();
         static uint32_t seen[8] = {}, nseen = 0;
         const uint32_t owner = X86_MEM32(self + 0xA54);
@@ -1121,29 +1323,115 @@ X86_FUNC(sub_00148D10) {
             LOGR("instctx: owner %08X count after walk %u", owner, X86_MEM32(owner + 0x6430));
         }
     }
-    if (!on || ret != 0x0014A73Bu || !game::city_grid::Ring() || !game::city_grid::Ready()) return;
+    if (!game_slot_walk || !g_ring_instance_cutoff || !g_instance_table_ready || !game::city_grid::Ring()) return;
+    const auto [inner, outer] = g_instance_distances;
+    if (inner == 1.0f && outer == 0.0f) return;
     const uint32_t city = X86_MEM32(kCityPtr);
     if (g_ring_instances_done) return;  // once per frame (reset at the city draw entry)
     g_ring_instances_done = true;
     const uint32_t before = X86_MEM32(city + 0x6430);
-    (void)nplanes;
+
     const int n = game::city_grid::N();
     const uint32_t saved_ecx = ctx.ecx, saved_eax = ctx.eax;
-    int slots = 0;
+    const float saved_cutoff = *g_ring_instance_cutoff;
+    int inner_slots = 0, outer_slots = 0;
+    // 0x148D10 pops its five arguments, so esp is the caller's frame at 0x14A73B again.
+    const uint32_t frame = ctx.esp;
+    static const bool dyn_records = std::getenv("XBE_CITY_RING_NO_DYNAMIC") == nullptr;
+    uint32_t dyn_total = 0;
+    // XBE_TRACE_RING: periodic ring instance logs (every 5 s while the ring runs)
+    static const bool ring_trace = std::getenv("XBE_TRACE_RING") != nullptr;
+    if (ring_trace) {
+        static auto t = std::chrono::steady_clock::now();
+        if (std::chrono::steady_clock::now() - t > std::chrono::seconds(5)) {
+            t = std::chrono::steady_clock::now();
+            const uint32_t rec = X86_MEM32(frame + 0x34);
+            LOGR("ring dyn: esp %08X records %08X total %d game-count %d city %08X tile %d first %.0f,%.0f r %.0f",
+                 frame, rec, int32_t(X86_MEM32(frame + 0x18)), int32_t(X86_MEM32(frame + 0x2C)), X86_MEM32(frame + 0x24),
+                 int32_t(X86_MEM32(X86_MEM32(frame + 0x24) + 0xBC)), rec ? float(X86_MEMF32(rec)) : 0.f,
+                 rec ? float(X86_MEMF32(rec + 8)) : 0.f, rec ? float(X86_MEMF32(rec + 12)) : 0.f);
+        }
+    }
     for (int i = 0; i < n * n; ++i) {
         if (!game::city_grid::RingCell(i)) continue;
-        const uint32_t root = X86_MEM32(game::city_grid::Slots() + uint32_t(i) * 0x8B0u + 0x50);
-        if (!root) continue;
+        const uint32_t slot = game::city_grid::Slots() + uint32_t(i) * 0x8B0u;
+        const bool inner_slot = game::city_grid::InInnerDetailZone(base, slot);
+        if (!inner_slot && outer == 0.0f) continue;
+        const uint32_t root = X86_MEM32(slot + 0x50);
+        const uint32_t instances = X86_MEM32(slot + 0x5C);
+        if (!root || !X86_MEM32(slot + 0x54) || X86_MEM32(slot + 0x24) || instances > (0x8B0u - 0x70u) * 8u)
+            continue;
+        // 0x14A240 clears the nine game slots' per-frame instance bits. Do the same for the ring slot.
+        std::memset(base + slot + 0x70, 0, (instances + 7) / 8);
+        X86_MEM32(slot + 0x6C) = slot + 0x70;
+        // The five pushed arguments move the context from esp+0x580 to esp+0x594. 0x148A00 reads the
+        // slot from context+0xA50 (esp+0xFD0 before the pushes) when resolving a leaf's instance indices.
+        const uint32_t saved_slot = X86_MEM32(self + 0xA50);
+        X86_MEM32(self + 0xA50) = slot;
+        *g_ring_instance_cutoff = inner_slot ? inner : outer;
         ctx.ecx = self;
-        kernel::CallGuest(ctx, 0x148D10, {root, planes, 0, 0, 0});  // no portal planes: camera tests only
-        if (++slots >= 8) break;                                     // bounded while testing
+#if !TCNYC_PAL && TCNYC_DEV_TOOLS
+        { extern bool g_ring_walk; g_ring_walk = true; }
+#endif
+        // The game's 0x20-byte records describe dynamic objects selected for its current slot.
+        // Walk the ring slot's static instances without registering those unrelated objects again.
+        // Dynamic records (signs and other placed objects): 0x14A240 hands each of its slots the records of
+        // its frame array ([esp+0x34], [esp+0x18] in total) whose centre lies within half a tile plus the
+        // radius of the slot centre (+0x40) in x and z, partitioned to the front. Do the same for the ring slot.
+        // The dynamic records overlapping this slot are copied into a scratch list rather than moved to the
+        // front of the game's own array, which kept its order only by luck. They are copied back after the
+        // walk so anything it records in them still reaches the game's array.
+        constexpr uint32_t kRecordSize = 0x20, kMaxRecords = 4096;
+        static const uint32_t scratch = mem::AllocSystem(kMaxRecords * kRecordSize);
+        static std::vector<uint32_t> picked;
+        picked.clear();
+        uint32_t dyn = 0, dyn_count = 0;
+        if (dyn_records && scratch) {
+            const uint32_t records = X86_MEM32(frame + 0x34);
+            const int32_t total = int32_t(X86_MEM32(frame + 0x18));
+            const float half = float(int32_t(X86_MEM32(X86_MEM32(frame + 0x24) + 0xBC)) / 2);
+            const float cx = X86_MEMF32(slot + 0x40), cz = X86_MEMF32(slot + 0x48);
+            for (int32_t r = 0; records && r < total && r < int32_t(kMaxRecords); ++r) {
+                const uint32_t rec = records + uint32_t(r) * kRecordSize;
+                const float lim = half + X86_MEMF32(rec + 0x0C);
+                if (!(std::fabs(cx - X86_MEMF32(rec)) < lim && std::fabs(cz - X86_MEMF32(rec + 0x08)) < lim)) continue;
+                std::memcpy(base + scratch + dyn_count * kRecordSize, base + rec, kRecordSize);
+                picked.push_back(rec);
+                ++dyn_count;
+            }
+            if (dyn_count) dyn = scratch;
+            dyn_total += dyn_count;
+        }
+        kernel::CallGuest(ctx, TC_ADDR(0x148D10), {root, dyn, dyn_count, 0, 0});
+        for (uint32_t k = 0; k < dyn_count; ++k)
+            std::memcpy(base + picked[k], base + scratch + k * kRecordSize, kRecordSize);
+#if !TCNYC_PAL && TCNYC_DEV_TOOLS
+        { extern bool g_ring_walk; g_ring_walk = false; }
+#endif
+        X86_MEM32(self + 0xA50) = saved_slot;
+        ++(inner_slot ? inner_slots : outer_slots);
+        static const int max_slots = [] { const char *e = std::getenv("XBE_CITY_RING_INSTANCE_SLOTS"); return e ? std::atoi(e) : 72; }();
+        if (inner_slots + outer_slots >= max_slots) break;
     }
+    *g_ring_instance_cutoff = saved_cutoff;
     ctx.ecx = saved_ecx;
     ctx.eax = saved_eax;
+    static uint32_t frames_added = 0, peak_added = 0;
+    const uint32_t after = X86_MEM32(city + 0x6430);
+    if (after > before) {
+        ++frames_added;
+        peak_added = std::max(peak_added, after - before);
+    }
     static auto last = std::chrono::steady_clock::now();
-    if (std::chrono::steady_clock::now() - last > std::chrono::seconds(5)) {
+    if (ring_trace && std::chrono::steady_clock::now() - last > std::chrono::seconds(5)) {
         last = std::chrono::steady_clock::now();
-        LOGR("ring instances: %d ring slots walked, visible list %u -> %u", slots, before, X86_MEM32(city + 0x6430));
+        LOGR("ring instances: %d inner-band slots at %.2fx, %d outer slots at %.2fx, visible list %u -> %u, "
+             "growth in %u frames (peak +%u), %u dynamic records", inner_slots, inner, outer_slots, outer, before, after,
+             frames_added, peak_added, dyn_total);
+        frames_added = peak_added = 0;
+#if !TCNYC_PAL && TCNYC_DEV_TOOLS
+        { void LogRingWalkStats(); LogRingWalkStats(); }
+#endif
     }
 }
 
@@ -1168,6 +1456,7 @@ void DrawRingInDistantPass(uint8_t *base, X86Context &ctx) {
     ctx.edx = edx;
 }
 
+#if TCNYC_DEV_TOOLS
 // XBE_CITY_PORTALTRACE: the portal pass 0x13E7F0 runs on `this` (stored at [esp+0x44]) and at 0x13ECAD reads the
 // city's instance table instead of this->+0x50. Log every distinct `this` that is not the city.
 X86_EXTERN_FUNC(__imp__sub_0013E7F0);
@@ -1189,4 +1478,260 @@ X86_FUNC(sub_0013E7F0) {
         }
     }
     __imp__sub_0013E7F0(ctx, base);
+}
+#endif
+
+#if !TCNYC_PAL && TCNYC_DEV_TOOLS
+// Diagnostic (XBE_CITY_RING_INSTANCES): what the tile walk 0x148D10 does with a ring slot's tree. Counted only while
+// a ring walk runs (g_ring_walk): recursion, subtree accept 0x13E4A0, add 0x148A00, and the two bound tests.
+bool g_ring_walk = false;
+struct RingWalkStats {
+    uint32_t walks = 0, accepts = 0, adds = 0, bound_calls = 0, bound_pass = 0;
+    uint32_t distance_calls = 0, distant_subtrees = 0;
+    float last_bound = 0.0f;
+} g_rws;
+X86_EXTERN_FUNC(__imp__sub_0013E4A0);
+X86_FUNC(sub_0013E4A0) {
+    if (g_ring_walk) ++g_rws.accepts;
+    __imp__sub_0013E4A0(ctx, base);
+}
+X86_EXTERN_FUNC(__imp__sub_00148A00);
+X86_FUNC(sub_00148A00) {
+    if (g_ring_walk) ++g_rws.adds;
+    __imp__sub_00148A00(ctx, base);
+}
+X86_EXTERN_FUNC(__imp__sub_00136DB0);
+X86_FUNC(sub_00136DB0) {
+    const uint32_t obj = ctx.ecx, ret = X86_MEM32(ctx.esp);
+    __imp__sub_00136DB0(ctx, base);
+    static const bool portal_trace = std::getenv("XBE_CITY_PORTAL_OWNERS") != nullptr;
+    if (portal_trace && ret >= 0x13E7F0u && ret < 0x13EF50u && game::city_grid::Ready()) {
+        // Which tiles does the portal pass visit? Classify the object by the .g block it lies in.
+        static uint32_t game_hits = 0, ring_hits = 0, other = 0;
+        static auto last = std::chrono::steady_clock::now();
+        const uint32_t city = X86_MEM32(kCityPtr);
+        int owner = 2;
+        for (uint32_t i = 0; city && i < 9 && owner == 2; ++i) {
+            const uint32_t b = X86_MEM32(city + 0xE0 + i * 0x8B0 + 0x30);
+            if (b && obj >= b && obj < b + 0x400000u) owner = 0;
+        }
+        const int n = game::city_grid::N();
+        for (int i = 0; i < n * n && owner == 2; ++i) {
+            const uint32_t b = X86_MEM32(game::city_grid::Slots() + uint32_t(i) * 0x8B0u + 0x30);
+            if (b && obj >= b && obj < b + 0x400000u) owner = 1;
+        }
+        (owner == 0 ? game_hits : owner == 1 ? ring_hits : other)++;
+        if (std::chrono::steady_clock::now() - last > std::chrono::seconds(5)) {
+            last = std::chrono::steady_clock::now();
+            LOGR("portal owners: game tiles %u, ring tiles %u, other %u (per 5 s)", game_hits, ring_hits, other);
+            game_hits = ring_hits = other = 0;
+        }
+    }
+    if (!g_ring_walk || ret != 0x148D7Cu) return;
+    ++g_rws.bound_calls;
+    // The tile walk loads the result from [eax] before comparing it at 0x148D80.
+    g_rws.last_bound = X86_MEMF32(ctx.eax);
+    if (ctx.xmm[0].f[0] > X86_MEMF32(0x2E1C80)) ++g_rws.bound_pass;
+}
+X86_EXTERN_FUNC(__imp__sub_00136A70);
+X86_FUNC(sub_00136A70) {
+    const bool trace = g_ring_walk && X86_MEM32(ctx.esp) == 0x148E05u;
+    __imp__sub_00136A70(ctx, base);
+    if (trace) {
+        ++g_rws.distance_calls;
+        const float cutoff = X86_MEMF32(0x2D2AF4) * *g_ring_instance_cutoff;
+        if (X86_MEMF32(ctx.esp + 0x34) > cutoff && X86_MEMF32(ctx.esp + 0x3C) > cutoff)
+            ++g_rws.distant_subtrees;
+    }
+}
+#endif
+#if !TCNYC_PAL && TCNYC_DEV_TOOLS
+void LogRingWalkStats() {
+    uint8_t *base = mem::Base();
+    LOGR("ring walk: %u walks, %u scene-list calls, %u instance leaf calls, bound %u (%u above cutoff, last %.3f vs %.3f), "
+         "distance %u (%u early exits)",
+         g_rws.walks, g_rws.accepts, g_rws.adds, g_rws.bound_calls, g_rws.bound_pass, g_rws.last_bound,
+         X86_MEMF32(0x2E1C80), g_rws.distance_calls, g_rws.distant_subtrees);
+    g_rws = {};
+}
+#endif
+#if !TCNYC_PAL && TCNYC_DEV_TOOLS
+void CountRingWalk() { ++g_rws.walks; }
+#endif
+
+// XBE_CITY_SIGNWATCH=1: who attaches/detaches the per-instance object that 0x1387F0 draws through 0x21E1A0
+// (façade signs)? The first visible instance seen with an object gets a hardware write watch on inst+0.
+#if !TCNYC_PAL && TCNYC_DEV_TOOLS  // diagnostic only, USA addresses
+X86_EXTERN_FUNC(__imp__sub_001387F0);
+X86_FUNC(sub_001387F0) {
+    static const bool on = [] { const char *v = std::getenv("XBE_CITY_SIGNWATCH"); return v && std::strcmp(v, "1") == 0; }();
+    static bool armed = false;
+    if (on && !armed && !kernel::GuestWatchActive()) {
+        const uint32_t self = ctx.ecx;
+        const int32_t n = int32_t(X86_MEM32(self + 0x6430));
+        for (int32_t i = 0; i < n && i < 4096; ++i) {
+            const uint32_t inst = X86_MEM32((g_inst_entries ? g_inst_entries : self + 0x5AD4) + uint32_t(i) * 8);
+            if (!inst || !mem::IsCommitted(inst)) continue;
+            const uint32_t obj = X86_MEM32(inst);
+            if (!obj) continue;
+            LOGR("signwatch: inst %08X obj %08X (entry %d of %d, [inst+4] %08X)", inst, obj, i, n, X86_MEM32(inst + 4));
+            kernel::InstallGuestWatch(inst, 4);
+            armed = true;
+            break;
+        }
+    }
+    static const bool list_watch = [] { const char *v = std::getenv("XBE_CITY_SIGNWATCH");
+                                        return v && std::strcmp(v, "list") == 0; }();
+    if (list_watch && !kernel::GuestWatchActive()) {
+        // Live-object list [0x37F634]: node +0 next, +8 object. Watch the sentinel's next pointer so each
+        // head insertion logs its writer's stack.
+        const uint32_t head = X86_MEM32(0x37F634u);
+        if (head) {
+            LOGR("signwatch: live list sentinel %08X first %08X", head, X86_MEM32(head));
+            kernel::InstallGuestWatch(head, 4);
+        }
+    }
+    static const bool count = std::getenv("XBE_CITY_SIGNCOUNT") != nullptr;
+    if (count) {
+        // Visible instances by owning tile: game 3x3, inner ring (5x5 band), outer ring; and how many carry an
+        // attached object (the 0x21E1A0 draw: façade signs). The instance lies in its slot's .g block.
+        static uint32_t vis[3], obj[3], frames, after_ring, is_city;
+        if (g_ring_instances_done) ++after_ring;
+        if (ctx.ecx == X86_MEM32(kCityPtr)) ++is_city;
+        static auto last = std::chrono::steady_clock::now();
+        const uint32_t self = ctx.ecx, city = X86_MEM32(kCityPtr);
+        const int32_t n = int32_t(X86_MEM32(self + 0x6430));
+        const int grid = game::city_grid::Ring() ? game::city_grid::N() : 0;
+        for (int32_t i = 0; i < n && i < 8192; ++i) {
+            const uint32_t inst = X86_MEM32((g_inst_entries ? g_inst_entries : self + 0x5AD4) + uint32_t(i) * 8);
+            if (!inst) continue;
+            int cls = -1;
+            for (uint32_t s = 0; s < 9 && city && cls < 0; ++s) {
+                const uint32_t b = X86_MEM32(city + 0xE0 + s * 0x8B0 + 0x30);
+                if (b && inst >= b && inst < b + 0x400000u) cls = 0;
+            }
+            for (int s = 0; s < grid * grid && cls < 0; ++s) {
+                if (!game::city_grid::RingCell(s)) continue;
+                const uint32_t slot = game::city_grid::Slots() + uint32_t(s) * 0x8B0u;
+                const uint32_t b = X86_MEM32(slot + 0x30);
+                if (b && inst >= b && inst < b + 0x400000u)
+                    cls = game::city_grid::InInnerDetailZone(base, slot) ? 1 : 2;
+            }
+            if (cls < 0) continue;
+            static const bool ring_watch = [] { const char *v = std::getenv("XBE_CITY_SIGNWATCH");
+                                                 return v && std::strcmp(v, "ring") == 0; }();
+            static const bool game_watch = [] { const char *v = std::getenv("XBE_CITY_SIGNWATCH");
+                                                 return v && std::strcmp(v, "game") == 0; }();
+            if (game_watch && cls == 0 && !X86_MEM32(inst) && X86_MEM32(inst + 4) && !kernel::GuestWatchActive()) {
+                LOGR("signwatch: game-tile inst %08X has no object ([inst+4] %08X); watching", inst, X86_MEM32(inst + 4));
+                kernel::InstallGuestWatch(inst, 4);
+            }
+            if (ring_watch && cls == 1 && !X86_MEM32(inst) && !kernel::GuestWatchActive()) {
+                LOGR("signwatch: inner-ring inst %08X has no object ([inst+4] %08X); watching", inst, X86_MEM32(inst + 4));
+                kernel::InstallGuestWatch(inst, 4);
+            }
+            ++vis[cls];
+            if (const uint32_t o = X86_MEM32(inst)) {
+                ++obj[cls];
+                // object class census: vtable -> (count, sample object, sample instance)
+                if (mem::IsCommitted(o)) {
+                    static std::map<uint32_t, std::array<uint32_t, 3>> classes;
+                    auto &c = classes[X86_MEM32(o)];
+                    if (!c[0]) { c[1] = o; c[2] = inst; }
+                    ++c[0];
+                    static auto t = std::chrono::steady_clock::now();
+                    if (std::chrono::steady_clock::now() - t > std::chrono::seconds(10)) {
+                        t = std::chrono::steady_clock::now();
+                        for (auto &[vt, v] : classes)
+                            LOGR("signclass: vtable %08X seen %u (obj %08X inst %08X, obj+4 %08X +8 %08X +0x38 %08X)", vt,
+                                 v[0], v[1], v[2], X86_MEM32(v[1] + 4), X86_MEM32(v[1] + 8), X86_MEM32(v[1] + 0x38));
+                        classes.clear();
+                    }
+                }
+            }
+        }
+        ++frames;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last >= std::chrono::seconds(2)) {
+            last = now;
+            LOGR("signcount: per frame visible/with-object  game3x3 %u/%u  inner-ring %u/%u  outer %u/%u  (%u frames, %u after ring walk, %u self==city, list %d)",
+                 vis[0] / frames, obj[0] / frames, vis[1] / frames, obj[1] / frames, vis[2] / frames, obj[2] / frames,
+                 frames, after_ring, is_city, n);
+            vis[0] = vis[1] = vis[2] = obj[0] = obj[1] = obj[2] = frames = after_ring = is_city = 0;
+        }
+    }
+    __imp__sub_001387F0(ctx, base);
+}
+#endif
+
+// XBE_CITY_SIGNCOUNT=1: the façade-sign pass 0x13F840 walks the visible list and draws an overlay for each
+// instance whose model ([city+0x38] + ([inst+4]>>20)*0x100) has +0x4C == 1 and overlay data +0x1C, if the
+// overlay mask test on 0x136E70's flags passes. Count each step per owning tile class at the pass's entry.
+void SignPassCensus(uint8_t *base) {
+#if TCNYC_PAL
+    (void)base;  // diagnostic only, USA addresses
+#else
+    static const bool on = std::getenv("XBE_CITY_SIGNCOUNT") != nullptr;
+    const uint32_t city = X86_MEM32(kCityPtr);
+    if (on && city) {
+        static uint32_t vis[4], ovl[4], pass[4], frames;
+        const int32_t n = int32_t(X86_MEM32(city + 0x6430));
+        const int grid = game::city_grid::Ring() ? game::city_grid::N() : 0;
+        for (int32_t i = 0; i < n && i < 8192; ++i) {
+            const uint32_t inst = X86_MEM32((g_inst_entries ? g_inst_entries : city + 0x5AD4) + uint32_t(i) * 8);
+            if (!inst || !mem::IsCommitted(inst + 0x17)) continue;
+            int cls = -1;
+            for (uint32_t s = 0; s < 9 && cls < 0; ++s) {
+                const uint32_t b = X86_MEM32(city + 0xE0 + s * 0x8B0 + 0x30);
+                if (b && inst >= b && inst < b + 0x400000u) cls = 0;
+            }
+            for (int s = 0; s < grid * grid && cls < 0; ++s) {
+                if (!game::city_grid::RingCell(s)) continue;
+                const uint32_t slot = game::city_grid::Slots() + uint32_t(s) * 0x8B0u;
+                const uint32_t b = X86_MEM32(slot + 0x30);
+                if (b && inst >= b && inst < b + 0x400000u)
+                    cls = game::city_grid::InInnerDetailZone(base, slot) ? 1 : 2;
+            }
+            if (cls < 0) cls = 3;
+            ++vis[cls];
+            const uint32_t model = X86_MEM32(city + 0x38) + ((X86_MEM32(inst + 4) >> 20) << 8);
+            if (!mem::IsCommitted(model + 0x4F) || X86_MEM16(model + 0x4C) != 1) continue;
+            const uint32_t ov = X86_MEM32(model + 0x1C);
+            if (!ov || !mem::IsCommitted(ov + 0x1B)) continue;
+            ++ovl[cls];
+            // 0x136E70 flags (stdcall-free leaf: arg on the stack, cdecl)
+            const uint32_t f14 = X86_MEM32(inst + 0x14), f8 = X86_MEM32(inst + 8);
+            uint32_t fl = ((f14 >> 22) < X86_MEM16(0x37F0B0u + ((f14 >> 16) & 0x3F) * 2)) ? 0x4000u : 0u;
+            fl |= X86_MEM16(0x37F180u + ((f14 >> 8) & 0x0F) * 2);
+            fl |= ((f8 & 0xFFFF) < X86_MEM16(0x363D44u)) ? 0x8000u : 0u;
+            fl |= (f14 >> 12) & 0x0F;
+            if (((fl & X86_MEM16(ov + 0x18)) ^ X86_MEM16(ov + 0x1A)) == 0) {
+                ++pass[cls];
+                // texture entry as 0x13F9AB picks it: pooled ([0x3F54C4]) when [ov+0x14] has 0x4000, else the
+                // model's own table [model+0x10]; 36-byte entries. Log the first sightings per class.
+                const uint32_t t = X86_MEM32(ov + 0x14);
+                const bool pooled = (t & 0x4000u) != 0;
+                const uint32_t idx = pooled ? (t & 0x3FFFu) : t;
+                const uint32_t tab = pooled ? X86_MEM32(0x3F54C4u) : X86_MEM32(model + 0x10);
+                const uint32_t e = tab + idx * 36u;
+                static std::map<uint64_t, int> seen;
+                if (seen.size() < 120 && seen.emplace((uint64_t(cls) << 32) | e, 0).second && mem::IsCommitted(e + 35))
+                    LOGR("signtex: %s inst %08X pooled %d idx %X entry %08X: %08X %08X %08X %08X %08X %08X",
+                         cls == 0 ? "game3x3" : cls == 1 ? "inner" : cls == 2 ? "outer" : "unmatched", inst, pooled,
+                         idx, e, X86_MEM32(e), X86_MEM32(e + 4), X86_MEM32(e + 8), X86_MEM32(e + 12),
+                         X86_MEM32(e + 16), X86_MEM32(e + 20));
+            }
+        }
+        ++frames;
+        static auto last = std::chrono::steady_clock::now();
+        if (std::chrono::steady_clock::now() - last >= std::chrono::seconds(3)) {
+            last = std::chrono::steady_clock::now();
+            LOGR("signpass: per frame visible/overlay/mask-pass  game3x3 %u/%u/%u  inner-ring %u/%u/%u  outer %u/%u/%u  "
+                 "unmatched %u/%u/%u (list %d, %u frames)", vis[0] / frames, ovl[0] / frames, pass[0] / frames, vis[1] / frames,
+                 ovl[1] / frames, pass[1] / frames, vis[2] / frames, ovl[2] / frames, pass[2] / frames, vis[3] / frames, ovl[3] / frames, pass[3] / frames, n, frames);
+            for (int k = 0; k < 4; ++k) vis[k] = ovl[k] = pass[k] = 0;
+            frames = 0;
+        }
+    }
+#endif
 }
