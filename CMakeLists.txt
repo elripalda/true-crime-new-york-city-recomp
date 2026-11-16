@@ -103,8 +103,16 @@ target_compile_definitions(TrueCrimeNYC PRIVATE _WIN32_WINNT=0x0A00 WINVER=0x0A0
 
 # Keep the SDK startup intact and invoke it after the launcher closes.
 set_property(SOURCE "${SDK}/runtime/app/main.cpp" APPEND PROPERTY COMPILE_DEFINITIONS wWinMain=RecompMain)
-target_sources(TrueCrimeNYC PRIVATE launcher/launcher.cpp launcher/version.rc)
-target_include_directories(TrueCrimeNYC PRIVATE launcher)
+include(launcher/launcher.cmake)
+tcnyc_add_launcher(TrueCrimeNYC)
+target_sources(TrueCrimeNYC PRIVATE launcher/windows_main.cpp launcher/version.rc
+    "${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp")
+# Windows still uses ImGui 1.91, whose SDL3 backends refer to the SDL 3.1 names.
+set_property(SOURCE
+    "${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp"
+    "${imgui_SOURCE_DIR}/backends/imgui_impl_sdlrenderer3.cpp"
+    APPEND PROPERTY COMPILE_DEFINITIONS SDL_ENABLE_OLD_NAMES)
+target_link_libraries(TrueCrimeNYC PRIVATE SDL3::SDL3-static)
 set_property(SOURCE launcher/version.rc APPEND PROPERTY OBJECT_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/launcher/TrueCrimeNYC.ico")
 # Embed the long-path manifest. lld-link only accepts /MANIFESTINPUT with /manifest:embed; a
@@ -118,4 +126,8 @@ else()
         "-Wl,/manifest:embed"
         "-Wl,/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/launcher/TrueCrimeNYC.manifest")
 endif()
-target_link_libraries(TrueCrimeNYC PRIVATE comdlg32 gdi32 user32)
+target_link_libraries(TrueCrimeNYC PRIVATE shell32 gdi32 user32)
+
+set(TCNYC_REPO "${CMAKE_CURRENT_SOURCE_DIR}")
+set(TCNYC_TEST_SDL SDL3::SDL3-static)
+include(tests/HostTests.cmake)

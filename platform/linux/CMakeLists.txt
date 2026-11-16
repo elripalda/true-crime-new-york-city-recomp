@@ -9,9 +9,13 @@ get_filename_component(REPO "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
 option(TCNYC_PAL "Build for the European (PAL) XBE" OFF)
 if(TCNYC_PAL)
     set(GEN "${REPO}/generated/game-pal")
+    set(GAME_CONFIG game-pal.toml)
+    set(GENERATION_PRESET pal)
     set(XBE_FILE "${REPO}/assets-pal/default.xbe")
 else()
     set(GEN "${REPO}/generated/game")
+    set(GAME_CONFIG game.toml)
+    set(GENERATION_PRESET release)
     set(XBE_FILE "${REPO}/assets/default.xbe")
 endif()
 
@@ -44,11 +48,39 @@ set(IMGUI_SRC
 set(CMAKE_BUILD_RPATH "$ORIGIN/lib")
 set(CMAKE_INSTALL_RPATH "$ORIGIN/lib")
 
-file(GLOB GEN_SRC "${GEN}/x86_recomp.*.cpp" "${GEN}/x86_func_mapping.cpp")
+include("${REPO}/sdk/cmake/GuestManifest.cmake")
+file(STRINGS "${REPO}/config/${GAME_CONFIG}" partition_setting REGEX "^partitions *=")
+string(REGEX MATCH "[0-9]+" GAME_PARTITIONS "${partition_setting}")
+if(NOT GAME_PARTITIONS OR GAME_PARTITIONS LESS 1)
+    message(FATAL_ERROR "Invalid partition count in config/${GAME_CONFIG}.")
+endif()
+if(EXISTS "${GEN}/generation.manifest")
+    file(LOCK "${GEN}/generation.lock" GUARD PROCESS TIMEOUT 120)
+endif()
+xbe_generation_manifest(expected "${REPO}" "${GAME_CONFIG}" "${XBE_FILE}" "${GEN}" "${GAME_PARTITIONS}")
+if(EXISTS "${GEN}/generation.manifest")
+    file(READ "${GEN}/generation.manifest" actual)
+endif()
+if(NOT expected OR NOT actual STREQUAL expected)
+    message(FATAL_ERROR
+        "Generated guest code is missing or stale for ${GAME_CONFIG}. From a Windows build shell, "
+        "configure the ${GENERATION_PRESET} preset and build its recompile_TrueCrimeNYC target.")
+endif()
+file(LOCK "${GEN}/generation.lock" RELEASE)
+
+set(GEN_SRC "${GEN}/x86_func_mapping.cpp")
+math(EXPR last "${GAME_PARTITIONS} - 1")
+foreach(i RANGE 0 ${last})
+    list(APPEND GEN_SRC "${GEN}/x86_recomp.${i}.cpp")
+endforeach()
+xbe_generation_inputs(generation_inputs "${REPO}" "${GAME_CONFIG}" "${XBE_FILE}")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    ${generation_inputs} "${GEN}/generation.manifest" ${GEN_SRC}
+    "${GEN}/x86_recomp_shared.h" "${GEN}/image_symbols.h" "${GEN}/hook_exports.h")
 
 file(GLOB RT_SRC "${REPO}/sdk/runtime/*/*.cpp")
 list(FILTER RT_SRC EXCLUDE REGEX "/app/|/gpu/d3d12\\.cpp$|/gpu/texturedumper\\.cpp$|/audio/xaudio2\\.cpp$")
-list(APPEND RT_SRC "${REPO}/sdk/runtime/app/game_files.cpp")
+list(APPEND RT_SRC "${REPO}/sdk/runtime/app/game_files.cpp" "${REPO}/sdk/runtime/app/settings_store.cpp")
 
 file(GLOB GAME_SRC CONFIGURE_DEPENDS "${REPO}/src/*/*.cpp")
 list(FILTER GAME_SRC EXCLUDE REGEX "/linux/app_stub\\.cpp$|/linux/input_stub\\.cpp$|/linux/graphics_menu_stub\\.cpp$")
@@ -98,6 +130,9 @@ target_link_libraries(ffx_fsr3_vk PRIVATE PkgConfig::VULKAN)
 
 add_executable(TrueCrimeNYC ${GEN_SRC} ${RT_SRC} ${GAME_SRC} ${HOST} ${HARNESS} ${IMGUI_SRC} ${XBE_HASH})
 
+include("${REPO}/launcher/launcher.cmake")
+tcnyc_add_launcher(TrueCrimeNYC)
+
 target_include_directories(TrueCrimeNYC PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
     "${REPO}/src"
@@ -138,3 +173,7 @@ if(TCNYC_DLSS_SDK)
     endif()
 endif()
 target_link_options(TrueCrimeNYC PRIVATE -static-libstdc++)
+
+set(TCNYC_REPO "${REPO}")
+set(TCNYC_TEST_SDL "${SDL3_TARGET}")
+include("${REPO}/tests/HostTests.cmake")

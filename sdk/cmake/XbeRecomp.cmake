@@ -1,5 +1,6 @@
 # Original Xbox static recompilation: xbe_recomp, the host runtime and add_xbe_image()
 include_guard(GLOBAL)
+include("${CMAKE_CURRENT_LIST_DIR}/GuestManifest.cmake")
 
 get_filename_component(XBE_SDK_DIR ${CMAKE_CURRENT_LIST_DIR}/.. ABSOLUTE)
 # build scripts find the SDK's xdk folder and THIRD_PARTY.txt through this
@@ -17,7 +18,7 @@ FetchContent_Declare(imgui GIT_REPOSITORY https://github.com/ocornut/imgui.git G
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 set(SDL_STATIC ON CACHE BOOL "" FORCE)
 set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
-set(SDL_RENDER OFF CACHE BOOL "" FORCE)
+set(SDL_RENDER ON CACHE BOOL "" FORCE)
 set(SDL_GPU OFF CACHE BOOL "" FORCE)
 set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(SDL3 GIT_REPOSITORY https://github.com/libsdl-org/SDL.git GIT_TAG release-3.4.16 GIT_SHALLOW TRUE)
@@ -111,22 +112,17 @@ function(add_xbe_image target xbe config partitions game_dir)
     foreach(i RANGE ${last})
         list(APPEND GEN_SOURCES ${GEN}/x86_recomp.${i}.cpp)
     endforeach()
-    file(GLOB configs CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/config/*.toml ${XBE_SDK_DIR}/xdk/*/*.toml)
+    xbe_generation_inputs(generation_inputs "${CMAKE_CURRENT_SOURCE_DIR}" "${config}" "${xbe_file}")
     add_custom_command(
         OUTPUT ${GEN}/codegen.stamp
         BYPRODUCTS ${GEN_SOURCES} ${GEN}/x86_recomp_shared.h ${GEN}/image_symbols.h ${GEN}/hook_exports.h
-                   ${GEN}/exports.def ${GEN}/imports.def ${GEN}/code.lib
-        COMMAND xbe_recomp config/${config} --xdk ${XBE_SDK_DIR}/xdk
-        COMMAND $<TARGET_FILE:grid_patch> ${GEN} ${partitions}
-        COMMAND ${XBE_LLVM_BIN}/lld-link.exe /lib /machine:x64 /def:${GEN}/imports.def /out:${GEN}/code.lib
-        COMMAND ${CMAKE_COMMAND} -E touch ${GEN}/codegen.stamp
-        # The executable targets below are order-only in CMake, so name the patch implementation as
-        # files as well: editing either one must regenerate the sources and rebuild the game code.
-        DEPENDS xbe_recomp grid_patch
-                ${XBE_RECOMP_SOURCES}
-                ${XBE_SDK_DIR}/runtime/xbe/grid_patch.h
-                ${XBE_SDK_DIR}/tools/grid_patch/main.cpp
-                ${configs} ${xbe_file}
+                   ${GEN}/exports.def ${GEN}/imports.def ${GEN}/code.lib ${GEN}/generation.manifest
+        COMMAND ${CMAKE_COMMAND}
+                "-DRECOMP=$<TARGET_FILE:xbe_recomp>" "-DGRID_PATCH=$<TARGET_FILE:grid_patch>"
+                "-DLLD=${XBE_LLVM_BIN}/lld-link.exe" "-DREPO=${CMAKE_CURRENT_SOURCE_DIR}"
+                "-DGEN=${GEN}" "-DCONFIG=${config}" "-DPARTITIONS=${partitions}" "-DXBE=${xbe_file}"
+                -P "${XBE_SDK_DIR}/cmake/GenerateGuest.cmake"
+        DEPENDS xbe_recomp grid_patch ${generation_inputs}
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
         COMMENT "Recompiling ${xbe}"
         VERBATIM)

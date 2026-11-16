@@ -13,9 +13,13 @@
 
 # user's own game files
 /assets/
+/assets-pal/
+/build-*.log
 
 # runtime files
 settings.toml
+launcher.toml
+launcher-pal.toml
 /logs/
 /hdd/
 /CrashDumps/
