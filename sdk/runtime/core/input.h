@@ -3,6 +3,58 @@
 
 namespace input {
 
+// Bindings: every keyboard key, mouse button and controller input reaches the
+// game as one of these console pad inputs. The button prompts show whatever is
+// bound to the pad input each glyph stands for. See docs/rebinding-plan.md.
+enum class PadInput : uint8_t {
+    Up, Down, Left, Right, Start, Back, LS, RS,  // Pad::buttons bits 0-7
+    A, B, X, Y, Black, White, LT, RT,            // Pad::analog 0-7
+    MoveUp, MoveDown, MoveLeft, MoveRight,       // keyboard only: the left stick
+    Count
+};
+// keyboard layouts: on foot and in a vehicle; menu keys (Enter, Backspace,
+// arrows, Escape) are fixed and always on, so no binding can lock out the menus
+enum class Context : uint8_t { Any, OnFoot, Driving };
+// a key is an SDL keycode (layout-aware letters, as before), or a mouse button
+inline constexpr uint32_t kMouseKey = 0x10000000;  // | 0 left, 1 middle, 2 right, 3 side 1, 4 side 2
+inline constexpr uint32_t MouseKey(int button) { return kMouseKey | uint32_t(button); }
+struct KeyBinding {
+    PadInput target;
+    Context context;
+    uint32_t keys[4];  // any of them held presses the target; 0 unused
+};
+// a controller source: an SDL_GamepadButton, or kPadAxis | SDL_GamepadAxis (the triggers)
+inline constexpr int kPadAxis = 0x100;
+struct PadBinding {
+    PadInput target;  // Up..RT
+    int source;
+};
+inline constexpr int kKeyBindingCount = 20;
+inline constexpr int kPadBindingCount = 16;
+void KeyBindings(KeyBinding (&out)[kKeyBindingCount]);
+// settings.toml [controls]: keyboard actions by name, controller inputs by SDL name;
+// without it, today's layout with the old reload/heavy/use/climb letter keys
+void DefaultPadBindings(PadBinding (&out)[kPadBindingCount]);
+void DefaultKeys(KeyBinding (&out)[kKeyBindingCount]);  // today's layout with the letter-key settings
+// replaces both tables (the launcher's Controls tab); SaveBindings then writes them
+void SetBindings(const KeyBinding (&keys)[kKeyBindingCount], const PadBinding (&pad)[kPadBindingCount]);
+// changes whenever the bindings do, so the renderers re-bake the prompt glyphs
+uint32_t BindingGeneration();
+// display names for the menus
+void KeyDisplayName(uint32_t key, char (&out)[32]);
+void PadSourceDisplayName(int source, char (&out)[32]);
+// the first physical input held on controller 1 (a PadBinding source), -1 when none
+int HeldPadSource();
+// true when any controller input is moved from its default
+bool PadRemapped();
+// the keyboard prompt for a pad input in the current context: up to 4 characters, "-" when unbound;
+// MoveUp gives the movement keys (e.g. "WASD")
+void PromptLabel(PadInput target, bool driving, char (&out)[8]);
+bool CanBindKey(uint32_t key);
+void LoadBindings(const void* toml_table);
+void SaveBindings(void* toml_table);
+void PadBindings(PadBinding (&out)[kPadBindingCount]);
+
 // the console controller's report, analog buttons are 0-255
 struct Pad {
     // compare reports by value; padding is not part of the state
@@ -49,6 +101,8 @@ bool ConsumeMouseAim(float& dx, float& dy);
 void UseDirectMouseAim();
 // a direct sample was applied recently (the PC fix stops its direct path after 5 s idle)
 bool DirectAimRecent();
+// the mouse moved within the last 100 ms and no overlay owns the pointer
+bool MouseMovedRecently();
 // an overlay (the Graphics menu) owns the pointer: no look input, no direct aim
 void SetUiActive(bool active);
 bool UiActive();

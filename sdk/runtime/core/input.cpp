@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -17,6 +19,7 @@
 #include <windows.h>
 #endif
 #include <SDL3/SDL.h>
+#include <toml++/toml.hpp>
 
 #include "app/app.h"
 #include "core/log.h"
@@ -183,7 +186,6 @@ constexpr int kKeyUp = VK_UP, kKeyDown = VK_DOWN, kKeyLeft = VK_LEFT, kKeyRight 
 constexpr int kKeyEscape = VK_ESCAPE, kKeyTab = VK_TAB, kKeyReturn = VK_RETURN, kKeyBack = VK_BACK;
 constexpr int kKeySpace = VK_SPACE, kKeyShift = VK_SHIFT, kKeyRShift = VK_RSHIFT, kKeyLCtrl = VK_LCONTROL,
               kKeyRCtrl = VK_RCONTROL, kKeyLAlt = VK_LMENU, kKeyRAlt = VK_RMENU;
-bool HeldChar(char c) { return HeldCode(int(uint8_t(c))); }
 #else
 bool HeldCode(int code) {
     int count = 0;
@@ -196,7 +198,6 @@ constexpr int kKeyEscape = SDL_SCANCODE_ESCAPE, kKeyTab = SDL_SCANCODE_TAB, kKey
               kKeyBack = SDL_SCANCODE_BACKSPACE, kKeySpace = SDL_SCANCODE_SPACE, kKeyShift = SDL_SCANCODE_LSHIFT,
               kKeyRShift = SDL_SCANCODE_RSHIFT, kKeyLCtrl = SDL_SCANCODE_LCTRL, kKeyRCtrl = SDL_SCANCODE_RCTRL,
               kKeyLAlt = SDL_SCANCODE_LALT, kKeyRAlt = SDL_SCANCODE_RALT;
-bool HeldChar(char c) { return HeldCode(SDL_GetScancodeFromKey(SDL_Keycode(uint8_t(c) | 0x20), nullptr)); }
 #endif
 
 // 0 left, 1 middle, 2 right, 3 the first side button, 4 the second
@@ -210,6 +211,128 @@ bool MouseHeld(int button) {
                                               SDL_BUTTON_X1MASK, SDL_BUTTON_X2MASK};
     return (state & masks[button]) != 0;
 #endif
+}
+
+// An SDL keycode as the platform's key state code. Letters and digits stay
+// layout-aware, as the old HeldChar lookups were.
+int KeyCode(uint32_t key) {
+#ifdef _WIN32
+    if (key >= 'a' && key <= 'z') return int(key - 'a' + 'A');
+    if ((key >= '0' && key <= '9') || key == SDLK_RETURN || key == SDLK_ESCAPE || key == SDLK_BACKSPACE ||
+        key == SDLK_TAB || key == SDLK_SPACE)
+        return int(key);  // the same values as VK_RETURN, VK_ESCAPE, VK_BACK, VK_TAB, VK_SPACE
+    if (key >= SDLK_F1 && key <= SDLK_F12) return VK_F1 + int(key - SDLK_F1);
+    switch (key) {
+    case SDLK_UP: return VK_UP;
+    case SDLK_DOWN: return VK_DOWN;
+    case SDLK_LEFT: return VK_LEFT;
+    case SDLK_RIGHT: return VK_RIGHT;
+    case SDLK_LCTRL: return VK_LCONTROL;
+    case SDLK_RCTRL: return VK_RCONTROL;
+    case SDLK_LSHIFT: return VK_LSHIFT;
+    case SDLK_RSHIFT: return VK_RSHIFT;
+    case SDLK_LALT: return VK_LMENU;
+    case SDLK_RALT: return VK_RMENU;
+    case SDLK_CAPSLOCK: return VK_CAPITAL;
+    case SDLK_INSERT: return VK_INSERT;
+    case SDLK_HOME: return VK_HOME;
+    case SDLK_END: return VK_END;
+    case SDLK_PAGEUP: return VK_PRIOR;
+    case SDLK_PAGEDOWN: return VK_NEXT;
+    case SDLK_KP_0: return VK_NUMPAD0;
+    case SDLK_KP_1: return VK_NUMPAD1;
+    case SDLK_KP_2: return VK_NUMPAD2;
+    case SDLK_KP_3: return VK_NUMPAD3;
+    case SDLK_KP_4: return VK_NUMPAD4;
+    case SDLK_KP_5: return VK_NUMPAD5;
+    case SDLK_KP_6: return VK_NUMPAD6;
+    case SDLK_KP_7: return VK_NUMPAD7;
+    case SDLK_KP_8: return VK_NUMPAD8;
+    case SDLK_KP_9: return VK_NUMPAD9;
+    case SDLK_KP_PERIOD: return VK_DECIMAL;
+    case SDLK_KP_PLUS: return VK_ADD;
+    case SDLK_KP_MINUS: return VK_SUBTRACT;
+    case SDLK_KP_MULTIPLY: return VK_MULTIPLY;
+    case SDLK_KP_DIVIDE: return VK_DIVIDE;
+    default:
+        if (key < 0x20 || key > 0xFFFF) return 0;
+        const SHORT mapped = VkKeyScanExW(wchar_t(key), GetKeyboardLayout(0));
+        return mapped == -1 ? 0 : mapped & 0xFF;
+    }
+#else
+    return int(SDL_GetScancodeFromKey(SDL_Keycode(key), nullptr));
+#endif
+}
+
+bool KeyHeld(uint32_t key) {
+    if (!key) return false;
+    if (key & kMouseKey) return MouseHeld(int(key & 0xFF));
+    const int code = KeyCode(key);
+    return code && HeldCode(code);
+}
+
+uint32_t LetterBinding(uint32_t value, char fallback) {
+    const char letter = LetterKey(value, fallback);
+    return letter ? uint32_t(letter - 'A' + 'a') : 0;
+}
+
+// Today's layout. The four letter keys in settings.toml still apply.
+void DefaultKeyBindings(KeyBinding (&out)[kKeyBindingCount]) {
+    using enum PadInput;
+    const uint32_t lower_ls = uint32_t(kLeftStickClickKey - 'A' + 'a');
+    const KeyBinding table[kKeyBindingCount] = {
+        {MoveUp, Context::Any, {'w'}},
+        {MoveDown, Context::Any, {'s'}},
+        {MoveLeft, Context::Any, {'a'}},
+        {MoveRight, Context::Any, {'d'}},
+        {A, Context::OnFoot, {SDLK_LCTRL, SDLK_RCTRL, MouseKey(3)}},           // light attack
+        {B, Context::OnFoot, {'v'}},                                           // grapple / human shield
+        {X, Context::OnFoot, {SDLK_LALT, SDLK_RALT, MouseKey(4), LetterBinding(g_heavy_attack_key, 0)}},
+        {Y, Context::OnFoot, {SDLK_SPACE, LetterBinding(g_climb_key, 'G')}},  // jump / climb
+        {A, Context::Driving, {'w'}},                                          // accelerate
+        {B, Context::Driving, {SDLK_SPACE}},                                   // handbrake
+        {X, Context::Driving, {'s'}},                                          // brake / reverse
+        {Y, Context::Driving, {}},
+        {Black, Context::Any, {LetterBinding(g_reload_key, 'R')}},             // reload / block
+        {White, Context::Any, {LetterBinding(g_use_key, 'E')}},                // use / enter vehicle
+        {LT, Context::Any, {MouseKey(2), MouseKey(1)}},                        // aim / lock on
+        {RT, Context::Any, {MouseKey(0)}},                                     // fire
+        {Back, Context::Any, {'q', SDLK_TAB}},                                 // badge / horn / siren
+        {LS, Context::Any, {lower_ls}},
+        {RS, Context::Any, {SDLK_LSHIFT, SDLK_RSHIFT}},
+        {Start, Context::Any, {}},                                             // Escape, fixed
+    };
+    std::copy(std::begin(table), std::end(table), out);
+}
+
+}  // namespace
+
+void DefaultPadBindings(PadBinding (&out)[kPadBindingCount]) {
+    using enum PadInput;
+    const PadBinding table[kPadBindingCount] = {
+        {Up, SDL_GAMEPAD_BUTTON_DPAD_UP},       {Down, SDL_GAMEPAD_BUTTON_DPAD_DOWN},
+        {Left, SDL_GAMEPAD_BUTTON_DPAD_LEFT},   {Right, SDL_GAMEPAD_BUTTON_DPAD_RIGHT},
+        {Start, SDL_GAMEPAD_BUTTON_START},      {Back, SDL_GAMEPAD_BUTTON_BACK},
+        {LS, SDL_GAMEPAD_BUTTON_LEFT_STICK},    {RS, SDL_GAMEPAD_BUTTON_RIGHT_STICK},
+        {A, SDL_GAMEPAD_BUTTON_SOUTH},          {B, SDL_GAMEPAD_BUTTON_EAST},
+        {X, SDL_GAMEPAD_BUTTON_WEST},           {Y, SDL_GAMEPAD_BUTTON_NORTH},
+        {Black, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER}, {White, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER},
+        {LT, kPadAxis | SDL_GAMEPAD_AXIS_LEFT_TRIGGER}, {RT, kPadAxis | SDL_GAMEPAD_AXIS_RIGHT_TRIGGER},
+    };
+    std::copy(std::begin(table), std::end(table), out);
+}
+
+namespace {
+
+// Sets a pad input on the report: digital inputs as a bit, analog ones at full press
+// (or the trigger's own depth when value is below 255).
+void PressPad(Pad& pad, PadInput target, uint8_t value) {
+    const int index = int(target);
+    if (index < 8) {
+        if (value > 32) pad.buttons |= uint16_t(1 << index);
+    } else if (index < 16) {
+        pad.analog[index - 8] = std::max(pad.analog[index - 8], value);
+    }
 }
 
 bool WindowFocused() {
@@ -238,58 +361,45 @@ bool ReadKeyboardMouse(Pad& pad) {
         return false;
     }
     auto held = [](int key) { return HeldCode(key); };
-    // When an ImGui overlay owns the keyboard, the arrows and Enter/Escape
-    // already reach it as keys. Do not also mirror them into the pad: the menu
-    // reads both paths and would step twice. Controller input is unaffected.
     const bool ui = g_ui_active.load(std::memory_order_relaxed);
     // Keyboard movement is digital, and a diagonal is normalized to the same
     // length as a straight push (full / sqrt(2)), like the PC's keyboard input.
     // A real controller keeps its own analog values in Poll().
-    const int move_x = int(HeldChar('D')) - int(HeldChar('A'));
-    const int move_y = int(HeldChar('W')) - int(HeldChar('S'));
+    const bool driving = app::kGame.keyboard_driving && app::kGame.keyboard_driving();
+    g_keyboard_driving.store(driving, std::memory_order_relaxed);
+    KeyBinding bindings[kKeyBindingCount];
+    KeyBindings(bindings);
+    bool move[4] = {};
+    for (const auto& binding : bindings) {
+        if (binding.context == (driving ? Context::OnFoot : Context::Driving)) continue;
+        if (std::none_of(std::begin(binding.keys), std::end(binding.keys), KeyHeld)) continue;
+        if (binding.target >= PadInput::MoveUp) move[int(binding.target) - int(PadInput::MoveUp)] = true;
+        else PressPad(pad, binding.target, 255);
+    }
+    // Keyboard movement is digital, and a diagonal is normalized to the same
+    // length as a straight push (full / sqrt(2)), like the PC's keyboard input.
+    // A real controller keeps its own analog values in Poll().
+    const int move_x = int(move[3]) - int(move[2]);
+    const int move_y = int(move[0]) - int(move[1]);
     const int move_scale = move_x && move_y ? 23170 : 32767;
     pad.lx = int16_t(move_x * move_scale);
     pad.ly = int16_t(move_y * move_scale);
-    if (!ui) {
-        const int digital[] = {kKeyUp, kKeyDown, kKeyLeft, kKeyRight, kKeyEscape, kKeyTab, 0, 0};
-        const bool stick_click = HeldChar(kLeftStickClickKey);
-        for (int i = 0; i < 8; ++i) {
-            if (i == 6 ? stick_click : (digital[i] && held(digital[i]))) pad.buttons |= uint16_t(1 << i);
-        }
-    }
-    // Preserve the user's preferred aim/lock layout.
-    if (held(kKeyShift) || held(kKeyRShift)) pad.buttons |= uint16_t(1 << 7);
-    if (HeldChar('Q')) pad.buttons |= uint16_t(1 << 5); // Back: badge / horn / siren
-
-    auto press = [&](int button, bool on) {
-        if (on) pad.analog[button] = 255;
-    };
-    const bool driving = app::kGame.keyboard_driving && app::kGame.keyboard_driving();
-    g_keyboard_driving.store(driving, std::memory_order_relaxed);
-    if (!ui) {
-        press(0, held(kKeyReturn)); // A: menu confirmation
-        press(1, held(kKeyBack));   // B: menu cancel
-    }
+    // Steering uses only the horizontal axis. The forward/back keys are pedals
+    // here, so a held one must not apply the on-foot diagonal scale.
     if (driving) {
-        press(0, HeldChar('W')); // A: accelerate
-        press(2, HeldChar('S')); // X: brake / reverse
-        press(1, held(kKeySpace)); // B: handbrake
-        // Steering uses only the horizontal axis. W/S are pedals here, so a
-        // held W must not apply the on-foot diagonal scale to the steering.
         pad.ly = 0;
         pad.lx = int16_t(move_x * 32767);
-    } else {
-        press(0, held(kKeyLCtrl) || held(kKeyRCtrl) || MouseHeld(3)); // A: light attack
-        press(2, held(kKeyLAlt) || held(kKeyRAlt) || MouseHeld(4)); // X: heavy attack
-        if (char key = LetterKey(g_heavy_attack_key, 0)) press(2, HeldChar(key));
-        press(1, HeldChar('V')); // B: grapple / human shield
-        press(3, held(kKeySpace)); // Y: jump
-        if (char key = LetterKey(g_climb_key, 'G')) press(3, HeldChar(key)); // Y: jump / climb
     }
-    if (char key = LetterKey(g_reload_key, 'R')) press(4, HeldChar(key)); // Black: reload / block
-    if (char key = LetterKey(g_use_key, 'E')) press(5, HeldChar(key)); // White: use / enter vehicle
-    press(6, MouseHeld(1) || MouseHeld(2));
-    press(7, MouseHeld(0));
+    // Fixed menu keys, always on so no binding can lock out the menus. When an
+    // ImGui overlay owns the keyboard they already reach it as keys: do not
+    // also mirror them into the pad, or the menu would step twice.
+    if (!ui) {
+        const int menu[] = {kKeyUp, kKeyDown, kKeyLeft, kKeyRight, kKeyEscape};
+        for (int i = 0; i < 5; ++i)
+            if (held(menu[i])) pad.buttons |= uint16_t(1 << i);
+        if (held(kKeyReturn)) PressPad(pad, PadInput::A, 255);  // menu confirmation
+        if (held(kKeyBack)) PressPad(pad, PadInput::B, 255);    // menu cancel
+    }
     bool mouse_active;
     {
         std::lock_guard lock(g_mouse_lock);
@@ -367,6 +477,260 @@ bool ReadKeyboardMouse(Pad& pad) {
     return active;
 }
 
+}  // namespace
+
+namespace {
+
+// the settings file's names for the keyboard table's rows, in DefaultKeyBindings order
+constexpr const char* kActionNames[kKeyBindingCount] = {
+    "move_forward", "move_back", "move_left", "move_right", "light_attack", "grapple", "heavy_attack", "jump",
+    "drive_accelerate", "drive_handbrake", "drive_brake", "drive_y", "reload", "use", "aim", "fire",
+    "back", "left_stick_click", "right_stick_click", "start"};
+constexpr const char* kPadInputNames[kPadBindingCount] = {
+    "Up", "Down", "Left", "Right", "Start", "Back", "LS", "RS", "A", "B", "X", "Y", "Black", "White", "LT", "RT"};
+constexpr const char* kMouseNames[] = {"MouseLeft", "MouseMiddle", "MouseRight", "Mouse4", "Mouse5"};
+
+std::mutex g_bindings_lock;
+std::atomic<uint32_t> g_binding_generation{1};
+bool g_custom_bindings = false;  // [controls] was read; otherwise the defaults follow the letter keys
+KeyBinding g_keys[kKeyBindingCount];
+PadBinding g_pad[kPadBindingCount];
+
+std::string KeyName(uint32_t key) {
+    if (key & kMouseKey) return (key & 0xFF) < 5 ? kMouseNames[key & 0xFF] : "";
+    return SDL_GetKeyName(SDL_Keycode(key));
+}
+
+uint32_t KeyFromName(const std::string& name) {
+    for (uint32_t i = 0; i < 5; ++i)
+        if (name == kMouseNames[i]) return MouseKey(int(i));
+    return uint32_t(SDL_GetKeyFromName(name.c_str()));  // SDLK_UNKNOWN (0) when not a key
+}
+
+std::string PadSourceName(int source) {
+    const char* name = source & kPadAxis ? SDL_GetGamepadStringForAxis(SDL_GamepadAxis(source & 0xFF))
+                                         : SDL_GetGamepadStringForButton(SDL_GamepadButton(source));
+    return name ? name : "";
+}
+
+int PadSourceFromName(const std::string& name) {
+    const auto button = SDL_GetGamepadButtonFromString(name.c_str());
+    if (button != SDL_GAMEPAD_BUTTON_INVALID) return int(button);
+    const auto axis = SDL_GetGamepadAxisFromString(name.c_str());
+    return axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER || axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER ? kPadAxis | int(axis) : -1;
+}
+
+}  // namespace
+
+void KeyBindings(KeyBinding (&out)[kKeyBindingCount]) {
+    std::lock_guard lock(g_bindings_lock);
+    if (g_custom_bindings) std::copy(std::begin(g_keys), std::end(g_keys), out);
+    else DefaultKeyBindings(out);
+}
+
+void PadBindings(PadBinding (&out)[kPadBindingCount]) {
+    std::lock_guard lock(g_bindings_lock);
+    if (g_custom_bindings) std::copy(std::begin(g_pad), std::end(g_pad), out);
+    else DefaultPadBindings(out);
+}
+
+bool CanBindKey(uint32_t key) {
+    if (key & kMouseKey) return key >= MouseKey(0) && key <= MouseKey(4);
+    return key && KeyCode(key);
+}
+
+void LoadBindings(const void* toml_table) {
+    const auto& t = *static_cast<const toml::table*>(toml_table);
+    // The old letter keys (before [controls]) are integers: 'R' is 82.
+    const std::pair<const char*, uint32_t*> old_keys[] = {
+        {"reload_key", &g_reload_key}, {"heavy_attack_key", &g_heavy_attack_key},
+        {"use_key", &g_use_key}, {"climb_key", &g_climb_key}};
+    for (const auto& [key, value] : old_keys) *value = t[key].value_or(*value);
+    std::lock_guard lock(g_bindings_lock);
+    DefaultKeyBindings(g_keys);
+    DefaultPadBindings(g_pad);
+    g_binding_generation.fetch_add(1, std::memory_order_relaxed);
+    const auto* controls = t["controls"].as_table();
+    g_custom_bindings = controls != nullptr;
+    if (!controls) return;
+    if (const auto* keyboard = (*controls)["keyboard"].as_table()) {
+        for (int i = 0; i < kKeyBindingCount - 1; ++i) {  // Start stays on Escape
+            const auto* keys = (*keyboard)[kActionNames[i]].as_array();
+            if (!keys) continue;
+            auto& binding = g_keys[i];
+            std::fill(std::begin(binding.keys), std::end(binding.keys), 0u);
+            int slot = 0;
+            for (const auto& node : *keys) {
+                const std::string name = node.value_or(std::string{});
+                const uint32_t key = name.empty() ? 0 : KeyFromName(name);
+                if (!CanBindKey(key)) LOGR("input: unsupported key '%s' for %s ignored", name.c_str(), kActionNames[i]);
+                else if (slot < 4 && std::find(binding.keys, binding.keys + slot, key) == binding.keys + slot)
+                    binding.keys[slot++] = key;
+            }
+        }
+    }
+    if (const auto* controller = (*controls)["controller"].as_table()) {
+        for (int i = 0; i < kPadBindingCount; ++i) {
+            const auto name = (*controller)[kPadInputNames[i]].value<std::string>();
+            if (!name) continue;
+            const int source = PadSourceFromName(*name);
+            if (source >= 0) g_pad[i].source = source;
+            else LOGR("input: unknown controller input '%s' for %s ignored", name->c_str(), kPadInputNames[i]);
+        }
+    }
+}
+
+void DefaultKeys(KeyBinding (&out)[kKeyBindingCount]) { DefaultKeyBindings(out); }
+
+void SetBindings(const KeyBinding (&keys)[kKeyBindingCount], const PadBinding (&pad)[kPadBindingCount]) {
+    std::lock_guard lock(g_bindings_lock);
+    std::copy(std::begin(keys), std::end(keys), g_keys);
+    std::copy(std::begin(pad), std::end(pad), g_pad);
+    g_custom_bindings = true;
+    g_binding_generation.fetch_add(1, std::memory_order_relaxed);
+}
+
+void KeyDisplayName(uint32_t key, char (&out)[32]) {
+    constexpr const char* mouse[] = {"Mouse left", "Mouse middle", "Mouse right", "Mouse 4", "Mouse 5"};
+    const char* name = !key ? "" : key & kMouseKey ? ((key & 0xFF) < 5 ? mouse[key & 0xFF] : "?")
+                                                   : SDL_GetKeyName(SDL_Keycode(key));
+    std::snprintf(out, sizeof(out), "%s", name);
+}
+
+void PadSourceDisplayName(int source, char (&out)[32]) {
+    const char* name = "?";
+    if (source & kPadAxis) {
+        name = (source & 0xFF) == SDL_GAMEPAD_AXIS_LEFT_TRIGGER ? "Left trigger" : "Right trigger";
+    } else {
+        switch (source) {
+        case SDL_GAMEPAD_BUTTON_SOUTH: name = "A / Cross"; break;
+        case SDL_GAMEPAD_BUTTON_EAST: name = "B / Circle"; break;
+        case SDL_GAMEPAD_BUTTON_WEST: name = "X / Square"; break;
+        case SDL_GAMEPAD_BUTTON_NORTH: name = "Y / Triangle"; break;
+        case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER: name = "LB / L1"; break;
+        case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER: name = "RB / R1"; break;
+        case SDL_GAMEPAD_BUTTON_BACK: name = "View / Share"; break;
+        case SDL_GAMEPAD_BUTTON_START: name = "Menu / Options"; break;
+        case SDL_GAMEPAD_BUTTON_LEFT_STICK: name = "Left stick click"; break;
+        case SDL_GAMEPAD_BUTTON_RIGHT_STICK: name = "Right stick click"; break;
+        case SDL_GAMEPAD_BUTTON_DPAD_UP: name = "D-pad up"; break;
+        case SDL_GAMEPAD_BUTTON_DPAD_DOWN: name = "D-pad down"; break;
+        case SDL_GAMEPAD_BUTTON_DPAD_LEFT: name = "D-pad left"; break;
+        case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: name = "D-pad right"; break;
+        default:
+            if (const char* sdl = SDL_GetGamepadStringForButton(SDL_GamepadButton(source))) name = sdl;
+        }
+    }
+    std::snprintf(out, sizeof(out), "%s", name);
+}
+
+int HeldPadSource() {
+    std::lock_guard lock(g_lock);
+    SDL_Gamepad* pad = g_pads[0];
+    if (!pad) return -1;
+    for (int button = 0; button < SDL_GAMEPAD_BUTTON_COUNT; ++button)
+        if (button != SDL_GAMEPAD_BUTTON_GUIDE && SDL_GetGamepadButton(pad, SDL_GamepadButton(button))) return button;
+    for (auto axis : {SDL_GAMEPAD_AXIS_LEFT_TRIGGER, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER})
+        if (SDL_GetGamepadAxis(pad, axis) > 20000) return kPadAxis | int(axis);
+    return -1;
+}
+
+uint32_t BindingGeneration() { return g_binding_generation.load(std::memory_order_relaxed); }
+
+bool PadRemapped() {
+    PadBinding pad[kPadBindingCount], defaults[kPadBindingCount];
+    PadBindings(pad);
+    DefaultPadBindings(defaults);
+    for (int i = 0; i < kPadBindingCount; ++i)
+        if (pad[i].target != defaults[i].target || pad[i].source != defaults[i].source) return true;
+    return false;
+}
+
+namespace {
+
+// a short keycap label the 3x5 prompt font can draw
+std::string ShortKeyLabel(uint32_t key) {
+    if (key & kMouseKey) {
+        constexpr const char* mouse[] = {"LMB", "MMB", "RMB", "M4", "M5"};
+        return (key & 0xFF) < 5 ? mouse[key & 0xFF] : "";
+    }
+    if (key >= 'a' && key <= 'z') return std::string(1, char(key - 'a' + 'A'));
+    if (key >= '0' && key <= '9') return std::string(1, char(key));
+    if (key >= SDLK_F1 && key <= SDLK_F12) return "F" + std::to_string(key - SDLK_F1 + 1);
+    switch (key) {
+    case SDLK_SPACE: return "SPC";
+    case SDLK_LCTRL: case SDLK_RCTRL: return "CTL";
+    case SDLK_LALT: case SDLK_RALT: return "ALT";
+    case SDLK_LSHIFT: case SDLK_RSHIFT: return "SHF";
+    case SDLK_TAB: return "TAB";
+    case SDLK_RETURN: return "ENT";
+    case SDLK_ESCAPE: return "ESC";
+    case SDLK_BACKSPACE: return "BKS";
+    case SDLK_UP: return "UP";
+    case SDLK_DOWN: return "DN";
+    case SDLK_LEFT: return "LFT";
+    case SDLK_RIGHT: return "RGT";
+    default: break;
+    }
+    // anything else: the first letters of its name, as far as the font has them
+    std::string label;
+    for (const char* c = SDL_GetKeyName(SDL_Keycode(key)); *c && label.size() < 3; ++c)
+        if (std::isalnum(static_cast<unsigned char>(*c))) label += char(std::toupper(static_cast<unsigned char>(*c)));
+    return label.empty() ? "?" : label;
+}
+
+// the first key bound to a target in the context, 0 when none
+uint32_t FirstKey(const KeyBinding (&bindings)[kKeyBindingCount], PadInput target, bool driving) {
+    for (const auto& binding : bindings) {
+        if (binding.target != target || binding.context == (driving ? Context::OnFoot : Context::Driving)) continue;
+        for (uint32_t key : binding.keys)
+            if (key) return key;
+    }
+    return 0;
+}
+
+}  // namespace
+
+void PromptLabel(PadInput target, bool driving, char (&out)[8]) {
+    KeyBinding bindings[kKeyBindingCount];
+    KeyBindings(bindings);
+    std::string label;
+    if (target == PadInput::Start) {
+        label = "ESC";
+    } else if (target == PadInput::MoveUp) {
+        // single-character movement keys read as one word, like WASD; anything else as MOV
+        for (PadInput move : {PadInput::MoveUp, PadInput::MoveLeft, PadInput::MoveDown, PadInput::MoveRight}) {
+            const std::string key = ShortKeyLabel(FirstKey(bindings, move, driving));
+            label = key.size() == 1 && label != "MOV" ? label + key : "MOV";
+        }
+    } else {
+        const uint32_t key = FirstKey(bindings, target, driving);
+        label = key ? ShortKeyLabel(key) : "-";
+    }
+    std::snprintf(out, sizeof(out), "%.4s", label.c_str());
+}
+
+void SaveBindings(void* toml_table) {
+    auto& t = *static_cast<toml::table*>(toml_table);
+    KeyBinding keys[kKeyBindingCount];
+    PadBinding pad[kPadBindingCount];
+    KeyBindings(keys);
+    PadBindings(pad);
+    toml::table keyboard, controller;
+    for (int i = 0; i < kKeyBindingCount - 1; ++i) {
+        toml::array names;
+        for (uint32_t key : keys[i].keys)
+            if (key) names.push_back(KeyName(key));
+        keyboard.insert(kActionNames[i], std::move(names));
+    }
+    for (int i = 0; i < kPadBindingCount; ++i) controller.insert(kPadInputNames[i], PadSourceName(pad[i].source));
+    t.insert_or_assign("controls", toml::table{{"keyboard", std::move(keyboard)}, {"controller", std::move(controller)}});
+    // [controls] replaces the old letter keys
+    for (const char* old : {"reload_key", "heavy_attack_key", "use_key", "climb_key"}) t.erase(old);
+}
+
+namespace {
+
 void AddPad(SDL_JoystickID id) {
     for (SDL_Gamepad* pad : g_pads)
         if (pad && SDL_GetGamepadID(pad) == id) return;
@@ -388,23 +752,27 @@ void RemovePad(SDL_JoystickID id) {
     }
 }
 
-// once a millisecond at most, however many ports and threads read.
-// Linux owns the SDL event queue on the window thread (GamepadAdded/Removed), so only the
-// Windows host pumps it here; SDL_PumpEvents must not run on guest threads.
+// Linux consumes SDL events on the window thread. Windows uses a native message
+// loop and updates gamepads here at most once per millisecond, under g_lock.
 void UpdatePads() {
 #ifdef _WIN32
     static uint64_t last = 0;
     uint64_t now = SDL_GetTicks();
     if (!g_sdl || now == last) return;
     last = now;
-    SDL_PumpEvents();
-    SDL_Event e;
-    while (SDL_PeepEvents(&e, 1, SDL_GETEVENT, SDL_EVENT_GAMEPAD_ADDED, SDL_EVENT_GAMEPAD_REMOVED) == 1) {
-        if (e.type == SDL_EVENT_GAMEPAD_ADDED) AddPad(e.gdevice.which);
-        else if (e.type == SDL_EVENT_GAMEPAD_REMOVED) RemovePad(e.gdevice.which);
+    SDL_UpdateGamepads();  // safe from guest threads that poll for input
+    // State is read directly from the pads. Drain unused button, axis and other
+    // events as well, or they can fill SDL's queue and crowd out hot-plug notices.
+    SDL_Event events[32];
+    int count;
+    while ((count = SDL_PeepEvents(events, int(std::size(events)), SDL_GETEVENT,
+                                  SDL_EVENT_FIRST, SDL_EVENT_LAST)) > 0) {
+        for (int i = 0; i < count; ++i) {
+            const SDL_Event& event = events[i];
+            if (event.type == SDL_EVENT_GAMEPAD_ADDED) AddPad(event.gdevice.which);
+            else if (event.type == SDL_EVENT_GAMEPAD_REMOVED) RemovePad(event.gdevice.which);
+        }
     }
-#else
-    (void)0;
 #endif
 }
 
@@ -562,6 +930,11 @@ bool ConsumeMouseAim(float& dx, float& dy) {
     return true;
 }
 
+bool MouseMovedRecently() {
+    std::lock_guard lock(g_mouse_lock);
+    return !g_ui_active.load(std::memory_order_relaxed) && g_aim_at && NowMs() - g_aim_at < 100;
+}
+
 bool DirectAimRecent() {
     const uint64_t used = g_direct_used_at.load(std::memory_order_relaxed);
     return used && NowMs() - used < 5000;
@@ -596,20 +969,17 @@ Pad Poll(int port) {
         UpdatePads();
         if (SDL_Gamepad* pad = port >= 0 && port < 4 ? g_pads[port] : nullptr) {
             p.connected = true;
-            constexpr SDL_GamepadButton kButtons[] = {
-                SDL_GAMEPAD_BUTTON_DPAD_UP,   SDL_GAMEPAD_BUTTON_DPAD_DOWN,  SDL_GAMEPAD_BUTTON_DPAD_LEFT,
-                SDL_GAMEPAD_BUTTON_DPAD_RIGHT, SDL_GAMEPAD_BUTTON_START,     SDL_GAMEPAD_BUTTON_BACK,
-                SDL_GAMEPAD_BUTTON_LEFT_STICK, SDL_GAMEPAD_BUTTON_RIGHT_STICK};
-            for (int i = 0; i < 8; i++) p.buttons |= uint16_t(SDL_GetGamepadButton(pad, kButtons[i]) << i);
-            // A B X Y black white
-            constexpr SDL_GamepadButton kAnalog[] = {SDL_GAMEPAD_BUTTON_SOUTH, SDL_GAMEPAD_BUTTON_EAST,
-                                                     SDL_GAMEPAD_BUTTON_WEST,  SDL_GAMEPAD_BUTTON_NORTH,
-                                                     SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER};
-            for (int i = 0; i < 6; i++) p.analog[i] = SDL_GetGamepadButton(pad, kAnalog[i]) ? 0xFF : 0;
+            PadBinding bindings[kPadBindingCount];
+            PadBindings(bindings);
+            for (const auto& binding : bindings) {
+                // 0 to 32767 into 0 to 255
+                const uint8_t value =
+                    binding.source & kPadAxis
+                        ? uint8_t(std::max<int>(SDL_GetGamepadAxis(pad, SDL_GamepadAxis(binding.source & 0xFF)), 0) >> 7)
+                        : (SDL_GetGamepadButton(pad, SDL_GamepadButton(binding.source)) ? 255 : 0);
+                if (value) PressPad(p, binding.target, value);
+            }
             auto axis = [&](SDL_GamepadAxis a) { return int(SDL_GetGamepadAxis(pad, a)); };
-            // 0 to 32767 into 0 to 255
-            p.analog[6] = uint8_t(std::max(axis(SDL_GAMEPAD_AXIS_LEFT_TRIGGER), 0) >> 7);
-            p.analog[7] = uint8_t(std::max(axis(SDL_GAMEPAD_AXIS_RIGHT_TRIGGER), 0) >> 7);
             // SDL's sticks have y down
             // not plain negation: -32768 has no positive
             p.lx = int16_t(axis(SDL_GAMEPAD_AXIS_LEFTX));

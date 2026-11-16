@@ -24,6 +24,21 @@ bool DirectAimRecent() {
     return false;
 }
 
+bool MouseMovedRecently() { return false; }
+
+bool CanBindKey(uint32_t) { return false; }
+void LoadBindings(const void*) {}
+void SaveBindings(void*) {}
+uint32_t BindingGeneration() { return 1; }
+void KeyDisplayName(uint32_t, char (&out)[32]) { out[0] = 0; }
+void PadSourceDisplayName(int, char (&out)[32]) { out[0] = 0; }
+int HeldPadSource() { return -1; }
+bool PadRemapped() { return false; }
+void PromptLabel(PadInput, bool, char (&out)[8]) { out[0] = '-', out[1] = 0; }
+void KeyBindings(KeyBinding (&)[kKeyBindingCount]) {}
+void PadBindings(PadBinding (&)[kPadBindingCount]) {}
+void DefaultPadBindings(PadBinding (&)[kPadBindingCount]) {}
+
 bool KeyboardMouseActive() {
     return false;
 }

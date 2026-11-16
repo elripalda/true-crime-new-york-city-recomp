@@ -15,6 +15,45 @@ bool IsPromptAtlas(const TextureDesc& d) {
     return d.format == 0x1D && d.width == 128 && d.height == 448 && d.levels == 1 && !d.cube && d.depth == 1;
 }
 
+namespace {
+
+// Each pad input's glyph slot, in input::PadInput order (Up..RT).
+struct Slot { int x, y, w, h; };
+constexpr Slot kSlots[input::kPadBindingCount] = {
+    {1, 256, 17, 18}, {21, 256, 17, 18}, {41, 256, 17, 18}, {61, 256, 17, 18},  // D-pad
+    {0, 301, 27, 20}, {99, 278, 25, 20}, {53, 279, 26, 19}, {73, 233, 28, 19},  // Start Back LS RS
+    {1, 234, 15, 14}, {37, 234, 15, 14}, {55, 234, 15, 14}, {19, 234, 15, 14},  // A B X Y
+    {37, 279, 13, 15}, {1, 279, 14, 15}, {101, 256, 13, 18}, {19, 279, 13, 18}, // Black White LT RT
+};
+
+// A remapped controller: the slot for each pad input shows the glyph of the physical
+// button now bound to it (A and B swapped: the A slot draws B).
+void RemapControllerGlyphs(std::vector<uint8_t>& px, uint32_t pitch) {
+    if (!input::PadRemapped()) return;
+    input::PadBinding bindings[input::kPadBindingCount], defaults[input::kPadBindingCount];
+    input::PadBindings(bindings);
+    input::DefaultPadBindings(defaults);
+    const std::vector<uint8_t> original = px;
+    for (const auto& binding : bindings) {
+        const int target = int(binding.target);
+        int from = -1;  // the slot whose default source is this binding's source
+        for (const auto& d : defaults)
+            if (d.source == binding.source) from = int(d.target);
+        if (from < 0 || from == target || target >= input::kPadBindingCount) continue;
+        const Slot& src = kSlots[from];
+        const Slot& dst = kSlots[target];
+        for (int y = 0; y < dst.h; ++y)
+            std::fill_n(px.data() + (dst.y + y) * pitch + dst.x * 4, dst.w * 4, 0);
+        const int w = std::min(src.w, dst.w), h = std::min(src.h, dst.h);
+        const int sx = src.x + (src.w - w) / 2, sy = src.y + (src.h - h) / 2;
+        const int dx = dst.x + (dst.w - w) / 2, dy = dst.y + (dst.h - h) / 2;
+        for (int y = 0; y < h; ++y)
+            std::copy_n(original.data() + (sy + y) * pitch + sx * 4, w * 4, px.data() + (dy + y) * pitch + dx * 4);
+    }
+}
+
+} // namespace
+
 void ReplaceControllerGlyphs(std::vector<uint8_t>& px, uint32_t pitch, input::PromptStyle style) {
     auto pixel = [&](int x, int y) { return px.data() + y * pitch + x * 4; };
     // Match the four colored glyphs before editing a texture with this layout.
@@ -36,6 +75,9 @@ void ReplaceControllerGlyphs(std::vector<uint8_t>& px, uint32_t pitch, input::Pr
             {'O', {7, 5, 5, 5, 7}}, {'U', {5, 5, 5, 5, 7}}, {'V', {5, 5, 5, 5, 2}},
             {'W', {5, 5, 7, 7, 5}}, {'X', {5, 5, 2, 5, 5}}, {'Y', {5, 5, 2, 2, 2}},
             {'Z', {7, 1, 2, 4, 7}}, {'7', {7, 1, 2, 2, 2}}, {'9', {7, 5, 7, 1, 7}}, {'+', {0, 2, 7, 2, 0}},
+            {'0', {7, 5, 5, 5, 7}}, {'1', {2, 6, 2, 2, 7}}, {'2', {7, 1, 7, 4, 7}}, {'3', {7, 1, 3, 1, 7}},
+            {'4', {5, 5, 7, 1, 1}}, {'5', {7, 4, 7, 1, 7}}, {'6', {7, 4, 7, 5, 7}}, {'8', {7, 5, 7, 5, 7}},
+            {'?', {7, 1, 3, 0, 2}},
             {'-', {0, 0, 7, 0, 0}},
         };
         for (size_t k = 0; k < n; ++k) {
@@ -67,23 +109,21 @@ void ReplaceControllerGlyphs(std::vector<uint8_t>& px, uint32_t pitch, input::Pr
                 for (int x = 7; x < 20; ++x) std::fill_n(pixel(kStartX + x, kStartY + 4 + line * 5 + y), 4, 255);
     };
     if (style == input::PromptStyle::KeyboardMouse || style == input::PromptStyle::KeyboardDriving) {
-        // Face buttons follow input.cpp: on foot A Ctrl, B V, X Alt (or the heavy-attack key),
-        // Y Space; in a vehicle A is W (accelerate), B Space (handbrake), X S (brake), Y unbound.
+        // Each slot shows the first key bound to its pad input (input.cpp); a vehicle has its own layout.
         const bool driving = style == input::PromptStyle::KeyboardDriving;
-        Label heavy{55, 234, 15, 14, "ALT"};
-        if (char key = input::LetterKey(input::g_heavy_attack_key, 0)) heavy = {55, 234, 15, 14, {key}};
-        const Label keys[] = {
-            driving ? Label{1, 234, 15, 14, "W"} : Label{1, 234, 15, 14, "CTL"},
-            driving ? Label{19, 234, 15, 14, "-"} : Label{19, 234, 15, 14, "SPC"},
-            driving ? Label{37, 234, 15, 14, "SPC"} : Label{37, 234, 15, 14, "V"},
-            driving ? Label{55, 234, 15, 14, "S"} : heavy,
-            {1, 279, 14, 15, {input::LetterKey(input::g_use_key, 'E')}}, {37, 279, 13, 15, {input::LetterKey(input::g_reload_key, 'R')}},
-            {101, 256, 13, 18, "RMB"}, {19, 279, 13, 18, "LMB"},
-            {kBackX, kBackY, kBackW, kBackH, "Q"}, {kStartX, kStartY, kStartW, kStartH, "ESC"},
-            {53, 279, 26, 19, {input::kLeftStickClickKey}}, {73, 233, 28, 19, "SHF"},
-            // the left stick glyph: movement (steering in a vehicle)
-            {84, 301, 21, 20, "WASD"},
+        using enum input::PadInput;
+        constexpr struct { input::PadInput target; int x, y, w, h; } slots[] = {
+            {A, 1, 234, 15, 14}, {Y, 19, 234, 15, 14}, {B, 37, 234, 15, 14}, {X, 55, 234, 15, 14},
+            {White, 1, 279, 14, 15}, {Black, 37, 279, 13, 15}, {LT, 101, 256, 13, 18}, {RT, 19, 279, 13, 18},
+            {Back, kBackX, kBackY, kBackW, kBackH}, {Start, kStartX, kStartY, kStartW, kStartH},
+            {LS, 53, 279, 26, 19}, {RS, 73, 233, 28, 19},
+            {MoveUp, 84, 301, 21, 20},  // the left stick glyph: movement (steering in a vehicle)
         };
+        Label keys[std::size(slots)];
+        for (size_t i = 0; i < std::size(slots); ++i) {
+            keys[i] = {slots[i].x, slots[i].y, slots[i].w, slots[i].h, {}};
+            input::PromptLabel(slots[i].target, driving, keys[i].text);
+        }
         draw_labels(keys, std::size(keys));
         // The individual D-pad slots become keyboard arrows.
         for (int direction = 0; direction < 4; ++direction) {
@@ -202,6 +242,7 @@ void ReplaceControllerGlyphs(std::vector<uint8_t>& px, uint32_t pitch, input::Pr
     };
     const int suffix_offset = style == input::PromptStyle::Xbox ? 2 : 0;
     for (const auto& label : labels) {
+        if (style == input::PromptStyle::Original) break;
         for (int y = 0; y < label.h; ++y) {
             for (int x = 0; x < label.w; ++x) {
                 const int row = y - (label.h - 7) / 2;
@@ -215,6 +256,7 @@ void ReplaceControllerGlyphs(std::vector<uint8_t>& px, uint32_t pitch, input::Pr
             }
         }
     }
+    RemapControllerGlyphs(px, pitch);
 }
 
 } // namespace gpu
