@@ -293,8 +293,8 @@ bool CodeGen::EmitInteger(uint32_t va, const ZydisDecodedInstruction& in, const 
                            Read(ops[0], ea).c_str(), trap.c_str(), trap.c_str()));
             } else if (w == 16) {
                 if (sgn)
-                    emit(F("int32_t n = (int32_t)(((ctx.edx & 0xFFFFu) << 16) | (ctx.eax & 0xFFFFu)); int16_t d = (int16_t)%s; if (!d) %s "
-                           "int32_t q = n / d; if (q != (int16_t)q) %s ctx.eax = (ctx.eax & 0xFFFF0000u) | (uint16_t)q; ctx.edx = (ctx.edx & 0xFFFF0000u) | (uint16_t)(n %% d);",
+                    emit(F("int64_t n = (int32_t)(((ctx.edx & 0xFFFFu) << 16) | (ctx.eax & 0xFFFFu)); int16_t d = (int16_t)%s; if (!d) %s "
+                           "int64_t q = n / d; if (q != (int16_t)q) %s ctx.eax = (ctx.eax & 0xFFFF0000u) | (uint16_t)q; ctx.edx = (ctx.edx & 0xFFFF0000u) | (uint16_t)(n %% d);",
                            Read(ops[0], ea).c_str(), trap.c_str(), trap.c_str()));
                 else
                     emit(F("uint32_t n = ((ctx.edx & 0xFFFFu) << 16) | (ctx.eax & 0xFFFFu); uint16_t d = (uint16_t)%s; if (!d) %s "
