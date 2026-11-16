@@ -81,6 +81,7 @@ constexpr uint32_t TC_ADDR(uint32_t usa) {
         case 0x0021DC00u: return 0x0021E320u;
         case 0x0021E1A0u: return 0x0021E8C0u;
         case 0x0021EC70u: return 0x0021F390u;
+        case 0x0023F2D8u: return 0x0023F918u;
         case 0x00240D22u: return 0x00241362u;
         case 0x00240E62u: return 0x002414A2u;
         case 0x00240F74u: return 0x002415B4u;
@@ -177,6 +178,7 @@ constexpr uint32_t TC_ADDR(uint32_t usa) {
         case 0x00400000u: return 0x00400000u;
         case 0x00420468u: return 0x00420D38u;
         case 0x004C632Cu: return 0x004C6C2Cu;
+        case 0x004C6380u: return 0x004C6C80u;
         case 0x004D48A4u: return 0x004D51A4u;
         case 0x004D48A8u: return 0x004D51A8u;
         // added by hand 2026-11-15 (matched by instruction windows against generated/game-pal):

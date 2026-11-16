@@ -35,6 +35,9 @@ using namespace kernel;
 std::atomic<uint64_t>& XbeDrawCalls();  // game draw calls (diagnostic)
 using XbeDrawProbeFn = void (*)(X86Context &, uint32_t vertex_buffer, uint32_t count, uint32_t texture0);
 XbeDrawProbeFn &XbeDrawProbe();  // optional game-side probe on each draw (diagnostic)
+// optional game-side filter on D3DDevice_SetRenderState_Simple: returns the value to set (ctx.esp: the guest return)
+using XbeSimpleStateFilterFn = uint32_t (*)(X86Context &, uint32_t method, uint32_t value);
+XbeSimpleStateFilterFn &XbeSimpleStateFilter();
 
 namespace dispatch {
 bool InCode(uint32_t va);  // cpu/dispatch.cpp
@@ -947,6 +950,7 @@ HLE_STDCALL(D3DDevice_SetScreenSpaceOffset, 2) {
 HLE_FASTCALL(D3DDevice_SetRenderState_Simple, 0) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t method = a[0] & 0x1FFC, value = a[1];
+    if (const XbeSimpleStateFilterFn filter = ::XbeSimpleStateFilter()) value = filter(ctx, method, value);
     SetSimple(method, value);
     return 0;
 }
@@ -1967,4 +1971,9 @@ std::atomic<uint64_t>& XbeDrawCalls() {
 XbeDrawProbeFn& XbeDrawProbe() {
     static XbeDrawProbeFn probe = nullptr;
     return probe;
+}
+
+XbeSimpleStateFilterFn& XbeSimpleStateFilter() {
+    static XbeSimpleStateFilterFn filter = nullptr;
+    return filter;
 }
