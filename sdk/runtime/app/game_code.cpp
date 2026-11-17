@@ -162,10 +162,13 @@ bool Sha1File(const fs::path& path, std::string& out) {
     return true;
 }
 
-// Stamp format shared with the CMake build: host, XBE, DLL hashes.
+// Stamp format shared with the CMake build (StampGameCode.cmake): host, XBE, image config, DLL hashes. The
+// config is part of it because its [functions] entries change the generated code.
 bool StampFor(const Image& image, const std::vector<uint8_t>& xbe, std::string& stamp) {
     if (!Sha1File(ExeFolder() / (image.exe + L".exe"), stamp)) return false;
-    stamp += " " + Sha1(xbe);
+    std::string config;
+    if (image.config.empty() || !Sha1File(image.config, config)) return false;
+    stamp += " " + Sha1(xbe) + " " + config;
     return true;
 }
 

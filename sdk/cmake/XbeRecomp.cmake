@@ -175,6 +175,7 @@ function(add_xbe_image target xbe config partitions game_dir)
     set_property(TARGET ${target}_code APPEND PROPERTY LINK_DEPENDS "${stamp_script}" "$<TARGET_FILE:${target}>")
     add_custom_command(TARGET ${target}_code POST_BUILD
         COMMAND ${CMAKE_COMMAND} "-DHOST=$<TARGET_FILE:${target}>" "-DXBE_SHA1=${xbe_sha1}"
-                "-DDLL=$<TARGET_FILE:${target}_code>" -P "${stamp_script}"
+                "-DDLL=$<TARGET_FILE:${target}_code>"
+                "-DCONFIG_FILE=${CMAKE_CURRENT_SOURCE_DIR}/config/${config}" -P "${stamp_script}"
         VERBATIM)
 endfunction()
