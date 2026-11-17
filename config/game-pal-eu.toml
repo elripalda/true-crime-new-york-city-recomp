@@ -12,6 +12,9 @@ library = "TrueCrimeNYCPALEU.dll"  # <exe>.dll, which the executable delay loads
 
 # extra entry points
 [functions]
+# Reached only through an indirect call when the pause menu opens the map; analysis takes it for the
+# middle of the function before it, so it is listed here ("indirect call to 000C1EA0").
+0xC1EA0 = ""
 
 # functions the host replaces or calls by name, 0 where the image has none
 [symbols]
