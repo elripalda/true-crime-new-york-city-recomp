@@ -1,0 +1,155 @@
+{
+    "$schema": "https://recomplauncher.com/schema/recomplauncher.json",
+    "format": 1,
+    "name": "True Crime: New York City Recomp",
+    "game": {
+        "kind": "iso_or_folder",
+        "label": "Your own US NTSC Xbox copy of True Crime: New York City: its disc image (.iso), or the extracted files with default.xbe. Only the US NTSC release works.",
+        "check": {
+            "file": "default.xbe",
+            "xdvdfs": "default.xbe"
+        }
+    },
+    "start": {
+        "program": [
+            "TrueCrimeNYC.exe",
+            "TrueCrimeNYC"
+        ],
+        "args": [
+            "--game",
+            "{game}"
+        ]
+    },
+    "prepare": {
+        "program": [
+            "TrueCrimeNYC.exe"
+        ],
+        "args": [
+            "--prepare",
+            "--game",
+            "{game}"
+        ],
+        "label": "Compiling the game's code for this PC",
+        "timeout": 3600
+    },
+    "config": [
+        {
+            "id": "main",
+            "format": "toml",
+            "file": [
+                {
+                    "path": "{install}/settings.toml"
+                }
+            ]
+        }
+    ],
+    "folders": {
+        "logs": [
+            {
+                "path": "{install}/logs"
+            }
+        ]
+    },
+    "settings": [
+        {
+            "id": "prompt_style",
+            "label": "Button prompts",
+            "help": "Which button pictures the game shows. Automatic follows the controller in use. Set one if it guesses wrong, such as an Xbox pad through Steam Input on a Steam Deck.",
+            "choices": [
+                {
+                    "label": "Automatic",
+                    "set": {
+                        "prompt_style": "0"
+                    }
+                },
+                {
+                    "label": "Original Xbox",
+                    "set": {
+                        "prompt_style": "1"
+                    }
+                },
+                {
+                    "label": "Xbox",
+                    "set": {
+                        "prompt_style": "2"
+                    }
+                },
+                {
+                    "label": "PlayStation",
+                    "set": {
+                        "prompt_style": "3"
+                    }
+                },
+                {
+                    "label": "Steam Deck",
+                    "set": {
+                        "prompt_style": "4"
+                    }
+                }
+            ],
+            "defaults": {
+                "prompt_style": "0"
+            }
+        },
+        {
+            "id": "direct_mouse_aim",
+            "label": "Mouse camera",
+            "help": "On: the mouse turns the camera directly. Off: the mouse feeds the right stick instead.",
+            "choices": [
+                {
+                    "label": "Direct",
+                    "set": {
+                        "direct_mouse_aim": "true"
+                    }
+                },
+                {
+                    "label": "Right stick",
+                    "set": {
+                        "direct_mouse_aim": "false"
+                    }
+                }
+            ],
+            "defaults": {
+                "direct_mouse_aim": "true"
+            }
+        },
+        {
+            "id": "mouse_sensitivity",
+            "label": "Mouse sensitivity",
+            "help": "How fast the mouse turns the camera. 100 is the default.",
+            "slider": {
+                "key": "mouse_sensitivity_percent",
+                "min": 10,
+                "max": 400,
+                "step": 10,
+                "format": "%d"
+            }
+        },
+        {
+            "id": "mouse_vertical_sensitivity",
+            "label": "Vertical mouse sensitivity",
+            "help": "Vertical speed compared with horizontal. 100 is the default.",
+            "slider": {
+                "key": "mouse_vertical_sensitivity_percent",
+                "min": 10,
+                "max": 400,
+                "step": 10,
+                "format": "%d"
+            }
+        }
+    ],
+    "actions": [
+        {
+            "id": "logs",
+            "label": "Logs",
+            "help": "Log files from the game's runs, for bug reports.",
+            "open": "logs"
+        }
+    ],
+    "requires": [
+        "start",
+        "settings.toml",
+        "settings.choices",
+        "settings.slider"
+    ]
+}
