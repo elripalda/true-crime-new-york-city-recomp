@@ -84,8 +84,7 @@
   downloads, and makes an already-staged release visible when update checks are off. Files removed from a
   newer package are deleted; they are backed up first, so an interrupted or failed install restores them.
   Directories created by a failed install are removed.
-- Ambient occlusion works on D3D12: the reversed-depth prepass clears to the far value, and the AO depth
-  target no longer leaves the draw's GREATER test with nothing to pass.
+- D3D12 ambient occlusion uses the scene's depth clear value. This restores visible occlusion on both PAL disc builds.
 - Vulkan: MSAA scene attachments keep their contents across pass reopens, borrowed depth uses its depth view,
   and a multisampled target's feedback copy resolves into a separate image instead of reading its own resolve
   target.

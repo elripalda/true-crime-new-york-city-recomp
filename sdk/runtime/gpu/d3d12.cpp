@@ -2779,6 +2779,7 @@ bool D3D12Backend::DrawDepthCopy(Target& src, Target& dst, ID3D12PipelineState* 
     DrawFullScreen(pso, cb.gpu, slot);
     dst.drawn = true;
     dst.depth_resolved = false;  // the cached depth resolve shows the old surface
+    dst.depth_clear = src.depth_clear;
     bound_rt_ = bound_ds_ = nullptr;
     return true;
 }
@@ -6294,10 +6295,9 @@ void D3D12Backend::FlushDeferredScene() {
             Transition(ao_dist_.Get(), ao_dist_state_, D3D12_RESOURCE_STATE_RENDER_TARGET);
             // the prepass accumulates across a view's flushes; a scene clear starts it again
             if (std::exchange(ao_depth_clear_, false)) {
-                // Reversed depth: kDepthFar is 0, and the depth test retained from the
-                // draw is GREATER. Clearing to 1.0f left nothing to pass.
-                cl_->ClearDepthStencilView(dh, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, kDepthFar, 0, 0,
-                                           nullptr);
+                // Replay uses the scene's depth tests, so start from the same reversed clear value.
+                cl_->ClearDepthStencilView(dh, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+                                           defer_ds_->depth_clear, 0, 0, nullptr);
                 const float far_dist[4] = {kAoDistClear, 0, 0, 0};
                 cl_->ClearRenderTargetView(distv, far_dist, 0, nullptr);
             }
@@ -6378,7 +6378,7 @@ bool D3D12Backend::EnsureAoDepth(const Target& like) {
     td.SampleDesc.Count = samples;
     D3D12_CLEAR_VALUE cv{};
     cv.Format = kDepthFormat;
-    cv.DepthStencil.Depth = kDepthFar;
+    cv.DepthStencil.Depth = like.depth_clear;
     ao_depth_state_ = D3D12_RESOURCE_STATE_DEPTH_WRITE;
     if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, ao_depth_state_, &cv,
                                              IID_PPV_ARGS(&ao_depth_)))) {
@@ -6534,12 +6534,15 @@ void D3D12Backend::ClearTarget(Target& t, const State& s, const ClearArgs& c, st
         rs.push_back(ScaledRect(t, int(v.x), int(v.y), int(v.x + v.w), int(v.y + v.h)));
     }
     if (t.depth) {
-        if (c.flags & kClearZ)
+        const float reversed = 1 - std::clamp(c.z, 0.0f, 1.0f);
+        if (c.flags & kClearZ) {
             std::erase_if(scene_depth_, [&](const auto& entry) { return entry.second.target == &t; });
+            t.depth_clear = reversed;
+            if (t.gw == guest_w_ && t.gh == guest_h_) ao_depth_clear_ = true;
+        }
         Transition(t.res.Get(), t.state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
         D3D12_CLEAR_FLAGS cf = D3D12_CLEAR_FLAGS(((c.flags & kClearZ) ? D3D12_CLEAR_FLAG_DEPTH : 0) |
                                                  ((c.flags & kClearStencil) ? D3D12_CLEAR_FLAG_STENCIL : 0));
-        float reversed = 1 - std::clamp(c.z, 0.0f, 1.0f);
         cl_->ClearDepthStencilView(Cpu(dsv_heap_.Get(), t.view, dsv_inc_), cf, reversed, UINT8(c.stencil),
                                    UINT(rs.size()), rs.data());
     } else {
@@ -6616,8 +6619,6 @@ void D3D12Backend::Clear(const State& s, uint32_t count, const uint8_t* rects, u
         if (!bundle_) DeferredBarrier("clear touched a deferred target");
         else DeferredFallback("clear touched a deferred target");
     }
-    // a full-size depth clear starts a new scene view: the AO depth prepass starts empty again
-    if (ds && (flags & kClearZ) && ds->gw == guest_w_ && ds->gh == guest_h_) ao_depth_clear_ = true;
     if (scene_clear) {
         LOG_FIRST(4, "d3d12: deferred scene clear rt %08X ds %08X flags %X", rt ? rt->data : 0, ds ? ds->data : 0,
                   flags);

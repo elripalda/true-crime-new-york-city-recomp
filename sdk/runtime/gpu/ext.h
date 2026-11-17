@@ -50,6 +50,7 @@ struct Target {
     float range = 1;         // colour held divided by it until the extension resolves the target
     uint64_t tag = ~0ull;    // the extension's
     uint32_t guest_format = ~0u;  // guest surface format it was made for (~0: unknown)
+    float depth_clear = 0.0f;    // last host clear of this depth surface
 };
 
 // what the renderer lends an extension, on the render thread
