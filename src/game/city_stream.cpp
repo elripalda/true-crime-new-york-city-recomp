@@ -1,4 +1,5 @@
 #include "game_addresses.h"
+#include "core/dev_env.h"
 // City streaming probe (Phase 0 of docs/city-streaming-plan.md).
 //
 // Nothing here changes game behaviour. With XBE_TRACE_CITY=1 it logs, for the nine fixed city tile slots:
@@ -38,7 +39,7 @@ constexpr uint32_t kSlots = 0xE0, kSlotStride = 0x8B0, kSlotCount = 9;
 constexpr uint32_t kX = 0x04, kY = 0x08, kHandle = 0x0C, kSize = 0x28, kLoaded = 0x50;
 
 bool Trace() {
-    static const bool on = std::getenv("XBE_TRACE_CITY") != nullptr;
+    static const bool on = DevEnv("XBE_TRACE_CITY") != nullptr;
     return on;
 }
 
@@ -211,7 +212,7 @@ void DiagDuplicates(uint8_t *base, uint32_t city) {
 // so the overflowing neighbour can be identified.
 } // namespace
 void NodeGuard(uint8_t *base, const char *tag) {
-    static const bool enabled = std::getenv("XBE_CITY_NODEGUARD") != nullptr;
+    static const bool enabled = DevEnv("XBE_CITY_NODEGUARD") != nullptr;
     if (!enabled) return;
     // Static nodes registered by the 0x2730xx initialisers; guard their arg (+8) and callback (+0xC).
     static const uint32_t nodes[] = {TC_ADDR(0x2EA780), TC_ADDR(0x2EA794), TC_ADDR(0x2EA7B8), TC_ADDR(0x2EA7CC), TC_ADDR(0x2EA7E0), TC_ADDR(0x2EA7F4), TC_ADDR(0x2EA808),
@@ -271,7 +272,7 @@ void NodeGuard(uint8_t *base, const char *tag) {
 namespace {
 void DiagEffectLists(uint8_t *base, const char *tag, bool always) {
     NodeGuard(base, tag);
-    static const bool enabled = std::getenv("XBE_CITY_RING_LISTDIAG") != nullptr;
+    static const bool enabled = DevEnv("XBE_CITY_RING_LISTDIAG") != nullptr;
     if (!enabled) return;
     const auto now = std::chrono::steady_clock::now();
     static auto last = now;
@@ -385,11 +386,11 @@ int g_reserved_n = 0;
 
 void MaybeReserve() {
     static const uint32_t kb = [] {
-        const char *value = std::getenv("XBE_CITY_RESERVE_KB");
+        const char *value = DevEnv("XBE_CITY_RESERVE_KB");
         return value ? uint32_t(std::atoi(value)) : 0u;
     }();
     static const uint32_t blocks = [] {
-        const char *value = std::getenv("XBE_CITY_RESERVE_BLOCKS");
+        const char *value = DevEnv("XBE_CITY_RESERVE_BLOCKS");
         return value ? std::max(1u, uint32_t(std::atoi(value))) : 1u;
     }();
     static bool done = false;
@@ -550,7 +551,7 @@ uint32_t g_game_cell_ctx = 0;
 // XBE_CITY_RING_PORTALS: hand the loaded ring slots to the portal pass (grid_patch: past the game's nine slots its
 // loop continues with xbe_extra_slots, each a slot + 0x1C), so ring tiles are walked and drawn in full detail.
 void FillRingPortalSlots() {
-    static const bool on = std::getenv("XBE_CITY_RING_PORTALS") != nullptr;
+    static const bool on = DevEnv("XBE_CITY_RING_PORTALS") != nullptr;
     if (!on) return;
     static uint32_t *count = nullptr, *slots = nullptr;
     static bool looked = false;
@@ -596,7 +597,7 @@ void FillRingPortalSlots() {
 }
 
 void LogPortalSlots() {
-    static const bool on = std::getenv("XBE_CITY_PORTAL_OWNERS") != nullptr;
+    static const bool on = DevEnv("XBE_CITY_PORTAL_OWNERS") != nullptr;
     if (!on) return;
     static auto last = std::chrono::steady_clock::now();
     if (std::chrono::steady_clock::now() - last < std::chrono::seconds(5)) return;
@@ -611,7 +612,7 @@ void ApplyDrawRadius() {
     static bool done = false;
     if (done) return;
     done = true;
-    const char *e = std::getenv("XBE_DRAW_RADIUS");
+    const char *e = DevEnv("XBE_DRAW_RADIUS");
     if (!e) return;
     auto *scale = game::GuestExport<float>("xbe_draw_radius_scale");
     if (!scale) {
@@ -636,9 +637,9 @@ void ApplyCityInstanceDistances() {
 
     // Keep the old environment-driven configuration for diagnostic runs.
     static const CityInstanceDistances override = [] {
-        if (!std::getenv("XBE_CITY_RING_INSTANCES")) return CityInstanceDistances{0.0f, 0.0f};
+        if (!DevEnv("XBE_CITY_RING_INSTANCES")) return CityInstanceDistances{0.0f, 0.0f};
         auto read = [](const char *name, float fallback) {
-            const char *value = std::getenv(name);
+            const char *value = DevEnv(name);
             if (!value) return fallback;
             char *end;
             const float requested = std::strtof(value, &end);
@@ -719,7 +720,7 @@ void RelocateLightTable() {
 extern int g_ring_draw_idx;
 X86_EXTERN_FUNC(__imp__sub_00142CE0);
 X86_FUNC(sub_00142CE0) {
-    static const bool diag = std::getenv("XBE_CITY_DIAG") != nullptr;
+    static const bool diag = DevEnv("XBE_CITY_DIAG") != nullptr;
     const uint32_t city = X86_MEM32(kCityPtr);
     if (city && game::city_grid::Ring()) {
         if (!game::city_grid::Ready()) game::city_grid::Init(base, city + 0xD0);
@@ -733,7 +734,7 @@ X86_FUNC(sub_00142CE0) {
     LogPortalSlots();
     FillRingPortalSlots();
     { void InstallTileDrawProbe(); InstallTileDrawProbe(); }
-    static const bool drawprobe = std::getenv("XBE_CITY_DRAWPROBE") != nullptr;
+    static const bool drawprobe = DevEnv("XBE_CITY_DRAWPROBE") != nullptr;
     if (drawprobe && city && game::city_grid::Ready()) {
         // Scene list at city + 0x6B48 (walked by 0x144250 -> 0x13F400): who owns its nodes?
         static auto last = std::chrono::steady_clock::now();
@@ -779,14 +780,14 @@ X86_FUNC(sub_00142CE0) {
         }
     }
     NodeGuard(base, "gamedraw");
-    static const bool alternate = std::getenv("XBE_CITY_RING_ALTERNATE") != nullptr;  // A/B captures
+    static const bool alternate = DevEnv("XBE_CITY_RING_ALTERNATE") != nullptr;  // A/B captures
     static uint32_t passes = 0;
     const bool skip_alt = alternate && (++passes & 1u);
     if (alternate && (passes % 600u) < 2u) LOGR("ring alternate: pass %u ring %s", passes, skip_alt ? "off" : "on");
     // The ring normally draws inside the distant pass (0x13F1B0 hook below), with the game's own render states.
     // XBE_CITY_RING_DRAW_LATE=1 keeps the old draw here, after the pass (states already reset: see-through).
-    static const bool late = std::getenv("XBE_CITY_RING_DRAW_LATE") != nullptr;
-    if (late && city && game::city_grid::Ring() && !skip_alt && std::getenv("XBE_CITY_RING_NODRAW") == nullptr)
+    static const bool late = DevEnv("XBE_CITY_RING_DRAW_LATE") != nullptr;
+    if (late && city && game::city_grid::Ring() && !skip_alt && DevEnv("XBE_CITY_RING_NODRAW") == nullptr)
         if (g_game_cell_ctx) game::city_grid::DrawRing(base, ctx, g_game_cell_ctx);
     if (city && game::city_grid::Ring()) DiagEffectLists(base, "drawdone", false);
 }
@@ -899,7 +900,7 @@ TRACE_HOOK(00142C90, 29)
 // Phase 3 probe: the per-slot state machine's argument order.
 X86_EXTERN_FUNC(__imp__sub_00137600);
 X86_FUNC(sub_00137600) {
-    static const bool freeze_game = std::getenv("XBE_CITY_FREEZE_GAME") != nullptr;
+    static const bool freeze_game = DevEnv("XBE_CITY_FREEZE_GAME") != nullptr;
     static const auto freeze_start = std::chrono::steady_clock::now();
     const uint32_t object = ctx.ecx;
     if (freeze_game && std::chrono::steady_clock::now() - freeze_start > std::chrono::seconds(5)) {
@@ -917,7 +918,7 @@ X86_FUNC(sub_00137600) {
     }
     // One owner per tile: when a game cell changes, drop any ring cell for the same tile before the game
     // unloads or reuses the object. XBE_CITY_RING_NOUNLOAD disables it for debugging.
-    static const bool ring_unload = std::getenv("XBE_CITY_RING_NOUNLOAD") == nullptr;
+    static const bool ring_unload = DevEnv("XBE_CITY_RING_NOUNLOAD") == nullptr;
     if (ring_unload && !freeze_game) {
         const uint32_t city = X86_MEM32(kCityPtr);
         if (city) {
@@ -931,7 +932,7 @@ X86_FUNC(sub_00137600) {
             }
         }
     }
-    static const bool diag = std::getenv("XBE_CITY_DIAG") != nullptr;
+    static const bool diag = DevEnv("XBE_CITY_DIAG") != nullptr;
     if (diag) {
         const uint32_t city = X86_MEM32(kCityPtr);
         if (city)
@@ -973,7 +974,7 @@ int g_ring_draw_idx = -1;
 X86_EXTERN_FUNC(__imp__sub_0013EFB0);
 X86_FUNC(sub_0013EFB0) {
     static int logged = 0;
-    static const bool node_guard = std::getenv("XBE_CITY_NODEGUARD") != nullptr;
+    static const bool node_guard = DevEnv("XBE_CITY_NODEGUARD") != nullptr;
     if (node_guard && g_ring_draw_idx >= 0 && logged < 40) {
         ++logged;
         LOGR("effinsert ring %d node %08X linked %08X cb %08X key %08X ret %08X", g_ring_draw_idx, ctx.ecx,
@@ -1046,7 +1047,7 @@ std::map<uint32_t, Rec> g_blocks;
 std::map<uint32_t, std::array<uint32_t, 5>> *g_released = nullptr;
 std::mutex g_lock;
 bool On() {
-    static const bool on = std::getenv("XBE_TRACE_HEAP") != nullptr;
+    static const bool on = DevEnv("XBE_TRACE_HEAP") != nullptr;
     return on;
 }
 void Chain(uint8_t *base, const X86Context &ctx, uint32_t out[5]) {
@@ -1069,7 +1070,7 @@ void Log(const char *what, uint32_t at, const Rec &r) {
 
 X86_EXTERN_FUNC(__imp__sub_00269405);
 X86_FUNC(sub_00269405) {
-    static const bool release_trace = std::getenv("XBE_TRACE_RELEASE") != nullptr;
+    static const bool release_trace = DevEnv("XBE_TRACE_RELEASE") != nullptr;
     if (!heaptrace::On() && !release_trace) return __imp__sub_00269405(ctx, base);
     heaptrace::Rec r;
     r.size = X86_MEM32(ctx.esp + 4);
@@ -1101,7 +1102,7 @@ X86_FUNC(sub_002688F9) {
 
 X86_EXTERN_FUNC(__imp__sub_0021FC00);
 X86_FUNC(sub_0021FC00) {
-    static const bool release_trace = std::getenv("XBE_TRACE_RELEASE") != nullptr;
+    static const bool release_trace = DevEnv("XBE_TRACE_RELEASE") != nullptr;
     if (release_trace) {
         // Release twice without a new allocation at that address in between = double release; log both.
         static std::map<uint32_t, std::array<uint32_t, 5>> released;
@@ -1145,7 +1146,7 @@ X86_FUNC(sub_0021FC00) {
 // count calls on game slots (city + 0xE0..) and on store slots (allocated top-down, >= 0x70000000).
 X86_EXTERN_FUNC(__imp__sub_0013D100);
 X86_FUNC(sub_0013D100) {
-    static const bool on = std::getenv("XBE_CITY_SLOTDRAW_TRACE") != nullptr;
+    static const bool on = DevEnv("XBE_CITY_SLOTDRAW_TRACE") != nullptr;
     if (on) {
         static uint32_t game_calls = 0, store_calls = 0;
         static auto last = std::chrono::steady_clock::now();
@@ -1286,7 +1287,7 @@ void QuadDrawProbe(X86Context &ctx, uint32_t, uint32_t count, uint32_t tex0) {
 }
 } // namespace
 void InstallTileDrawProbe() {
-    static const char* const probe = std::getenv("XBE_CITY_DRAWPROBE");
+    static const char* const probe = DevEnv("XBE_CITY_DRAWPROBE");
     if (!probe || ::XbeDrawProbe()) return;
     ::XbeDrawProbe() = std::strcmp(probe, "quads") == 0 ? QuadDrawProbe : TileDrawProbe;
 }
@@ -1307,7 +1308,7 @@ X86_FUNC(sub_00148D10) {
     const uint32_t self = ctx.ecx;
     if (game_slot_walk) ApplyCityInstanceDistances();
     __imp__sub_00148D10(ctx, base);
-    static const bool inst_ctx = std::getenv("XBE_CITY_INSTCTX") != nullptr;
+    static const bool inst_ctx = DevEnv("XBE_CITY_INSTCTX") != nullptr;
     if (inst_ctx) {
         static auto t = std::chrono::steady_clock::now();
         static uint32_t seen[8] = {}, nseen = 0;
@@ -1338,10 +1339,10 @@ X86_FUNC(sub_00148D10) {
     int inner_slots = 0, outer_slots = 0;
     // 0x148D10 pops its five arguments, so esp is the caller's frame at 0x14A73B again.
     const uint32_t frame = ctx.esp;
-    static const bool dyn_records = std::getenv("XBE_CITY_RING_NO_DYNAMIC") == nullptr;
+    static const bool dyn_records = DevEnv("XBE_CITY_RING_NO_DYNAMIC") == nullptr;
     uint32_t dyn_total = 0;
     // XBE_TRACE_RING: periodic ring instance logs (every 5 s while the ring runs)
-    static const bool ring_trace = std::getenv("XBE_TRACE_RING") != nullptr;
+    static const bool ring_trace = DevEnv("XBE_TRACE_RING") != nullptr;
     if (ring_trace) {
         static auto t = std::chrono::steady_clock::now();
         if (std::chrono::steady_clock::now() - t > std::chrono::seconds(5)) {
@@ -1411,7 +1412,7 @@ X86_FUNC(sub_00148D10) {
 #endif
         X86_MEM32(self + 0xA50) = saved_slot;
         ++(inner_slot ? inner_slots : outer_slots);
-        static const int max_slots = [] { const char *e = std::getenv("XBE_CITY_RING_INSTANCE_SLOTS"); return e ? std::atoi(e) : 72; }();
+        static const int max_slots = [] { const char *e = DevEnv("XBE_CITY_RING_INSTANCE_SLOTS"); return e ? std::atoi(e) : 72; }();
         if (inner_slots + outer_slots >= max_slots) break;
     }
     *g_ring_instance_cutoff = saved_cutoff;
@@ -1441,13 +1442,13 @@ X86_FUNC(sub_00148D10) {
 // 0x13F090 and right after the game's nine distant cells: the ring's cells then get exactly the same render
 // states (depth, blend, fog) as the game's own. XBE_CITY_RING_DRAW_LATE=1 restores the old draw after the pass.
 void DrawRingInDistantPass(uint8_t *base, X86Context &ctx) {
-    static const bool late = std::getenv("XBE_CITY_RING_DRAW_LATE") != nullptr;
-    static const bool nodraw = std::getenv("XBE_CITY_RING_NODRAW") != nullptr;
+    static const bool late = DevEnv("XBE_CITY_RING_DRAW_LATE") != nullptr;
+    static const bool nodraw = DevEnv("XBE_CITY_RING_NODRAW") != nullptr;
     const uint32_t city = X86_MEM32(kCityPtr);
     if (late || nodraw || !game::city_grid::Ring() || !g_game_cell_ctx || !city) return;
     // While one of the game's own nine tiles is still loading, its gap would show the ring's far tiles in front
     // of where nearer buildings belong; hold the ring back until the game's tiles settle (state +0x24 idle).
-    static const bool always = std::getenv("XBE_CITY_RING_DRAW_ALWAYS") != nullptr;
+    static const bool always = DevEnv("XBE_CITY_RING_DRAW_ALWAYS") != nullptr;
     for (uint32_t i = 0; !always && i < 9; ++i)
         if (X86_MEM32(city + 0xE0 + i * 0x8B0 + 0x24) || X86_MEM32(city + 0x4FA4 + i * 0x9C + 0x24)) return;
     const uint32_t eax = ctx.eax, ecx = ctx.ecx, edx = ctx.edx;
@@ -1463,7 +1464,7 @@ void DrawRingInDistantPass(uint8_t *base, X86Context &ctx) {
 X86_EXTERN_FUNC(__imp__sub_0013E7F0);
 X86_FUNC(sub_0013E7F0) {
     if (Trace()) TraceHit(17, ctx, base);
-    static const bool on = std::getenv("XBE_CITY_PORTALTRACE") != nullptr;
+    static const bool on = DevEnv("XBE_CITY_PORTALTRACE") != nullptr;
     if (on) {
         const uint32_t self = ctx.ecx, city = X86_MEM32(kCityPtr);
         static uint32_t seen[16] = {}, n = 0;
@@ -1505,7 +1506,7 @@ X86_EXTERN_FUNC(__imp__sub_00136DB0);
 X86_FUNC(sub_00136DB0) {
     const uint32_t obj = ctx.ecx, ret = X86_MEM32(ctx.esp);
     __imp__sub_00136DB0(ctx, base);
-    static const bool portal_trace = std::getenv("XBE_CITY_PORTAL_OWNERS") != nullptr;
+    static const bool portal_trace = DevEnv("XBE_CITY_PORTAL_OWNERS") != nullptr;
     if (portal_trace && ret >= 0x13E7F0u && ret < 0x13EF50u && game::city_grid::Ready()) {
         // Which tiles does the portal pass visit? Classify the object by the .g block it lies in.
         static uint32_t game_hits = 0, ring_hits = 0, other = 0;
@@ -1565,7 +1566,7 @@ void CountRingWalk() { ++g_rws.walks; }
 #if !TCNYC_PAL && TCNYC_DEV_TOOLS  // diagnostic only, USA addresses
 X86_EXTERN_FUNC(__imp__sub_001387F0);
 X86_FUNC(sub_001387F0) {
-    static const bool on = [] { const char *v = std::getenv("XBE_CITY_SIGNWATCH"); return v && std::strcmp(v, "1") == 0; }();
+    static const bool on = [] { const char *v = DevEnv("XBE_CITY_SIGNWATCH"); return v && std::strcmp(v, "1") == 0; }();
     static bool armed = false;
     if (on && !armed && !kernel::GuestWatchActive()) {
         const uint32_t self = ctx.ecx;
@@ -1581,7 +1582,7 @@ X86_FUNC(sub_001387F0) {
             break;
         }
     }
-    static const bool list_watch = [] { const char *v = std::getenv("XBE_CITY_SIGNWATCH");
+    static const bool list_watch = [] { const char *v = DevEnv("XBE_CITY_SIGNWATCH");
                                         return v && std::strcmp(v, "list") == 0; }();
     if (list_watch && !kernel::GuestWatchActive()) {
         // Live-object list [0x37F634]: node +0 next, +8 object. Watch the sentinel's next pointer so each
@@ -1592,7 +1593,7 @@ X86_FUNC(sub_001387F0) {
             kernel::InstallGuestWatch(head, 4);
         }
     }
-    static const bool count = std::getenv("XBE_CITY_SIGNCOUNT") != nullptr;
+    static const bool count = DevEnv("XBE_CITY_SIGNCOUNT") != nullptr;
     if (count) {
         // Visible instances by owning tile: game 3x3, inner ring (5x5 band), outer ring; and how many carry an
         // attached object (the 0x21E1A0 draw: façade signs). The instance lies in its slot's .g block.
@@ -1619,9 +1620,9 @@ X86_FUNC(sub_001387F0) {
                     cls = game::city_grid::InInnerDetailZone(base, slot) ? 1 : 2;
             }
             if (cls < 0) continue;
-            static const bool ring_watch = [] { const char *v = std::getenv("XBE_CITY_SIGNWATCH");
+            static const bool ring_watch = [] { const char *v = DevEnv("XBE_CITY_SIGNWATCH");
                                                  return v && std::strcmp(v, "ring") == 0; }();
-            static const bool game_watch = [] { const char *v = std::getenv("XBE_CITY_SIGNWATCH");
+            static const bool game_watch = [] { const char *v = DevEnv("XBE_CITY_SIGNWATCH");
                                                  return v && std::strcmp(v, "game") == 0; }();
             if (game_watch && cls == 0 && !X86_MEM32(inst) && X86_MEM32(inst + 4) && !kernel::GuestWatchActive()) {
                 LOGR("signwatch: game-tile inst %08X has no object ([inst+4] %08X); watching", inst, X86_MEM32(inst + 4));
@@ -1672,7 +1673,7 @@ void SignPassCensus(uint8_t *base) {
 #if TCNYC_PAL
     (void)base;  // diagnostic only, USA addresses
 #else
-    static const bool on = std::getenv("XBE_CITY_SIGNCOUNT") != nullptr;
+    static const bool on = DevEnv("XBE_CITY_SIGNCOUNT") != nullptr;
     const uint32_t city = X86_MEM32(kCityPtr);
     if (on && city) {
         static uint32_t vis[4], ovl[4], pass[4], frames;

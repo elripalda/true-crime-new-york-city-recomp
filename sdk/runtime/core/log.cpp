@@ -1,4 +1,5 @@
 #include "core/log.h"
+#include "core/dev_env.h"
 
 #include <algorithm>
 #include <atomic>
@@ -85,7 +86,7 @@ const std::string& Path() { return g_path; }
 void EnterCrashMode() { g_crash_mode.store(true, std::memory_order_relaxed); }
 
 void Write(Level lv, const char* fmt, ...) {
-    static const bool env_verbose = std::getenv("XBE_VERBOSE") != nullptr;  // release: XBE_VERBOSE keeps every level
+    static const bool env_verbose = DevEnv("XBE_VERBOSE") != nullptr;  // release: XBE_VERBOSE keeps every level
     if (!kVerbose && !env_verbose && lv < Level::Error) return;
     char msg[4096];
     va_list ap;

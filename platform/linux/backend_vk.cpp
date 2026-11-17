@@ -11,6 +11,7 @@
 //  - points/lines use native topologies (no console pixel geometry shader)
 //  - occlusion queries stay pending, as the headless backend leaves them
 #include <algorithm>
+#include "core/dev_env.h"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -218,7 +219,7 @@ int FindBase(dl_phdr_info* info, size_t, void*) {
 // on the drawing thread, once
 void Start() {
     static bool started = false;
-    if (started || !std::getenv("TCNYC_SAMPLE")) return;
+    if (started || !DevEnv("TCNYC_SAMPLE")) return;
     started = true;
     dl_iterate_phdr(FindBase, nullptr);
     pthread_attr_t attr;
@@ -2284,10 +2285,10 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
     aspect_ = app::AspectRatio();
     perf_ = std::getenv("TCNYC_PERF") != nullptr;
     // testing only: no occlusion set can be bound, to exercise the non-AO receiver fallback
-    ao_fail_test_ = std::getenv("TCNYC_AO_FAIL_TEST") != nullptr;
+    ao_fail_test_ = DevEnv("TCNYC_AO_FAIL_TEST") != nullptr;
     trace_ = std::getenv("TCNYC_TRACE") != nullptr;
     ao_mode_ = app::Snapshot().ao;
-    if (const char* e = std::getenv("TCNYC_TRACE_PRESENT")) trace_present_ = std::atoi(e) != 0;
+    if (const char* e = DevEnv("TCNYC_TRACE_PRESENT")) trace_present_ = std::atoi(e) != 0;
     if (const char* e = std::getenv("TCNYC_DUMP_TEX")) {
         const char* p = e;
         while (*p) {
@@ -2300,7 +2301,7 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
         }
     }
     dump_targets_ = std::getenv("TCNYC_DUMP_TARGETS") != nullptr;
-    if (std::getenv("TCNYC_DRAWLOG")) {
+    if (DevEnv("TCNYC_DRAWLOG")) {
         std::error_code ec;
         std::filesystem::create_directories(app::ExeDir() / "logs", ec);
         draw_log_ = std::fopen((app::ExeDir() / "logs/draws_vk.txt").string().c_str(), "w");
@@ -2823,7 +2824,7 @@ bool VulkanBackend::CreateDevice() {
         VkPhysicalDeviceProperties properties{};
         vkGetPhysicalDeviceProperties(physical_, &properties);
         const uint32_t api = std::min(instance_version_, properties.apiVersion);
-        const char* baseline = std::getenv("TCNYC_FSR_BASELINE");
+        const char* baseline = DevEnv("TCNYC_FSR_BASELINE");
         if (api >= VK_API_VERSION_1_2 && (!baseline || std::atoi(baseline) == 0)) {
             const bool can_query_subgroup = api >= VK_API_VERSION_1_3 || has_subgroup_control;
             VkPhysicalDeviceFeatures2 features2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
@@ -2942,7 +2943,7 @@ bool VulkanBackend::CreateDevice() {
 // exercise the retry in Present
 bool VulkanBackend::SwapchainFailTest() {
     static uint32_t left = [] {
-        const char* v = std::getenv("TCNYC_SWAPCHAIN_FAIL_TEST");
+        const char* v = DevEnv("TCNYC_SWAPCHAIN_FAIL_TEST");
         return v ? uint32_t(std::strtoul(v, nullptr, 10)) : 0u;
     }();
     if (!left || !extent_.width) return false;  // never the first creation
@@ -4004,7 +4005,7 @@ void VulkanBackend::Fail(const char* what, VkResult r) {
 void VulkanBackend::EndRecord(bool wait, std::source_location where) {
     if (!recording_) return;
     {
-        static const bool split_on = std::getenv("TCNYC_PERF_SPLITS") != nullptr;
+        static const bool split_on = DevEnv("TCNYC_PERF_SPLITS") != nullptr;
         if (split_on) submit_where_["line " + std::to_string(where.line())]++;
     }
     if (failed_) {
@@ -6693,7 +6694,7 @@ void VulkanBackend::DestroyTargetImages(Target& t) {
 // TCNYC_TARGET_FAIL_TEST=N fails every Nth target image creation, to exercise the cleanup paths
 bool VulkanBackend::TargetAllocFailTest() {
     static const uint32_t every = [] {
-        const char* v = std::getenv("TCNYC_TARGET_FAIL_TEST");
+        const char* v = DevEnv("TCNYC_TARGET_FAIL_TEST");
         return v ? uint32_t(std::strtoul(v, nullptr, 10)) : 0u;
     }();
     if (!every) return false;
@@ -7330,7 +7331,7 @@ Tex* VulkanBackend::EnsureTexture(const State& s, int stage, bool* is_target) {
         t->frame = frames_ + 1;
         const bool palette_changed = t->palette != palette_hash;
         t->palette = palette_hash;
-        static const bool split_on = std::getenv("TCNYC_PERF_SPLITS") != nullptr;
+        static const bool split_on = DevEnv("TCNYC_PERF_SPLITS") != nullptr;
         SplitScope check(split_on, &splits_ms_, "  (in textures) change check");
         // The lock epoch is checked every frame. The bytes are hashed every frame while the texture has changed in
         // the last second, else every 4th frame (spread over textures by address): hashing every texture up to 64 KB
@@ -8282,7 +8283,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     }
     ScopeTimer timer(perf_, &perf_draw_ms_);
     LapTimer laps(perf_, &perf_assemble_ms_);
-    static const bool split_on = std::getenv("TCNYC_PERF_SPLITS") != nullptr;
+    static const bool split_on = DevEnv("TCNYC_PERF_SPLITS") != nullptr;
     Splits splits(split_on, &splits_ms_);
     if (split_on) g_assemble_splits = &splits_ms_;
     Assembled& a = scratch_;
@@ -8406,7 +8407,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     // same draw runs its program again on that draw's constants and writes its uv motion beside the colour. The
     // three road programs rebuild their strips every frame, so they reuse the previous frame's projection rows.
     const VertexConstants* prev_consts = nullptr;
-    static const bool trace_motion = std::getenv("TCNYC_TRACE_MOTION") != nullptr;
+    static const bool trace_motion = DevEnv("TCNYC_TRACE_MOTION") != nullptr;
     {
         const bool blend_on = SimpleState(s, kMBlendEnable) != 0;
         const uint32_t bsrc = SimpleState(s, kMSrcBlend), bdst = SimpleState(s, kMDestBlend);
@@ -8612,7 +8613,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     {
         static const std::vector<std::string> skip = [] {
             std::vector<std::string> v;
-            if (const char* e = std::getenv("TCNYC_SKIP_PS")) {
+            if (const char* e = DevEnv("TCNYC_SKIP_PS")) {
                 std::string t(e);
                 for (size_t a = 0; a <= t.size();) {
                     size_t b = t.find(',', a);
@@ -10493,7 +10494,7 @@ VkImageView VulkanBackend::ApplyTaa(Target& ft, VkImageView color) {
                 for (int k = 0; k < 4; k++) sum += inv[r * 4 + k] * taa_.camera.view[k * 4 + c];
                 m[r * 4 + c] = sum;
             }
-    static const bool trace = std::getenv("TCNYC_TRACE_TAA") != nullptr;
+    static const bool trace = DevEnv("TCNYC_TRACE_TAA") != nullptr;
     if (trace && (frames_ % 30 == 0 || (reset && taa_.valid)))
         LOGR("taa: frame %llu serial %llu reset %d xs %.4f ys %.4f planes %.3f %.1f target %ux%u jitter %.2f %.2f "
              "world %u", (unsigned long long)frames_, (unsigned long long)cam.serial, reset ? 1 : 0, cam.xs, cam.ys,
@@ -10501,7 +10502,7 @@ VkImageView VulkanBackend::ApplyTaa(Target& ft, VkImageView color) {
     const bool motion = motion_.view && motion_rt_ == &ft && motion_.cleared == frames_ &&
                         motion_.w == ft.w && motion_.h == ft.h;
     static const int view_mode = [] {
-        const char* e = std::getenv("TCNYC_TAA_VIEW");
+        const char* e = DevEnv("TCNYC_TAA_VIEW");
         return e ? std::atoi(e) : 0;
     }();
     float p[32] = {m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13], m[14],
@@ -10568,7 +10569,7 @@ void VulkanBackend::Present(const Surface& front) {
     // The scene is submitted without waiting: the CPU records the present pass while the GPU runs it.
     // Its upload ring, descriptor sets and draw batches are reused only after the present fence below,
     // which also covers the scene (a fence signal waits for all earlier submissions on the queue).
-    static const bool sync_present = std::getenv("TCNYC_VK_SYNC_PRESENT") != nullptr;
+    static const bool sync_present = DevEnv("TCNYC_VK_SYNC_PRESENT") != nullptr;
     EndRecord(sync_present);
     // every path must clear the per-frame rings, even when the front buffer cannot be read
     struct FrameEnd {
@@ -10632,7 +10633,7 @@ void VulkanBackend::Present(const Surface& front) {
         return e ? std::atol(e) : 0;
     }();
     static const long trace_every = [] {
-        const char* e = std::getenv("TCNYC_TRACE_EVERY");
+        const char* e = DevEnv("TCNYC_TRACE_EVERY");
         return e ? std::atol(e) : 0;
     }();
     if (trace_ && trace_at > 0 && int64_t(frames_) + 1 == trace_at) gpu::g_capture.store(true);
@@ -10885,7 +10886,7 @@ void VulkanBackend::Present(const Surface& front) {
     VkImageView taa_view = VK_NULL_HANDLE;
     if (taa_on_ && direct && ft && !ft->depth && ft->w && ft->h && ft->scene_frame == frames_ + 1 &&
         front.picture == gpu::Picture::Unknown) {
-        static const bool profile = std::getenv("TCNYC_PROFILE_FSR3") != nullptr;
+        static const bool profile = DevEnv("TCNYC_PROFILE_FSR3") != nullptr;
         if (profile && !profile_.pool) {
             VkQueryPoolCreateInfo q{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
             q.queryType = VK_QUERY_TYPE_TIMESTAMP;

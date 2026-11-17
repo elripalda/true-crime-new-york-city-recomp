@@ -1,4 +1,5 @@
 #include "game_addresses.h"
+#include "core/dev_env.h"
 // 60 FPS main-loop timing and opt-in deterministic replay for default.xbe.
 //
 // 0x2914D2: DirectSoundGetSampleTime reads the APU's free-running 48 kHz
@@ -74,7 +75,7 @@ namespace timing {
 // for controlled replay experiments, but ordinary input recording must not turn
 // them on during normal gameplay.
 bool Enabled() {
-    static const bool enabled = std::getenv("XBE_DETERMINISTIC_REPLAY") != nullptr;
+    static const bool enabled = DevEnv("XBE_DETERMINISTIC_REPLAY") != nullptr;
     return enabled;
 }
 FILE *g_out = nullptr;
@@ -86,8 +87,8 @@ void Load() {
     if (g_loaded) return;
     g_loaded = true;
     if (!Enabled()) return;
-    if (const char *r = std::getenv("XBE_PAD_RECORD")) g_out = std::fopen((std::string(r) + ".timing").c_str(), "w");
-    if (const char *r = std::getenv("XBE_PAD_REPLAY")) {
+    if (const char *r = DevEnv("XBE_PAD_RECORD")) g_out = std::fopen((std::string(r) + ".timing").c_str(), "w");
+    if (const char *r = DevEnv("XBE_PAD_REPLAY")) {
         if (FILE *f = std::fopen((std::string(r) + ".timing").c_str(), "r")) {
             char k;
             unsigned v;
@@ -196,13 +197,13 @@ thread_local X86Context render_entry;
 
 uint32_t NativeGameplayCap() {
     static const uint32_t cap = []() -> uint32_t {
-        if (std::getenv("XBE_PAD_RECORD") || std::getenv("XBE_PAD_REPLAY")) return 0;
-        if (const char *option = std::getenv("XBE_NATIVE_FPS")) {
+        if (DevEnv("XBE_PAD_RECORD") || DevEnv("XBE_PAD_REPLAY")) return 0;
+        if (const char *option = DevEnv("XBE_NATIVE_FPS")) {
             char *end = nullptr;
             const long value = std::strtol(option, &end, 10);
             return end != option && !*end && value >= 61 && value <= 120 ? uint32_t(value) : 0;
         }
-        const char *legacy = std::getenv("XBE_NATIVE_90FPS");
+        const char *legacy = DevEnv("XBE_NATIVE_90FPS");
         return legacy && std::strcmp(legacy, "1") == 0 ? 90 : 0;
     }();
     return cap;
@@ -215,8 +216,8 @@ bool NativeGameplayEnabled(uint8_t *base) {
 
 int VehicleStepProbe() {
     static const int mode = [] {
-        const char *option = std::getenv("XBE_VEHICLE_STEP_PROBE");
-        if (!option || std::getenv("XBE_PAD_RECORD") || std::getenv("XBE_PAD_REPLAY")) return 0;
+        const char *option = DevEnv("XBE_VEHICLE_STEP_PROBE");
+        if (!option || DevEnv("XBE_PAD_RECORD") || DevEnv("XBE_PAD_REPLAY")) return 0;
         if (std::strcmp(option, "full") == 0) return 1;
         if (std::strcmp(option, "split") == 0) return 2;
         if (std::strcmp(option, "motion") == 0) return 3;
@@ -245,10 +246,10 @@ bool PlayerDrivesVehicle(uint8_t *base, uint32_t vehicle) {
 
 bool ShouldDoubleRender(uint8_t *base) {
     static const bool enabled = [] {
-        const char *option = std::getenv("XBE_EXPERIMENTAL_120FPS");
+        const char *option = DevEnv("XBE_EXPERIMENTAL_120FPS");
         // Pad recordings use the guest swap count as their input clock.
-        return option && std::strcmp(option, "1") == 0 && !std::getenv("XBE_PAD_RECORD") &&
-               !std::getenv("XBE_PAD_REPLAY");
+        return option && std::strcmp(option, "1") == 0 && !DevEnv("XBE_PAD_RECORD") &&
+               !DevEnv("XBE_PAD_REPLAY");
     }();
     if (!enabled || native_gameplay || VehicleStepProbe() || !fast_gameplay || frame_ticks != 1 || dev::GameSpeed() != 4 ||
         game::choices::EffectiveFrameCap(app::FrameCap()) != 60 || !dev::InGameplay() || kernel::MovieOpen())
@@ -258,7 +259,7 @@ bool ShouldDoubleRender(uint8_t *base) {
 #endif
 
 void TraceFrame(uint32_t ticks, bool audio_clock, uint32_t steps) {
-    static const bool enabled = std::getenv("XBE_TRACE_FRAME_TIMING") != nullptr;
+    static const bool enabled = DevEnv("XBE_TRACE_FRAME_TIMING") != nullptr;
     if (!enabled) return;
     using clock = std::chrono::steady_clock;
     static auto start = clock::now();
@@ -446,7 +447,7 @@ X86_FUNC(sub_000A5200) {
 #endif
 #if TCNYC_DEV_TOOLS
     static const bool trace_audio = [] {
-        const char* flag = std::getenv("TCNYC_TEST_AUDIO_TRACE");
+        const char* flag = DevEnv("TCNYC_TEST_AUDIO_TRACE");
         return flag && std::strcmp(flag, "1") == 0;
     }();
     const auto native_start = native_gameplay || trace_audio ? NativeClock::now() : NativeClock::time_point{};

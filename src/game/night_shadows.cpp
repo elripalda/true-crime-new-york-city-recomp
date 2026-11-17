@@ -1,4 +1,5 @@
 #include "game_addresses.h"
+#include "core/dev_env.h"
 // Night shadows that pop in and out.
 //
 // Each frame 0x143650 takes the scene's shadow light: a vector at 0x37F8D0 (a direction with w 0 for the moon,
@@ -84,7 +85,7 @@ int g_away_frames = 0, g_none_frames = 0;
 int g_fit = -1;  // the last fit of the shadow to the view: -1 not reached, 0 failed, 1 done
 
 bool Tracing() {
-    static const bool on = std::getenv("TCNYC_TRACE_SHADOW") != nullptr;
+    static const bool on = DevEnv("TCNYC_TRACE_SHADOW") != nullptr;
     return on;
 }
 

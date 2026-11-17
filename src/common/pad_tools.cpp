@@ -1,6 +1,7 @@
 // Optional scripted input and frame-indexed controller recording/replay.
 
 #include <chrono>
+#include "core/dev_env.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -24,7 +25,7 @@ struct Press {
 
 std::vector<Press> LoadScript() {
     std::vector<Press> out;
-    const char *v = std::getenv("XBE_PAD_SCRIPT");
+    const char *v = DevEnv("XBE_PAD_SCRIPT");
     if (!v) return out;
     struct Name {
         const char *name;
@@ -71,7 +72,7 @@ bool SameState(const input::Pad &a, const input::Pad &b) {
 
 void Record(const input::Pad &p) {
     static FILE *f = [] {
-        const char *v = std::getenv("XBE_PAD_RECORD");
+        const char *v = DevEnv("XBE_PAD_RECORD");
         FILE *out = v ? std::fopen(v, "w") : nullptr;
         if (out) std::fputs("pad2\n", out);
         return out;
@@ -90,7 +91,7 @@ void Record(const input::Pad &p) {
 
 std::vector<PadState> LoadReplay() {
     std::vector<PadState> out;
-    const char *v = std::getenv("XBE_PAD_REPLAY");
+    const char *v = DevEnv("XBE_PAD_REPLAY");
     FILE *f = v ? std::fopen(v, "r") : nullptr;
     if (!f) return out;
     char line[256];

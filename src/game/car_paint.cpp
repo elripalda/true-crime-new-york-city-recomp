@@ -1,4 +1,5 @@
 #include "game_addresses.h"
+#include "core/dev_env.h"
 // Car paint drawn as one blended mesh: keep its depth writes.
 //
 // This is a bug in the original Xbox release, not in the port: the game's own draw turns the depth writes off.
@@ -49,7 +50,7 @@ uint32_t KeepPaintDepth(X86Context &ctx, uint32_t method, uint32_t value) {
 }
 
 const bool g_installed = [] {
-    if (const char *e = std::getenv("XBE_CAR_PAINT_DEPTH"); e && e[0] == '0') return false;
+    if (const char *e = DevEnv("XBE_CAR_PAINT_DEPTH"); e && e[0] == '0') return false;
     ::XbeSimpleStateFilter() = KeepPaintDepth;
     return true;
 }();

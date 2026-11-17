@@ -1,4 +1,5 @@
 #include "game_addresses.h"
+#include "core/dev_env.h"
 // Phase 2 city tile store: an NÃ—N shadow of the game's fixed 3Ã—3 arrays.
 //
 // Nothing here changes the game yet. The game's arrays remain authoritative; this store is populated from them
@@ -515,12 +516,12 @@ void DriveRing(uint8_t *base, X86Context &ctx, uint32_t city, uint32_t manager) 
 
     if (now - g.last_drive < std::chrono::milliseconds(10)) return;
     g.last_drive = now;
-    static const bool static_ring = std::getenv("XBE_CITY_RING_STATIC") != nullptr;
+    static const bool static_ring = DevEnv("XBE_CITY_RING_STATIC") != nullptr;
     if (static_ring && now - g.start > std::chrono::seconds(20)) return;
     if (GameBusy(base, city, manager)) return;
     if (!EnsureTemplates(base, city, manager)) return;
     static bool locks_logged = false;
-    static const bool diag = std::getenv("XBE_CITY_DIAG") != nullptr;
+    static const bool diag = DevEnv("XBE_CITY_DIAG") != nullptr;
     if (!locks_logged && diag) {
         locks_logged = true;
         for (int i = 0; i < 27; ++i)
@@ -573,7 +574,7 @@ void DriveRing(uint8_t *base, X86Context &ctx, uint32_t city, uint32_t manager) 
     }
     const int max_outer = g.n * g.n - 9;
     static const int requested = [] {
-        const char *value = std::getenv("XBE_CITY_RING_LIMIT");
+        const char *value = DevEnv("XBE_CITY_RING_LIMIT");
         return value ? std::atoi(value) : 0;
     }();
     const int drive_limit = requested > 0 ? std::min(requested, max_outer) : max_outer;
@@ -601,7 +602,7 @@ void DriveRing(uint8_t *base, X86Context &ctx, uint32_t city, uint32_t manager) 
                 }
                 if (g.ring_blocked[idx]) continue;
                 static const int min_x_allowed = [] {
-                    const char* value = std::getenv("XBE_CITY_RING_MINX");
+                    const char* value = DevEnv("XBE_CITY_RING_MINX");
                     return value ? std::atoi(value) : INT32_MIN;
                 }();
                 if (x < min_x_allowed) {
@@ -644,7 +645,7 @@ void DrawRing(uint8_t *base, X86Context &ctx, uint32_t camera) {
         if (!X86_MEM8(cell + 0x88)) continue;
         if (X86_MEM32(cell + 0x90) == 0xFFFFFFFFu) continue;
         const uint32_t saved = ctx.ecx;
-        static const bool trace = std::getenv("XBE_CITY_NODEGUARD") != nullptr;
+        static const bool trace = DevEnv("XBE_CITY_NODEGUARD") != nullptr;
         const uint32_t p70 = X86_MEM32(cell + 0x70), p74 = X86_MEM32(cell + 0x74);
         static uint32_t pre[kCellBytes / 4 + 4];
         uint32_t guard_before = 0;
@@ -716,7 +717,7 @@ void ScanReferences(uint8_t *base) {
 
 void Init(uint8_t *base, uint32_t manager) {
     static const char *env = [] {
-        const char *value = std::getenv("XBE_CITY_GRID");
+        const char *value = DevEnv("XBE_CITY_GRID");
         return value;
     }();
     // The in-game City draw distance setting allocates a 9x9 store the first time it is above Normal; the
@@ -781,7 +782,7 @@ void Init(uint8_t *base, uint32_t manager) {
     // heap, which then overwrites the store (and the store overwrites the game) after a minute or two.
     static const uint32_t alloc_flags = [] {
         uint32_t flags = mem::kMemReserve | mem::kMemCommit;
-        if (!std::getenv("XBE_CITY_STORE_LOW")) flags |= mem::kMemTopDown;
+        if (!DevEnv("XBE_CITY_STORE_LOW")) flags |= mem::kMemTopDown;
         return flags;
     }();
     uint32_t at = 0, size = total;
@@ -800,20 +801,20 @@ void Init(uint8_t *base, uint32_t manager) {
     g.cell_tmpl_buf = Align16(g.slot_tmpl_buf + kSlotBytes);
     g.n = n;
     g.manager = manager;
-    g.test = std::getenv("XBE_CITY_MIRROR_TEST") != nullptr;
-    g.cell_test = std::getenv("XBE_CITY_CELL_TEST") != nullptr;
-    g.ring = std::getenv("XBE_CITY_RING") != nullptr || std::getenv("XBE_CITY_RING_DIAG") != nullptr ||
-             std::getenv("XBE_CITY_DIAG") != nullptr || g.from_setting;
+    g.test = DevEnv("XBE_CITY_MIRROR_TEST") != nullptr;
+    g.cell_test = DevEnv("XBE_CITY_CELL_TEST") != nullptr;
+    g.ring = DevEnv("XBE_CITY_RING") != nullptr || DevEnv("XBE_CITY_RING_DIAG") != nullptr ||
+             DevEnv("XBE_CITY_DIAG") != nullptr || g.from_setting;
     LOGR("city: slot type %08X -> %08X %08X %08X %08X; cell type %08X -> %08X %08X %08X %08X", TC_ADDR(0x2D9C44),
          X86_MEM32(TC_ADDR(0x2D9C44)), X86_MEM32(TC_ADDR(0x2D9C48)), X86_MEM32(TC_ADDR(0x2D9C4C)), X86_MEM32(TC_ADDR(0x2D9C50)), TC_ADDR(0x2D9E0C),
          X86_MEM32(TC_ADDR(0x2D9E0C)), X86_MEM32(TC_ADDR(0x2D9E10)), X86_MEM32(TC_ADDR(0x2D9E14)), X86_MEM32(TC_ADDR(0x2D9E18)));
-    g.ring_freeze = std::getenv("XBE_CITY_RING_FREEZE") != nullptr;
-    g.ring_nodraw = std::getenv("XBE_CITY_RING_NODRAW") != nullptr;
-    g.ring_slotonly = std::getenv("XBE_CITY_RING_SLOTONLY") != nullptr;
-    g.ring_cellonly = std::getenv("XBE_CITY_RING_CELLONLY") != nullptr;
-    g.ring_nodrive = std::getenv("XBE_CITY_RING_NODRIVE") != nullptr;
-    g.keep_objects = std::getenv("XBE_CITY_KEEP_OBJECTS") != nullptr;
-    g.no_unlink = std::getenv("XBE_CITY_NO_CLEAR") != nullptr;
+    g.ring_freeze = DevEnv("XBE_CITY_RING_FREEZE") != nullptr;
+    g.ring_nodraw = DevEnv("XBE_CITY_RING_NODRAW") != nullptr;
+    g.ring_slotonly = DevEnv("XBE_CITY_RING_SLOTONLY") != nullptr;
+    g.ring_cellonly = DevEnv("XBE_CITY_RING_CELLONLY") != nullptr;
+    g.ring_nodrive = DevEnv("XBE_CITY_RING_NODRIVE") != nullptr;
+    g.keep_objects = DevEnv("XBE_CITY_KEEP_OBJECTS") != nullptr;
+    g.no_unlink = DevEnv("XBE_CITY_NO_CLEAR") != nullptr;
     std::memset(base + at, 0, size);
     g.start = g.last = g.last_log = g.last_move = std::chrono::steady_clock::now();
     g.ready = true;
@@ -832,7 +833,7 @@ void MaybeSync(uint8_t *base) {
         ++g.syncs;
     }
 
-    static const bool scan_diag = std::getenv("XBE_CITY_DIAG") != nullptr;
+    static const bool scan_diag = DevEnv("XBE_CITY_DIAG") != nullptr;
     if (scan_diag && g.ring && !g.scanned && now - g.start > std::chrono::milliseconds(5500)) {
         g.scanned = true;
         ScanReferences(base);
@@ -897,9 +898,9 @@ bool InInnerDetailZone(uint8_t *base, uint32_t slot) {
 }
 bool OuterDetailAvailable() {
     static const bool fixed_outer_ring = [] {
-        const char* grid = std::getenv("XBE_CITY_GRID");
+        const char* grid = DevEnv("XBE_CITY_GRID");
         return grid && (std::atoi(grid) == 7 || std::atoi(grid) == 9) &&
-               (std::getenv("XBE_CITY_RING") || std::getenv("XBE_CITY_RING_DIAG") || std::getenv("XBE_CITY_DIAG"));
+               (DevEnv("XBE_CITY_RING") || DevEnv("XBE_CITY_RING_DIAG") || DevEnv("XBE_CITY_DIAG"));
     }();
     return fixed_outer_ring || std::atomic_ref(app::Get().city_range).load(std::memory_order_relaxed) >= 2;
 }

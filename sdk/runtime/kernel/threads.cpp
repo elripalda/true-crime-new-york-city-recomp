@@ -1,4 +1,5 @@
 #include <algorithm>
+#include "core/dev_env.h"
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -193,7 +194,7 @@ void GuestRunWatchdog() {
 
 bool GuestRunSerial() {
     static const bool on = [] {
-        const char* v = std::getenv("XBE_SERIAL_GUEST");
+        const char* v = DevEnv("XBE_SERIAL_GUEST");
         return v && *v && *v != '0';
     }();
     if (on) std::call_once(g_guest_watchdog_once, [] { std::thread(GuestRunWatchdog).detach(); });

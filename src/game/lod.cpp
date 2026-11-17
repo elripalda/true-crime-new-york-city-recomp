@@ -1,4 +1,5 @@
 #include "game_addresses.h"
+#include "core/dev_env.h"
 // Object detail: how far meshes keep each detail level.
 //
 // A scene node keeps its meshes as a list at node+0x2C, highest detail first: each entry has its switch
@@ -68,7 +69,7 @@ bool AllowedType(uint32_t vtable) {
     static int n = -1;
     if (n < 0) {
         n = 0;
-        if (const char *env = std::getenv("XBE_VEHICLE_LOD"); !env) {
+        if (const char *env = DevEnv("XBE_VEHICLE_LOD"); !env) {
             list[n++] = kActiveCarVtable;
             list[n++] = kTrafficCarVtable;
         } else {
@@ -180,7 +181,7 @@ X86_FUNC(sub_0021E1A0) {
     if (body) {
         const uint32_t vt = valid_object ? X86_MEM32(obj) : 0;
         t_allowed = valid_object && AllowedType(vt);
-        static const bool trace = std::getenv("XBE_TRACE_VEHICLES") != nullptr;
+        static const bool trace = DevEnv("XBE_TRACE_VEHICLES") != nullptr;
         if (trace && valid_object && mem::IsCommitted(obj + 0x448)) {
             // Vtable census of objects drawn by the dynamic-object body draw (execution plan 4.1).
             static uint32_t vts[32] = {}, counts[32] = {}, n = 0, total = 0;
@@ -214,13 +215,13 @@ X86_FUNC(sub_0021E1A0) {
 X86_EXTERN_FUNC(__imp__sub_00137C00);
 X86_FUNC(sub_00137C00) {
     static const double factor = [] {
-        const char *e = std::getenv("XBE_INSTANCE_DISTANCE");
+        const char *e = DevEnv("XBE_INSTANCE_DISTANCE");
         const double f = e ? std::atof(e) : 1.0;
         return f > 0.0 ? f : 1.0;
     }();
     const uint32_t ret = X86_MEM32(ctx.esp);
     __imp__sub_00137C00(ctx, base);
-    static const bool trace = std::getenv("XBE_INSTANCE_TRACE") != nullptr;
+    static const bool trace = DevEnv("XBE_INSTANCE_TRACE") != nullptr;
     if (ret == TC_ADDR(0x00144670) && trace) {
         static uint32_t calls = 0, small = 0;
         ++calls;

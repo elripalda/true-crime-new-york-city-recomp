@@ -1,4 +1,5 @@
 #include <algorithm>
+#include "core/dev_env.h"
 #include <chrono>
 #include <cstdlib>
 #include <string>
@@ -312,7 +313,7 @@ static uint32_t WaitFor(const std::vector<ObjectRef>& objs, bool wait_all, int64
     std::unique_lock<std::mutex> lock(g_dispatch);
     Queued queued{objs};
     // XBE_WAITLOG set: a wait still blocked after 3 s logs its objects and the guest stack once (diagnostic)
-    static const bool wait_log = std::getenv("XBE_WAITLOG") != nullptr;
+    static const bool wait_log = DevEnv("XBE_WAITLOG") != nullptr;
     auto wait_start = steady_clock::now();
     bool wait_logged = false;
     for (;;) {

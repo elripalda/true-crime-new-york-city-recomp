@@ -1,5 +1,6 @@
 // DirectSound (XDK 4831 and 5849) on a host software mixer. Buffers and streams are read from guest memory as they play.
 #include <algorithm>
+#include "core/dev_env.h"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -618,7 +619,7 @@ std::optional<Cursor> BufferFrame(Voice& v) {
 #if TCNYC_DEV_TOOLS
 bool TraceAudio() {
     static const bool enabled = [] {
-        const char* flag = std::getenv("TCNYC_TEST_AUDIO_TRACE");
+        const char* flag = DevEnv("TCNYC_TEST_AUDIO_TRACE");
         return flag && std::strcmp(flag, "1") == 0;
     }();
     return enabled;

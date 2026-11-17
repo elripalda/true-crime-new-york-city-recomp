@@ -1,6 +1,7 @@
 // Native Linux settings: the same keys as runtime/app/settings.cpp, stored under the
 // XDG config directory instead of beside the executable.
 #include <algorithm>
+#include "core/dev_env.h"
 #include <atomic>
 #include <cerrno>
 #include <cstdio>
@@ -32,7 +33,7 @@ std::mutex g_save_lock;
 const char* kModes[] = {"fullscreen", "borderless", "windowed"};
 
 std::filesystem::path ConfigDir() {
-    if (const char* override = std::getenv("TCNYC_SETTINGS"); override && *override) {
+    if (const char* override = DevEnv("TCNYC_SETTINGS"); override && *override) {
         std::filesystem::path p(override);
         return p.has_filename() ? p.parent_path() : p;
     }
@@ -46,7 +47,7 @@ std::filesystem::path ConfigDir() {
 } // namespace
 
 std::filesystem::path SettingsPath() {
-    if (const char* override = std::getenv("TCNYC_SETTINGS"); override && *override) {
+    if (const char* override = DevEnv("TCNYC_SETTINGS"); override && *override) {
         std::filesystem::path p(override);
         if (p.has_filename()) return p;
         return p / SettingsFile();

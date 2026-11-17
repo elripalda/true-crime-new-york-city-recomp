@@ -1,4 +1,5 @@
 #include "game_addresses.h"
+#include "core/dev_env.h"
 // Graphics rows in the native Options > Display tab.
 //
 // The tab's rows come from a MenuDuplicator in PauseMenu.tag (0x42A44) that
@@ -70,7 +71,7 @@ constexpr uint32_t kControllerText = 0x043E9964;   // + row: the row's text
 constexpr uint32_t kControllerColour = 0xCAA49974; // + row: the row's text colour
 
 bool Tracing() {
-    static const bool on = std::getenv("XBE_TRACE_OPTIONS_PAGE") != nullptr;
+    static const bool on = DevEnv("XBE_TRACE_OPTIONS_PAGE") != nullptr;
     return on;
 }
 

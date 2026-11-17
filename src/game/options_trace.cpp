@@ -1,4 +1,5 @@
 #include "game_addresses.h"
+#include "core/dev_env.h"
 // Read-only tracing of the native Options tab renderer. Off unless
 // XBE_TRACE_OPTIONS_PAGE is set; the hook calls the original unchanged.
 
@@ -15,7 +16,7 @@
 // Trace explicit numTabs updates to identify the renderer used by Options.
 X86_EXTERN_FUNC(__imp__sub_00250170);
 X86_FUNC(sub_00250170) {
-    static const bool trace = std::getenv("XBE_TRACE_OPTIONS_PAGE") != nullptr;
+    static const bool trace = DevEnv("XBE_TRACE_OPTIONS_PAGE") != nullptr;
     const uint32_t renderer = trace && X86_MEM32(ctx.esp + 12) == 0xEF15D709u ? ctx.ecx : 0;
     const uint32_t caller = renderer ? X86_MEM32(ctx.esp) : 0;
     // The forwarding wrapper pushes three arguments before calling this setter.

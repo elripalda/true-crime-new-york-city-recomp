@@ -7,6 +7,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include "core/dev_env.h"
 
 #include <algorithm>
 #include <atomic>
@@ -771,7 +772,7 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
     {
         static std::vector<double> at, pictures;
         static bool parsed = [] {
-            for (const char* v = std::getenv("XBE_CAPTURE_AT"); v && *v;) {
+            for (const char* v = DevEnv("XBE_CAPTURE_AT"); v && *v;) {
                 const bool pic = *v == 'p';
                 char* end;
                 double s = std::strtod(v + (pic ? 1 : 0), &end);

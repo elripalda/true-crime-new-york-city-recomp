@@ -195,8 +195,10 @@ temporary installs, mocks network downloads and exercises restart and recovery.
 
 ## Switches for testing
 
-These work in any build, release included. Set them before launching; on Linux, for example,
-`XBE_VERBOSE=1 ./TrueCrimeNYC`.
+Set them before launching; on Linux, for example, `XBE_VERBOSE=1 ./TrueCrimeNYC`. Release builds read
+only `TCNYC_SCENE_FP16`, `TCNYC_PIPELINE_CACHE`, `TCNYC_PIPELINE_WARM` and `TCNYC_DRAW_WORKER` from this table,
+plus the player and troubleshooting switches in README.md and README-LINUX.md. The other diagnostic, trace and
+tuning switches need a developer build (`build-dev.bat`); release builds ignore them (`core/dev_env.h`).
 
 | Variable | Effect |
 |---|---|

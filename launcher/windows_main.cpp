@@ -2,6 +2,7 @@
 #define UNICODE
 #endif
 #include <windows.h>
+#include "core/dev_env.h"
 #include <shellapi.h>
 
 #include <cstdlib>
@@ -33,7 +34,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR args, int show
     bool skip = false;
     app::GameSource source;
 #if TCNYC_DEV_TOOLS
-    skip = _wgetenv(L"XBE_DEV_SKIP_LAUNCHER") != nullptr;
+    skip = DevWEnv(L"XBE_DEV_SKIP_LAUNCHER") != nullptr;
 #endif
     for (int i = 1; i < argc; ++i) {
         if (std::wcscmp(argv[i], L"--game-source") == 0 && i + 1 < argc) source.path = argv[++i];

@@ -1,4 +1,5 @@
 #include "launcher.h"
+#include "core/dev_env.h"
 #include "updater.h"
 
 #include <algorithm>
@@ -779,7 +780,7 @@ void LogWindowGeometry(SDL_Window *window, SDL_Renderer *renderer) {
 // TCNYC_LAUNCHER_SHOT=<file.bmp>: saves the backbuffer of the 30th frame, to check the layout on a
 // desktop whose windows cannot be captured from outside (Wayland over SSH).
 void SaveLauncherShot(SDL_Renderer *renderer) {
-    static const char *path = std::getenv("TCNYC_LAUNCHER_SHOT");
+    static const char *path = DevEnv("TCNYC_LAUNCHER_SHOT");
     static int frame = 0;
     if (!path || ++frame != 30) return;
     if (SDL_Surface *shot = SDL_RenderReadPixels(renderer, nullptr)) {

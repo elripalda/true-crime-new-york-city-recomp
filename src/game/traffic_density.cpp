@@ -1,4 +1,5 @@
 #include "game_addresses.h"
+#include "core/dev_env.h"
 // Traffic density: how many ambient cars the game keeps.
 //
 // Road spawn points (message handler 0x18C80) add a car while the point's own count ([point+0x82]) is below
@@ -25,7 +26,7 @@ X86_FUNC(sub_00014120) {
     if (level == 0 || level > 5) return;
     const int32_t budget = int32_t(ctx.eax);
     const int32_t scaled = game::choices::TrafficScale(budget, level);
-    static const bool trace = std::getenv("XBE_TRACE_TRAFFIC_RANGE") != nullptr;
+    static const bool trace = DevEnv("XBE_TRACE_TRAFFIC_RANGE") != nullptr;
     static uint32_t ticks = 0;
     if (trace && (++ticks & 0x3FFF) == 0) {
         const uint32_t g = X86_MEM32(TC_ADDR(0x360E00));
@@ -125,7 +126,7 @@ X86_FUNC(sub_00044090) {
     // with XBE_TRAFFIC_DESPAWN_SCALE.
     // Traffic distance setting (default 1.5x spawn, 2x despawn); XBE_TRAFFIC_DESPAWN_SCALE overrides it.
     static const float env_scale = [] {
-        const char *e = std::getenv("XBE_TRAFFIC_DESPAWN_SCALE");
+        const char *e = DevEnv("XBE_TRAFFIC_DESPAWN_SCALE");
         const float s = e ? float(std::atof(e)) : 0.0f;
         return s > 0.0f ? s : 0.0f;
     }();
@@ -136,7 +137,7 @@ X86_FUNC(sub_00044090) {
         const RangeScale range(base, scale);
         __imp__sub_00044090(ctx, base);
     }
-    static const bool trace = std::getenv("XBE_TRACE_TRAFFIC_RANGE") != nullptr;
+    static const bool trace = DevEnv("XBE_TRACE_TRAFFIC_RANGE") != nullptr;
     if (!trace) return;
     static uint32_t despawns = 0;
     static auto last = std::chrono::steady_clock::now();
@@ -159,7 +160,7 @@ X86_EXTERN_FUNC(__imp__sub_00018C80);
 X86_FUNC(sub_00018C80) {
     // Traffic distance setting; XBE_TRAFFIC_SPAWN_SCALE overrides it.
     static const float env_scale = [] {
-        const char *e = std::getenv("XBE_TRAFFIC_SPAWN_SCALE");
+        const char *e = DevEnv("XBE_TRAFFIC_SPAWN_SCALE");
         const float s = e ? float(std::atof(e)) : 0.0f;
         return s > 0.0f ? s : 0.0f;
     }();
@@ -180,7 +181,7 @@ X86_FUNC(sub_00015420) {
     __imp__sub_00015420(ctx, base);
     if (ret != TC_ADDR(0x00018E46u) || !out) return;
     static const float min_distance = [] {
-        const char *e = std::getenv("XBE_TRAFFIC_MIN_SPAWN");
+        const char *e = DevEnv("XBE_TRAFFIC_MIN_SPAWN");
         return e ? float(std::atof(e)) : 0.0f;
     }();
     if (min_distance > 0.0f && X86_MEMF32(out) < min_distance) X86_MEMF32(out) = X86_MEMF32(TC_ADDR(0x2E3504)) + 1.0f;

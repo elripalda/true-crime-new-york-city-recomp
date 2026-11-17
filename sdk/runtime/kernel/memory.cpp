@@ -1,4 +1,5 @@
 #include "kernel/memory.h"
+#include "core/dev_env.h"
 
 #include <algorithm>
 #include <atomic>
@@ -141,7 +142,7 @@ std::atomic<uint32_t> (*g_free_sites)[6] = nullptr;
 
 void RecordFree(uint32_t va, uint32_t size) {
     static const bool on = [] {
-        if (!std::getenv("XBE_TRACE_FREE")) return false;
+        if (!DevEnv("XBE_TRACE_FREE")) return false;
         g_free_sites = new std::atomic<uint32_t>[kTracePages][6]();
         return true;
     }();
@@ -442,7 +443,7 @@ bool QueryVirtual(uint32_t addr, RegionInfo& out) {
 // Phase 0 city-streaming probe: with XBE_TRACE_CITY=1, log the larger physical allocations and frees so tile
 // loads can be attributed from their timestamp. Off otherwise, so normal runs are unaffected.
 static bool CityTrace() {
-    static const bool on = std::getenv("XBE_TRACE_CITY") != nullptr;
+    static const bool on = DevEnv("XBE_TRACE_CITY") != nullptr;
     return on;
 }
 
@@ -455,7 +456,7 @@ struct ContigRec {
 };
 std::map<uint32_t, ContigRec> g_contig_live;
 bool ContigTrace() {
-    static const bool on = std::getenv("XBE_TRACE_CONTIG") != nullptr;
+    static const bool on = DevEnv("XBE_TRACE_CONTIG") != nullptr;
     return on;
 }
 void ContigChain(uint32_t out[4]) {

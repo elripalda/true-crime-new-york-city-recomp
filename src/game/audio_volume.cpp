@@ -1,4 +1,5 @@
 #include "game_addresses.h"
+#include "core/dev_env.h"
 // A non-positive mix-bin volume can prevent a stream from starting.
 //
 // 0x25DA90 starts a voice/music/SFX stream. Before starting it, it compares
@@ -114,7 +115,7 @@ X86_FUNC(sub_0025DE90) {
     const uint32_t flags = X86_MEM32(ctx.esp + 8);
 #if TCNYC_DEV_TOOLS
     static const bool trace = [] {
-        const char* flag = std::getenv("TCNYC_TEST_RADIO_TRACE");
+        const char* flag = DevEnv("TCNYC_TEST_RADIO_TRACE");
         return flag && std::strcmp(flag, "1") == 0;
     }();
     if (trace) {
@@ -159,7 +160,7 @@ X86_FUNC(sub_002291F0) {
     constexpr uint32_t kStreamVolumeUpdate = TCNYC_PAL_EU ? 0x0024AC59u : TCNYC_PAL ? 0x24AD29u : 0x24A689u;
     if (bin == kMusicBin && caller == kStreamVolumeUpdate) {
         static const bool trace = [] {
-            const char* flag = std::getenv("TCNYC_TEST_AUDIO_TRACE");
+            const char* flag = DevEnv("TCNYC_TEST_AUDIO_TRACE");
             return flag && std::strcmp(flag, "1") == 0;
         }();
         if (trace) {
@@ -172,7 +173,7 @@ X86_FUNC(sub_002291F0) {
             }
         }
         static const bool boost = [] {
-            const char* flag = std::getenv("TCNYC_TEST_MUSIC_BOOST");
+            const char* flag = DevEnv("TCNYC_TEST_MUSIC_BOOST");
             return flag && std::strcmp(flag, "1") == 0;
         }();
         if (boost) {

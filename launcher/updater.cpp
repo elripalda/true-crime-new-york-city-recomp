@@ -840,7 +840,12 @@ bool OlderVersion(const std::string& a, const std::string& b) {
 
 const char* Updater::Current() {
     static const char* version = [] {
+// The version override exists for the updater tests and developer builds only.
+#if (defined(TCNYC_DEV_TOOLS) && TCNYC_DEV_TOOLS) || defined(TCNYC_UPDATER_TEST_TOOLS)
         const char* test = std::getenv("TCNYC_UPDATE_TEST_VERSION");
+#else
+        const char* test = nullptr;
+#endif
         return test && *test ? test : TCNYC_VERSION;
     }();
     return version;

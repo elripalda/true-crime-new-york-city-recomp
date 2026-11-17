@@ -6,6 +6,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include "core/dev_env.h"
 #include <dbghelp.h>
 #include <timeapi.h>
 
@@ -574,7 +575,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     if (app::kGame.init) app::kGame.init();
     if (relaunched && !logx::kVerbose) LOGR("Relaunched: %s", IMAGE_XBE);
     else app::LogSystem();
-    LOGR("diagnostics: effect watch %s", std::getenv("XBE_EFFECT_WATCH") ? "enabled" : "off");
+    LOGR("diagnostics: effect watch %s", DevEnv("XBE_EFFECT_WATCH") ? "enabled" : "off");
 
     app::GameFiles game;
     if (!app::FindGame(game, nullptr, startup_game_location)) return 1;

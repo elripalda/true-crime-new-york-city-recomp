@@ -1,4 +1,5 @@
 #include "game_addresses.h"
+#include "core/dev_env.h"
 // Extra Music Player songs from the custom music folder.
 //
 // The song manager (0x3735FC) keeps {tag root, SongsArray node, song count} and
@@ -252,10 +253,10 @@ fs::path MusicFolder() {
         folder = fs::path(reinterpret_cast<const char8_t*>(chosen.c_str()));
 #if TCNYC_DEV_TOOLS
 #ifdef _WIN32
-    else if (const wchar_t* test = _wgetenv(L"TCNYC_TEST_RADIO_FOLDER"))
+    else if (const wchar_t* test = DevWEnv(L"TCNYC_TEST_RADIO_FOLDER"))
         folder = test;
 #else
-    else if (const char* test = std::getenv("TCNYC_TEST_RADIO_FOLDER"))
+    else if (const char* test = DevEnv("TCNYC_TEST_RADIO_FOLDER"))
         folder = test;
 #endif
 #endif

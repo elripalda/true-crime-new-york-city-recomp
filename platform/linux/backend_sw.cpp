@@ -3,6 +3,7 @@
 // This is the bring-up path: it needs no GPU API, so the whole host can be tested
 // while the Vulkan backend is written.
 #include <cstdio>
+#include "core/dev_env.h"
 #include <cstdlib>
 #include <filesystem>
 #include <string>
@@ -53,7 +54,7 @@ public:
         }
         // TC_SW_CAP=N: save every Nth frame for a look at the software path's output
         static const long capture = [] {
-            const char* e = std::getenv("TC_SW_CAP");
+            const char* e = DevEnv("TC_SW_CAP");
             return e ? std::atol(e) : 0;
         }();
         if (capture > 0 && frames_ % uint64_t(capture) == 0) {

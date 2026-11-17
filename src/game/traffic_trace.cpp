@@ -1,4 +1,5 @@
 #include "game_addresses.h"
+#include "core/dev_env.h"
 // Read-only vehicle spawn diagnostics for investigating the Xbox Copland bug.
 #include <algorithm>
 #include <cstdint>
@@ -16,7 +17,7 @@ constexpr uint32_t kTrafficRefStride = 0x14;
 constexpr uint32_t kTrafficRefCount = 16;
 
 bool TraceEnabled() {
-    static const bool enabled = std::getenv("XBE_TRACE_TRAFFIC") != nullptr;
+    static const bool enabled = DevEnv("XBE_TRACE_TRAFFIC") != nullptr;
     return enabled;
 }
 

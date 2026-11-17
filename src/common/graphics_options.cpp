@@ -8,6 +8,7 @@
 // is written when the menu closes.
 
 #include "graphics_menu.h"
+#include "core/dev_env.h"
 
 #include "app/app.h"
 #include "game/city_grid.h"
@@ -1015,7 +1016,7 @@ std::string Value(Row row) {
 #else
 #ifdef _WIN32
             static const bool forced = [] {
-                const char* e = std::getenv("TCNYC_DLSS_FORCE");
+                const char* e = DevEnv("TCNYC_DLSS_FORCE");
                 return e && *e && std::atoi(e) != 0;
             }();
 #else

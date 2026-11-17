@@ -15,6 +15,7 @@
 // to it. XBE_TRACE_CAMERA=1 logs each change.
 
 #include <algorithm>
+#include "core/dev_env.h"
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -40,7 +41,7 @@ constexpr uint32_t kGameplayProjection[] = {TC_ADDR(0x0007E1BA), TC_ADDR(0x000A7
 constexpr uint32_t kScaleX = 0x08, kScaleY = 0x10, kNear = 0x1C, kFar = 0x20;
 
 bool Tracing() {
-    static const bool on = std::getenv("XBE_TRACE_CAMERA") != nullptr;
+    static const bool on = DevEnv("XBE_TRACE_CAMERA") != nullptr;
     return on;
 }
 
@@ -199,7 +200,7 @@ X86_FUNC(sub_0013C390) {
 X86_EXTERN_FUNC(__imp__sub_0013F090);
 X86_FUNC(sub_0013F090) {
     static const bool hide = [] {
-        const char *value = std::getenv("XBE_HIDE_DISTANT_CITY");
+        const char *value = DevEnv("XBE_HIDE_DISTANT_CITY");
         return value && std::strcmp(value, "1") == 0;
     }();
     if (hide && X86_MEM32(ctx.esp) == TC_ADDR(0x142CEE)) {

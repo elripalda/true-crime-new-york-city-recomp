@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include "core/dev_env.h"
 #include <cstdlib>
 #include <string>
 
@@ -20,7 +21,7 @@ enum AoRole : uint8_t { kAoDepth = 1, kAoColour = 2 };
 constexpr float kAoDistClear = 1e30f;  // no geometry: the sky, or only effects
 
 inline float AoEnvFloat(const char* name, float fallback) {
-    const char* e = std::getenv(name);
+    const char* e = DevEnv(name);
     return e && *e ? std::strtof(e, nullptr) : fallback;
 }
 

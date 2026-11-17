@@ -7,6 +7,7 @@
 #endif
 #include <windows.h>
 #endif
+#include "core/dev_env.h"
 
 #include <atomic>
 #include <algorithm>
@@ -151,7 +152,7 @@ void x86_icall(X86Context& ctx, uint8_t* base, uint32_t target) {
     if (X86Func* f = dispatch::Find(target)) {
 #if TCNYC_DEV_TOOLS
         static const bool trace_audio = [] {
-            const char* flag = std::getenv("TCNYC_TEST_AUDIO_TRACE");
+            const char* flag = DevEnv("TCNYC_TEST_AUDIO_TRACE");
             return flag && std::strcmp(flag, "1") == 0;
         }();
         if (trace_audio && game::TraceAudioRefillCall(f, ctx, base)) return;

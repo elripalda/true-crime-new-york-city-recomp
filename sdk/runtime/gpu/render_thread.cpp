@@ -9,6 +9,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include "core/dev_env.h"
 #include <smmintrin.h>
 
 #include <algorithm>
@@ -102,7 +103,7 @@ uint64_t Ns(Clock::time_point t) { return uint64_t(std::chrono::duration_cast<st
 #if TCNYC_DEV_TOOLS
 bool TraceAudioWaits() {
     static const bool enabled = [] {
-        const char* flag = std::getenv("TCNYC_TEST_AUDIO_TRACE");
+        const char* flag = DevEnv("TCNYC_TEST_AUDIO_TRACE");
         return flag && std::strcmp(flag, "1") == 0;
     }();
     return enabled;

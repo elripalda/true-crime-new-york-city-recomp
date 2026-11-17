@@ -1,4 +1,5 @@
 #include "game_addresses.h"
+#include "core/dev_env.h"
 // Compatibility hooks for default.xbe (True Crime: New York City, XDK 5849).
 // A strong definition replaces the recompiled function at that address.
 // The cutscene clock and replay hooks are in timing.cpp.
@@ -87,7 +88,7 @@ X86_FUNC(sub_00293541) {
 // is made 1024 slots longer while it is empty.
 X86_EXTERN_FUNC(__imp__sub_0024C020);
 X86_FUNC(sub_0024C020) {
-    static const bool ring_fix_disabled = std::getenv("XBE_NO_STREAM_RING_FIX") != nullptr;
+    static const bool ring_fix_disabled = DevEnv("XBE_NO_STREAM_RING_FIX") != nullptr;
     if (ring_fix_disabled) return __imp__sub_0024C020(ctx, base);
     auto rv = [&](uint32_t a) { return *reinterpret_cast<volatile uint32_t *>(base + a); };
     auto wv = [&](uint32_t a, uint32_t v) { *reinterpret_cast<volatile uint32_t *>(base + a) = v; };
@@ -173,7 +174,7 @@ X86_FUNC(sub_0013C8F0) {
 // watch itself is installed by a helper thread and never changes game state.
 namespace {
 void WatchEffectSlot8IfRequested() {
-    static const bool requested = std::getenv("XBE_EFFECT_WATCH") != nullptr;
+    static const bool requested = DevEnv("XBE_EFFECT_WATCH") != nullptr;
     if (!requested || kernel::GuestWatchActive()) return;
     if (!mem::IsCommitted(TC_ADDR(0x37F8FCu))) return;
     const uint32_t renderer = kernel::R32(TC_ADDR(0x37F8FCu));

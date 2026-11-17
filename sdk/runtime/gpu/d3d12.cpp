@@ -6,6 +6,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include "core/dev_env.h"
 #include <d3d12.h>
 #include <dbghelp.h>
 #pragma comment(lib, "dbghelp.lib")
@@ -133,7 +134,7 @@ void Run(HANDLE thread) {
 
 // on the render thread, once
 void Start() {
-    if (g_started.exchange(true) || !std::getenv("TCNYC_SAMPLE")) return;
+    if (g_started.exchange(true) || !DevEnv("TCNYC_SAMPLE")) return;
     HANDLE self = nullptr;
     if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &self,
                          THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, 0))
@@ -160,7 +161,7 @@ std::string Name(uint64_t pc) {
 
 // counts since the start, written over logs/samples.txt
 void Dump() {
-    if (!g_started.load() || !std::getenv("TCNYC_SAMPLE")) return;
+    if (!g_started.load() || !DevEnv("TCNYC_SAMPLE")) return;
     static bool sym_ready = false;
     if (!sym_ready) {
         SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
@@ -239,7 +240,7 @@ namespace {
 void FlushShaderCacheWrites();
 
 bool EnvFlag(const char* name) {
-    const char* value = std::getenv(name);
+    const char* value = DevEnv(name);
     return value && *value && std::atoi(value) != 0;
 }
 
@@ -266,7 +267,7 @@ void NVSDK_CONV DlssLogCallback(const char* message, NVSDK_NGX_Logging_Level, NV
 // DLSS's convention is close enough to test from there, with per-axis overrides for the checks in
 // docs/dlss-plan.md.
 float DlssAxisSign(const char* name, float fallback) {
-    const char* value = std::getenv(name);
+    const char* value = DevEnv(name);
     return value && *value && std::atoi(value) < 0 ? -1.0f : fallback;
 }
 #endif
@@ -398,7 +399,7 @@ struct PerfScope {
 // TCNYC_TAA_VIEW=1 or 2 shows TAA's motion instead of the picture (a tuning aid; kTaaHlsl)
 int TaaView() {
     static const int view = [] {
-        const char* e = std::getenv("TCNYC_TAA_VIEW");
+        const char* e = DevEnv("TCNYC_TAA_VIEW");
         return e ? std::atoi(e) : 0;
     }();
     return view;
@@ -406,7 +407,7 @@ int TaaView() {
 
 // TCNYC_BLOOM_VIEW=1 shows only the bloom chain's output, ten times brighter (a tuning aid)
 bool BloomView() {
-    static const bool on = std::getenv("TCNYC_BLOOM_VIEW") != nullptr;
+    static const bool on = DevEnv("TCNYC_BLOOM_VIEW") != nullptr;
     return on;
 }
 
@@ -4649,7 +4650,7 @@ D3D12_SAMPLER_DESC StageSampler(const State& s, int i, const DrawTextures& stage
     sd.MipLODBias = Bits(t[kTssMipLodBias]);
     sd.MinLOD = float(t[kTssMaxMipLevel]);
     sd.MaxLOD = mip ? D3D12_FLOAT32_MAX : sd.MinLOD;
-    static const bool force_mip0 = std::getenv("XBE_FORCE_MIP0") != nullptr;  // diagnostic: top level only
+    static const bool force_mip0 = DevEnv("XBE_FORCE_MIP0") != nullptr;  // diagnostic: top level only
     if (force_mip0) sd.MaxLOD = sd.MinLOD;
     Color(t[kTssBorderColor], sd.BorderColor);
     if (stages.info[i].shadow) {
@@ -5294,7 +5295,7 @@ void D3D12Backend::CaptureDraw(const State& s, uint32_t prim, uint32_t count, co
 // small draws: their inputs and constants; then ends the draw's line
 void D3D12Backend::EndDrawCapture(const State& s, const Assembled& a, uint32_t count, const DrawConstants& c) {
     // XBE_CAPTURE_INPUTS: every draw's first vertices and constants, not only small ones
-    static const bool all_inputs = getenv("XBE_CAPTURE_INPUTS") != nullptr;
+    static const bool all_inputs = DevEnv("XBE_CAPTURE_INPUTS") != nullptr;
     if (count <= kQuadVertices || all_inputs) CaptureInputs(s, a, c);
     fputc('\n', cap_);
 }
@@ -5851,7 +5852,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     const uint32_t bsrc = SimpleState(s, kMSrcBlend), bdst = SimpleState(s, kMDestBlend);
     const bool solid = !blend_on || (bsrc == 1 && bdst == 0) || (bsrc == 0x302 && bdst == 0x303);
     // TCNYC_TRACE_MOTION=1: why the 3D scene's draws do or do not write motion, every 120 frames
-    static const bool trace_motion = std::getenv("TCNYC_TRACE_MOTION") != nullptr;
+    static const bool trace_motion = DevEnv("TCNYC_TRACE_MOTION") != nullptr;
     const bool trace_scene_draw = trace_motion && bound_rt_ && bound_rt_->gw == guest_w_ &&
                                   bound_rt_->gh == guest_h_ && bound_ds_ && !a.pretransformed;
     const char* motion_reason = nullptr;
@@ -7808,7 +7809,7 @@ bool D3D12Backend::EnsureDlss(uint32_t w, uint32_t h, uint32_t out_w, uint32_t o
     dlss_.params->Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, flags);
     dlss_.params->Set(NVSDK_NGX_Parameter_Sharpness, 0.0f);
     dlss_.params->Set(NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, 0);
-    if (const char* preset = std::getenv("TCNYC_DLSS_PRESET"); preset && *preset) {
+    if (const char* preset = DevEnv("TCNYC_DLSS_PRESET"); preset && *preset) {
         int value = 0;
         if (*preset == 'J' || *preset == 'j') value = NVSDK_NGX_DLSS_Hint_Render_Preset_J;
         else if (*preset == 'K' || *preset == 'k') value = NVSDK_NGX_DLSS_Hint_Render_Preset_K;
@@ -8043,7 +8044,7 @@ bool D3D12Backend::EnsureFsr3(uint32_t w, uint32_t h, uint32_t out_w, uint32_t o
         // The guest's scene is display-referred SDR, not linear, and there is no exposure texture.
         desc.flags |= FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
     }
-    if (std::getenv("TCNYC_TRACE_TAA")) {
+    if (DevEnv("TCNYC_TRACE_TAA")) {
         desc.flags |= FFX_UPSCALE_ENABLE_DEBUG_CHECKING;
         desc.fpMessage = [](uint32_t, const wchar_t* message) { LOGR("FSR: %ls", message); };
     }
@@ -8226,7 +8227,7 @@ ID3D12Resource* D3D12Backend::ApplyTaa(Target& t) {
     }
     const SceneDepth& sd = depth->second;
     // TCNYC_TRACE_TAA=1: the inputs, every 30th frame
-    static const bool trace = std::getenv("TCNYC_TRACE_TAA") != nullptr;
+    static const bool trace = DevEnv("TCNYC_TRACE_TAA") != nullptr;
     if (trace && (presents_ % 30 == 0 || (reset && taa_.valid))) {
         const float* v = cam.view;
         LOGR("taa: frame %llu serial %llu prev %llu reset %d xs %.4f ys %.4f pxs %.4f pys %.4f near %.3f far %.3f "
@@ -8465,7 +8466,7 @@ void D3D12Backend::ReleaseOldTextures() {
 }
 
 void D3D12Backend::InitFsr3Profile() {
-    if (!std::getenv("TCNYC_PROFILE_FSR3")) return;
+    if (!DevEnv("TCNYC_PROFILE_FSR3")) return;
     const D3D12_QUERY_HEAP_DESC queries{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, kFrames * kFsrProfileQueries, 0};
     const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_READBACK};
     const auto buffer = BufferDesc(uint64_t(queries.Count) * sizeof(uint64_t));
@@ -8619,7 +8620,7 @@ void D3D12Backend::Present(const Surface& front) {
     if (defer_scene_) FlushDeferredScene();
     // Diagnostic: TCNYC_CAPTURE_AT=<frame> starts an F3-style capture without input.
     static const long capture_at = [] {
-        const char* e = std::getenv("TCNYC_CAPTURE_AT");
+        const char* e = DevEnv("TCNYC_CAPTURE_AT");
         return e ? std::atol(e) : 0;
     }();
     if (capture_at > 0 && frame_ == uint64_t(capture_at)) g_capture.store(true);
@@ -9310,7 +9311,7 @@ void D3D12Backend::CapSave(Target& t, const char* name) {
 void D3D12Backend::CapStep(const Surface& rt) {
     uint32_t d = rt.header ? mem::VirtualFromPhysical(rt.data) : 0;
     // XBE_CAPTURE_EVERY=<n>: also save the current target every n draws, to find the draw that changes it
-    static const uint32_t every = [] { const char* v = std::getenv("XBE_CAPTURE_EVERY"); return v ? uint32_t(std::atoi(v)) : 0u; }();
+    static const uint32_t every = [] { const char* v = DevEnv("XBE_CAPTURE_EVERY"); return v ? uint32_t(std::atoi(v)) : 0u; }();
     if (every && d == cap_rt_ && cap_i_ && cap_i_ % every == 0) {
         auto cur = targets_.find(TargetMapKey(cap_rt_, false));
         if (cur != targets_.end()) {
