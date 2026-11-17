@@ -24,6 +24,7 @@
 #include <toml++/toml.hpp>
 
 #include "app/app.h"
+#include "app/game_source.h"
 #include "core/input.h"
 #include "core/log.h"
 #include "hook_exports.h"
@@ -163,7 +164,7 @@ bool Sha1File(const fs::path& path, std::string& out) {
 
 // Stamp format shared with the CMake build: host, XBE, DLL hashes.
 bool StampFor(const Image& image, const std::vector<uint8_t>& xbe, std::string& stamp) {
-    if (!Sha1File(ExeDir() / (image.exe + L".exe"), stamp)) return false;
+    if (!Sha1File(ExeFolder() / (image.exe + L".exe"), stamp)) return false;
     stamp += " " + Sha1(xbe);
     return true;
 }
@@ -265,7 +266,7 @@ bool CacheKey(const Image& image, std::string& out) {
     KeyField(key, "game-code object cache 1");
     KeyField(key, Narrow(kClangFlags));
     KeyField(key, Narrow(kLinkFlags));
-    KeyFile(key, "host", ExeDir() / (image.exe + L".exe"));
+    KeyFile(key, "host", ExeFolder() / (image.exe + L".exe"));
     for (const wchar_t* tool : {L"clang.exe", L"lld-link.exe", L"xbe_recomp.exe", L"grid_patch.exe"})
         KeyFile(key, Narrow(tool), CompilerDir() / tool);
     KeyFile(key, "shared", WorkDir(image) / "x86_recomp_shared.h");
@@ -776,7 +777,7 @@ bool SharedCompiler() {
 #ifdef TCNYC_PAL
     return fs::is_regular_file(ExeDir() / "TrueCrimeNYC.exe", ec);
 #else
-    return fs::is_regular_file(ExeDir() / "TrueCrimeNYCPAL.exe", ec);
+    return fs::is_regular_file(ExeDir() / kRegionsFolder / "TrueCrimeNYCPAL.exe", ec);
 #endif
 }
 
