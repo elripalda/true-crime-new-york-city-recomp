@@ -110,7 +110,11 @@ float RenderStretch(uint32_t guest_width, uint32_t guest_height);
 // AspectRatio is 3:2 or wider: the console reports a widescreen TV (read by titles at boot)
 bool Widescreen();
 
+// The region game executables live in <install>/regions/ (app/game_source.h, kRegionsFolder). ExeDir is the
+// install folder for settings, saves, the game files and compiler/; ExeFolder is the executable's own folder,
+// where its compiled game code is kept.
 std::filesystem::path ExeDir();
+std::filesystem::path ExeFolder();
 // the game in assets (game_files.cpp): its folder and this executable's xbe, from the extracted files or a disc
 // image (.iso), which it mounts as D:; false after telling the player what is missing, with error set for hosts
 // that show it themselves

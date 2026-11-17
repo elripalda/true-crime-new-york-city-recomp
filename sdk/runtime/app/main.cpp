@@ -26,6 +26,7 @@
 #include <backends/imgui_impl_win32.h>
 
 #include "app/app.h"
+#include "app/game_source.h"
 #include "core/input.h"
 #include "core/log.h"
 #include "gpu/backend.h"
@@ -389,7 +390,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 }  // namespace
 
-std::filesystem::path ExeDir() {
+std::filesystem::path ExeFolder() {
     std::vector<wchar_t> p(MAX_PATH);
     for (;;) {
         const DWORD n = GetModuleFileNameW(nullptr, p.data(), DWORD(p.size()));
@@ -398,6 +399,8 @@ std::filesystem::path ExeDir() {
         p.resize(p.size() * 2);
     }
 }
+
+std::filesystem::path ExeDir() { return InstallRootFor(ExeFolder()); }
 
 // Hardware write watchpoint diagnostic (XBE_EFFECT_WATCH). The exception carries the host instruction that
 // performed the write; logging the module offset lets it be symbolized against the shipped PDB. The guest

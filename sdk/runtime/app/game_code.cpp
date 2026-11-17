@@ -119,9 +119,9 @@ std::vector<Image> Images() {
 }
 
 fs::path WorkDir(const Image& image) { return CompilerDir() / "work" / image.exe; }
-fs::path CodeDll(const Image& image) { return ExeDir() / (image.exe + L".dll"); }
+fs::path CodeDll(const Image& image) { return ExeFolder() / (image.exe + L".dll"); }
 // Beside the DLL, not in the compiler work folder: a release deletes that folder after the first run.
-fs::path StampFile(const Image& image) { return ExeDir() / (image.exe + L".dll.stamp"); }
+fs::path StampFile(const Image& image) { return ExeFolder() / (image.exe + L".dll.stamp"); }
 std::wstring Quote(const fs::path& path) { return L"\"" + path.wstring() + L"\""; }
 fs::path CompileLog() {
 #if TCNYC_PAL_EU

@@ -50,13 +50,13 @@ constexpr std::string_view kRepo = "roz1077/true-crime-new-york-city-recomp";
 #ifdef _WIN32
 constexpr char kAsset[] = "TrueCrimeNYC.zip";
 constexpr char kExecutable[] = "TrueCrimeNYC.exe";
-constexpr char kPalExecutable[] = "TrueCrimeNYCPAL.exe";
-constexpr char kPalEuExecutable[] = "TrueCrimeNYCPALEU.exe";
+constexpr char kPalExecutable[] = "regions/TrueCrimeNYCPAL.exe";
+constexpr char kPalEuExecutable[] = "regions/TrueCrimeNYCPALEU.exe";
 #else
 constexpr char kAsset[] = "TrueCrimeNYC-linux-x86_64.tar.gz";
 constexpr char kExecutable[] = "TrueCrimeNYC";
-constexpr char kPalExecutable[] = "TrueCrimeNYCPAL";
-constexpr char kPalEuExecutable[] = "TrueCrimeNYCPALEU";
+constexpr char kPalExecutable[] = "regions/TrueCrimeNYCPAL";
+constexpr char kPalEuExecutable[] = "regions/TrueCrimeNYCPALEU";
 #endif
 constexpr uint64_t kArchiveLimit = 1ull << 30;
 
@@ -72,7 +72,8 @@ std::string Utf8(const fs::path& path) {
 fs::path BaseDir() {
     const char* path = SDL_GetBasePath();
     if (!path || !*path) throw std::runtime_error("Could not locate the installation.");
-    return fs::canonical(PathFromUtf8(path));
+    // A PAL game executable in regions/ works on the install folder above it.
+    return app::InstallRootFor(fs::canonical(PathFromUtf8(path)));
 }
 
 fs::path ExecutablePath() {
@@ -1063,7 +1064,7 @@ void Updater::DoDownload() {
 
 namespace {
 fs::path PalExecutable(app::GameRegion region) {
-    return BaseDir() / (region == app::GameRegion::PalEu ? kPalEuExecutable : kPalExecutable);
+    return BaseDir() / PathFromUtf8(region == app::GameRegion::PalEu ? kPalEuExecutable : kPalExecutable);
 }
 }
 

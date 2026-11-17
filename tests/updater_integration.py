@@ -131,9 +131,10 @@ shutil.copyfile(os.environ["TCNYC_FIXTURE_" + key], args[args.index("-o") + 1])
         (payload / "HDD2" / "save").write_bytes(b"package data")
         (payload / "hdd-pal").mkdir()
         (payload / "hdd-pal" / "save").write_bytes(b"package data")
-        pal_exe = "TrueCrimeNYCPAL.exe" if WINDOWS else "TrueCrimeNYCPAL"
+        (payload / "regions").mkdir()
+        pal_exe = "regions/TrueCrimeNYCPAL.exe" if WINDOWS else "regions/TrueCrimeNYCPAL"
         (payload / pal_exe).write_bytes(b"new PAL executable")
-        pal_eu_exe = "TrueCrimeNYCPALEU.exe" if WINDOWS else "TrueCrimeNYCPALEU"
+        pal_eu_exe = "regions/TrueCrimeNYCPALEU.exe" if WINDOWS else "regions/TrueCrimeNYCPALEU"
         (payload / pal_eu_exe).write_bytes(b"new PAL EU executable")
         (payload / "hdd-pal-eu").mkdir()
         (payload / "hdd-pal-eu" / "save").write_bytes(b"package data")
@@ -169,6 +170,7 @@ shutil.copyfile(os.environ["TCNYC_FIXTURE_" + key], args[args.index("-o") + 1])
             (root / "hdd2" / "save").write_bytes(b"user save")
             (root / "hdd-pal").mkdir()
             (root / "hdd-pal" / "save").write_bytes(b"PAL user save")
+            (root / "regions").mkdir()
             (root / pal_exe).write_bytes(b"old PAL executable")
             (root / pal_eu_exe).write_bytes(b"old PAL EU executable")
             (root / "hdd-pal-eu").mkdir()

@@ -54,8 +54,9 @@ set(IMGUI_SRC
     "${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp"
     "${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp")
 # the package carries libshaderc beside the binary; the rpath makes it win over the host's
-set(CMAKE_BUILD_RPATH "$ORIGIN/lib")
-set(CMAKE_INSTALL_RPATH "$ORIGIN/lib")
+# $ORIGIN/../lib: the PAL game executables run from regions/ beside lib/.
+set(CMAKE_BUILD_RPATH "$ORIGIN/lib:$ORIGIN/../lib")
+set(CMAKE_INSTALL_RPATH "$ORIGIN/lib:$ORIGIN/../lib")
 
 include("${REPO}/sdk/cmake/GuestManifest.cmake")
 file(STRINGS "${REPO}/config/${GAME_CONFIG}" partition_setting REGEX "^partitions *=")

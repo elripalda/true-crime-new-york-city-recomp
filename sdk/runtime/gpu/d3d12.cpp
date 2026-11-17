@@ -3129,11 +3129,11 @@ const std::filesystem::path& ShaderCacheDirectory() {
         if (!fingerprint) return {};
         wchar_t path[MAX_PATH];
         DWORD count;
-        count = GetModuleFileNameW(nullptr, path, MAX_PATH);
-        if (!count || count == MAX_PATH) return {};
+        (void)path;
+        (void)count;
         char name[24];
         std::snprintf(name, sizeof(name), "%016llX", static_cast<unsigned long long>(fingerprint));
-        return std::filesystem::path(path).parent_path() / "shader-cache" / "v1" / name;
+        return app::ExeDir() / "shader-cache" / "v1" / name;
     }();
     return directory;
 }

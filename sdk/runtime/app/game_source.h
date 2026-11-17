@@ -6,6 +6,12 @@
 namespace app {
 
 enum class GameRegion { Unknown, Ntsc, Pal, PalEu };
+
+// The PAL game executables ship in this subfolder of the install; the launcher in the install folder starts them.
+inline constexpr char kRegionsFolder[] = "regions";
+inline std::filesystem::path InstallRootFor(const std::filesystem::path& exe_folder) {
+    return exe_folder.filename() == kRegionsFolder ? exe_folder.parent_path() : exe_folder;
+}
 constexpr bool IsPal(GameRegion region) { return region == GameRegion::Pal || region == GameRegion::PalEu; }
 
 // The Xbox executables Beta 4 supports. They are public identifiers, not game

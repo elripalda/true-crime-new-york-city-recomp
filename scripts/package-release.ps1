@@ -239,8 +239,10 @@ try {
         Add-ReleaseDirectory 'LICENSES/'
         Add-ReleaseDirectory 'music/'  # the default custom music folder, empty
         Add-ReleaseFile $exe 'TrueCrimeNYC.exe'
-        Add-ReleaseFile $palExe 'TrueCrimeNYCPAL.exe'
-        Add-ReleaseFile $palEuExe 'TrueCrimeNYCPALEU.exe'
+        # The PAL game executables sit in regions/; TrueCrimeNYC.exe starts the one that matches the disc.
+        Add-ReleaseDirectory 'regions/'
+        Add-ReleaseFile $palExe 'regions/TrueCrimeNYCPAL.exe'
+        Add-ReleaseFile $palEuExe 'regions/TrueCrimeNYCPALEU.exe'
         Add-ReleaseFile (Join-Path $root 'README.md') 'README.md'
         Add-ReleaseFile (Join-Path $root 'README-LINUX.md') 'README-LINUX.md'
         Add-ReleaseFile (Join-Path $root 'CHANGELOG.md') 'CHANGELOG.md'
@@ -276,6 +278,7 @@ try {
             $runtime = Join-Path $RuntimeDir $name
             Add-ReleaseFile $runtime $name
             Add-ReleaseFile $runtime "compiler/$name"
+            Add-ReleaseFile $runtime "regions/$name"  # Windows loads these from the executable's own folder
         }
 
         $buildText = "True Crime: New York City - Windows build`nVersion: $version`nGit: $git`nBuilt: $($entryTime.ToString('yyyy-MM-ddTHH:mm:ssZ'))`n"

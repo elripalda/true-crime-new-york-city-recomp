@@ -16,6 +16,7 @@
 #include <SDL3/SDL.h>
 
 #include "app/app.h"
+#include "app/game_source.h"
 #include "core/log.h"
 
 // app_sdl.cpp -> platform/linux/backend_sw.cpp
@@ -266,7 +267,7 @@ void SetMsaaSamples(uint32_t samples) {
     Get().msaa = samples;
 }
 
-std::filesystem::path ExeDir() {
+std::filesystem::path ExeFolder() {
     static const std::filesystem::path dir = [] {
         std::error_code ec;
         const auto exe = std::filesystem::read_symlink("/proc/self/exe", ec);
@@ -274,6 +275,8 @@ std::filesystem::path ExeDir() {
     }();
     return dir;
 }
+
+std::filesystem::path ExeDir() { return InstallRootFor(ExeFolder()); }
 
 int Instance() {
     static const int n = [] {

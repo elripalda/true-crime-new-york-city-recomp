@@ -66,13 +66,14 @@ STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 
 PKG="$STAGE/$NAME"
-mkdir -p "$PKG/lib" "$PKG/assets" "$PKG/LICENSES" "$PKG/music"  # music: the default custom music folder
+mkdir -p "$PKG/lib" "$PKG/assets" "$PKG/LICENSES" "$PKG/music" "$PKG/regions"  # music: the default custom music folder
 
 # the release binary: no debug tables, the rpath already points at $ORIGIN/lib
 install -m 0755 "$BUILD/TrueCrimeNYC" "$PKG/TrueCrimeNYC"
-install -m 0755 "$PAL_BUILD/TrueCrimeNYC" "$PKG/TrueCrimeNYCPAL"
-install -m 0755 "$PAL_EU_BUILD/TrueCrimeNYC" "$PKG/TrueCrimeNYCPALEU"
-strip --strip-unneeded "$PKG/TrueCrimeNYC" "$PKG/TrueCrimeNYCPAL" "$PKG/TrueCrimeNYCPALEU"
+# The PAL game executables sit in regions/; TrueCrimeNYC starts the one that matches the disc.
+install -m 0755 "$PAL_BUILD/TrueCrimeNYC" "$PKG/regions/TrueCrimeNYCPAL"
+install -m 0755 "$PAL_EU_BUILD/TrueCrimeNYC" "$PKG/regions/TrueCrimeNYCPALEU"
+strip --strip-unneeded "$PKG/TrueCrimeNYC" "$PKG/regions/TrueCrimeNYCPAL" "$PKG/regions/TrueCrimeNYCPALEU"
 
 SHADERC=$(ldconfig -p 2>/dev/null | awk '/libshaderc\.so\.1 /{print $NF; exit}' || true)
 if [ -z "$SHADERC" ]; then
@@ -96,7 +97,7 @@ fi
 # Every dependency of the release binary must resolve with the bundled lib/
 # directory in the search path. glibc, libstdc++ and libgcc are intentionally
 # not bundled; they come from the target system.
-for executable in "$PKG/TrueCrimeNYC" "$PKG/TrueCrimeNYCPAL" "$PKG/TrueCrimeNYCPALEU"; do
+for executable in "$PKG/TrueCrimeNYC" "$PKG/regions/TrueCrimeNYCPAL" "$PKG/regions/TrueCrimeNYCPALEU"; do
     if ! LD_LIBRARY_PATH="$PKG/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
             ldd "$executable" > "$STAGE/ldd.txt" 2>&1; then
         echo "ldd failed for $executable:" >&2
@@ -156,7 +157,7 @@ The extracted files are used when both are present. No game assets are included
 in this package.
 EOF
 
-GLIBC=$(objdump -T "$PKG/TrueCrimeNYC" "$PKG/TrueCrimeNYCPAL" "$PKG/TrueCrimeNYCPALEU" | grep -oE 'GLIBC_[0-9.]+' | sort -V | tail -1 || true)
+GLIBC=$(objdump -T "$PKG/TrueCrimeNYC" "$PKG/regions/TrueCrimeNYCPAL" "$PKG/regions/TrueCrimeNYCPALEU" | grep -oE 'GLIBC_[0-9.]+' | sort -V | tail -1 || true)
 [ -n "$GLIBC" ] || GLIBC=unknown
 {
     echo "True Crime: New York City - native Linux build"
@@ -174,7 +175,7 @@ for licence in "$PKG"/LICENSES/*; do
         chmod 0644 "$licence"
     fi
 done
-chmod 0755 "$PKG" "$PKG/lib" "$PKG/assets" "$PKG/LICENSES"
+chmod 0755 "$PKG" "$PKG/lib" "$PKG/assets" "$PKG/LICENSES" "$PKG/regions"
 
 mkdir -p "$OUT"
 if [[ -n $(find "$PKG" -type f \( -iname '*.xbe' -o -iname '*.iso' \) -print -quit) ]]; then

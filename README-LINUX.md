@@ -36,7 +36,8 @@ Each region has its own saves and settings.
 The package also contains:
 
 - `TrueCrimeNYC`: the launcher and NTSC executable.
-- `TrueCrimeNYCPAL` and `TrueCrimeNYCPALEU`: the two PAL executables started by the launcher.
+- `regions/TrueCrimeNYCPAL` and `regions/TrueCrimeNYCPALEU`: the two PAL game executables. Always start
+  `TrueCrimeNYC`; it starts the one that matches your disc.
 - `lib/libshaderc.so.1`: the bundled shader compiler, loaded from beside the
   executable.
 - `README.md`, `README-LINUX.md`, `BUILD.txt` and `THIRD_PARTY.txt`.
