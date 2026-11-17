@@ -1,4 +1,7 @@
 <h1 align="center">
+
+<a href="https://recomplauncher.com/game/true-crime-new-york-city-recomp"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
+
   <img src="docs/banner.png" alt="True Crime: New York City — Xbox Recomp" width="100%">
 </h1>
 
