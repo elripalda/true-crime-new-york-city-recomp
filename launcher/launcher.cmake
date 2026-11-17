@@ -19,6 +19,8 @@ function(tcnyc_add_launcher target)
     target_compile_definitions(${target} PRIVATE TCNYC_VERSION="${version}")
     set(pal_xbe "${launcher_dir}/../assets-pal/default.xbe")
     if(NOT TCNYC_PAL AND EXISTS "${pal_xbe}")
+        # Detection uses the public SHA-1s in app/game_source.h. These definitions
+        # tell the updater that the package bundles the PAL executables.
         set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${pal_xbe}")
         file(SHA1 "${pal_xbe}" pal_sha1)
         target_compile_definitions(${target} PRIVATE TCNYC_PAL_SHA1="${pal_sha1}")

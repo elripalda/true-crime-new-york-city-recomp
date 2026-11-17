@@ -12,6 +12,10 @@ if(BUILD_TESTING)
     target_include_directories(tcnyc_controller_look_test PRIVATE "${TCNYC_REPO}/src")
     add_test(NAME controller_look COMMAND tcnyc_controller_look_test)
 
+    add_executable(tcnyc_game_source_test "${TCNYC_REPO}/tests/game_source.cpp")
+    target_include_directories(tcnyc_game_source_test PRIVATE "${TCNYC_REPO}/sdk/runtime")
+    add_test(NAME game_source COMMAND tcnyc_game_source_test)
+
     add_executable(tcnyc_guest_format_test "${TCNYC_REPO}/tests/guest_format.cpp")
     target_include_directories(tcnyc_guest_format_test PRIVATE "${TCNYC_REPO}/sdk/runtime")
     add_test(NAME guest_format COMMAND tcnyc_guest_format_test)

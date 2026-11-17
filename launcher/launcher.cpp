@@ -12,6 +12,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -54,6 +55,10 @@ constexpr unsigned char kBanner[] = {
 std::string Utf8(const fs::path &path) {
     auto bytes = path.u8string();
     return {bytes.begin(), bytes.end()};
+}
+
+fs::path FromUtf8(std::string_view text) {
+    return fs::path(std::u8string(text.begin(), text.end()));
 }
 
 fs::path PreferencesPath() {
@@ -823,7 +828,7 @@ bool DrawLauncher(SDL_Window *window, SDL_Renderer *renderer, float scale, app::
         check_updates = prefs["check_updates"].value_or(true);
         skip_version = prefs["skip_version"].value_or(std::string{});
         prefer_pal = prefs["prefer_pal"].value_or(false);
-#ifdef TCNYC_PAL_SHA1
+#ifndef TCNYC_PAL
         if (!prefs.contains("iso")) {
             const auto pal_prefs = app::ReadSettingsTable(preferences.parent_path() / "launcher-pal.toml");
             iso = pal_prefs["iso"].value_or(std::string{});
@@ -846,7 +851,7 @@ bool DrawLauncher(SDL_Window *window, SDL_Renderer *renderer, float scale, app::
         }
     };
     const auto detect = [&] {
-        const auto path = fs::u8path(iso);
+        const auto path = FromUtf8(iso);
         return app::DetectGameSource(path, prefer_pal);
     };
     auto detected = detect();
@@ -1031,7 +1036,7 @@ bool DrawLauncher(SDL_Window *window, SDL_Renderer *renderer, float scale, app::
                     refresh_source = true;
                     notice.clear();
                 }
-#if defined(TCNYC_PAL_SHA1) || defined(TCNYC_PAL_EU_SHA1)
+#ifndef TCNYC_PAL
                 if (iso.empty() && (PalInstalled(app::GameRegion::Pal) || PalInstalled(app::GameRegion::PalEu))) {
                     ImGui::SameLine();
                     ImGui::Checkbox("Prefer PAL from local assets", &prefer_pal);
@@ -1042,7 +1047,7 @@ bool DrawLauncher(SDL_Window *window, SDL_Renderer *renderer, float scale, app::
                     ImGui::TextDisabled("%s", iso.empty() ? "Choose a supported Xbox ISO or extracted game folder."
                                                             : "This path has no supported Xbox disc.");
                 else if (detected.region == app::GameRegion::PalEu)
-                    ImGui::TextUnformatted("Detected: European PAL");
+                    ImGui::TextUnformatted("Detected: European PAL (other disc)");
                 else
                     ImGui::Text("Detected: %s", detected.region == app::GameRegion::Pal ? "European PAL (Fr/Es/It)" : "US NTSC");
                 ImGui::Spacing();

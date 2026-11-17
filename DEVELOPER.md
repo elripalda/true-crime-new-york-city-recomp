@@ -161,6 +161,13 @@ profile uses `-DTCNYC_PAL_EU=ON` and the Windows-generated `generated/game-pal-e
 Both PAL profiles use the same PAL timing and gameplay code with image-specific
 addresses. PAL EU uses its own `settings-pal-eu.toml` and `hdd-pal-eu/`.
 
+The launcher detects either PAL disc from an ISO, a folder, or local `assets/`
+and `assets-pal*/` folders. The supported XBE SHA-1s live in
+`sdk/runtime/app/game_source.h`, so an NTSC build can identify both PAL discs
+even when the PAL images are not present at configure time. A PAL build only
+starts its own profile. `build-pal.bat` still needs the matching XBE to compile
+that profile.
+
 For the Windows release, `release.bat` builds all three profiles. The package
 includes their host executables and shared compiler tools. Windows players
 compile the game code for each disc build on first use.

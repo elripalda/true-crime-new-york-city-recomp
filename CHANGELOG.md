@@ -32,6 +32,7 @@
 ### Launcher
 - A Music tab: explains custom songs, opens the music folder, and can point the game at another one.
 - Redesigned in the game's night-city look, with every graphics option grouped into sections.
+- The launcher recognises both PAL discs from an ISO or extracted folder even in a build made without the PAL game images present. A source build still needs the matching PAL executable to play them.
 - Checks GitHub for a newer release and can download, verify (SHA-256) and install it, then restart.
   Settings, game files and textures are never touched. Turn it off on the Play tab.
 

@@ -164,21 +164,8 @@ GameSource DetectGameSource(const fs::path& location, bool prefer_pal) {
         const auto path = fs::canonical(candidate, ec);
         if (ec || !ReadSource(path, xbe, disc)) continue;
         const auto hash = Sha1(xbe);
-        GameRegion region = GameRegion::Unknown;
-#if TCNYC_PAL_EU
-        if (hash == kImageSha1) region = GameRegion::PalEu;
-#elif defined(TCNYC_PAL)
-        if (hash == kImageSha1) region = GameRegion::Pal;
-#else
-        if (hash == kImageSha1) region = GameRegion::Ntsc;
-#ifdef TCNYC_PAL_SHA1
-        if (hash == TCNYC_PAL_SHA1) region = GameRegion::Pal;
-#endif
-#ifdef TCNYC_PAL_EU_SHA1
-        if (hash == TCNYC_PAL_EU_SHA1) region = GameRegion::PalEu;
-#endif
-#endif
-        if (region == GameRegion::Unknown) continue;
+        const GameRegion region = RegionForImageSha1(hash);
+        if (!CanLaunchRegion(BuildRegion(), region)) continue;
         if (first.region == GameRegion::Unknown) first = {path, region};
         if (!location.empty() || IsPal(region) == prefer_pal) return {path, region};
     }
