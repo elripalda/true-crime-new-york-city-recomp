@@ -155,6 +155,16 @@ gameplay and cutscenes. Record and replay with the same region.
 `XBE_NO_STREAM_RING_FIX=1` runs the PAL build without the stream callback-ring
 growth, for bisecting streaming problems.
 
+The second European disc uses the `pal-eu` profile. Extract its unmodified
+`default.xbe` into `assets-pal-eu/`, then run `build-pal.bat eu`. The Linux
+profile uses `-DTCNYC_PAL_EU=ON` and the Windows-generated `generated/game-pal-eu`.
+Both PAL profiles use the same PAL timing and gameplay code with image-specific
+addresses. PAL EU uses its own `settings-pal-eu.toml` and `hdd-pal-eu/`.
+
+For the Windows release, `release.bat` builds all three profiles. The package
+includes their host executables and shared compiler tools. Windows players
+compile the game code for each disc build on first use.
+
 ## Linux builds and host tests
 
 Regenerate the guest code for the region in a Windows build shell before configuring
@@ -168,6 +178,8 @@ cmake --build --preset release --target recompile_TrueCrimeNYC
 On Linux, configure `platform/linux` with SDL3, Vulkan and shaderc available. Pass
 `-DTCNYC_PAL=ON` for the PAL build. Configure compares the recorded input and output
 hashes with the files on disk and reports which region needs regeneration.
+Pass the NTSC, output, Fr/Es/It PAL, and second PAL directories to
+`scripts/package-linux.sh <ntsc-build> <output> <pal-build> <pal-eu-build>`.
 
 With `BUILD_TESTING` enabled, build the tests and run
 `ctest --test-dir <build-directory> --output-on-failure`. The settings and release

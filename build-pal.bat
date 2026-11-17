@@ -6,12 +6,19 @@ set "PF86=%ProgramFiles(x86)%"
 set "VSINST=%PF86%\Microsoft Visual Studio\Installer"
 set "VSWHERE=%VSINST%\vswhere.exe"
 set "PRESET=pal"
+set "PAL_ASSETS=assets-pal"
+set "GAME_EXE=TrueCrimeNYCPAL.exe"
 if /i "%~1"=="dev" set "PRESET=pal-dev"
+if /i "%~1"=="eu" (
+    set "PRESET=pal-eu"
+    set "PAL_ASSETS=assets-pal-eu"
+    set "GAME_EXE=TrueCrimeNYCPALEU.exe"
+)
 set "OUT=%CD%\out\build\%PRESET%"
 
-if not exist assets-pal\default.xbe (
-    echo   Put the European default.xbe in assets-pal first.
-    echo     %CD%\assets-pal\default.xbe
+if not exist "%PAL_ASSETS%\default.xbe" (
+    echo   Put the matching European default.xbe in %PAL_ASSETS% first.
+    echo     %CD%\%PAL_ASSETS%\default.xbe
     if not defined CI pause
     exit /b 1
 )
@@ -30,7 +37,7 @@ if exist "%ProgramFiles%\LLVM\bin\clang++.exe" set "PATH=%ProgramFiles%\LLVM\bin
 cmake --preset %PRESET% || goto :fail
 cmake --build "%OUT%" --parallel || goto :fail
 echo.
-echo   PAL build finished: %OUT%\TrueCrimeNYC.exe
+echo   PAL build finished: %OUT%\%GAME_EXE%
 if not defined CI pause
 exit /b 0
 

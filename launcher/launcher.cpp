@@ -57,7 +57,9 @@ std::string Utf8(const fs::path &path) {
 }
 
 fs::path PreferencesPath() {
-#ifdef TCNYC_PAL
+#if TCNYC_PAL_EU
+    constexpr char name[] = "launcher-pal-eu.toml";
+#elif defined(TCNYC_PAL)
     constexpr char name[] = "launcher-pal.toml";
 #else
     constexpr char name[] = "launcher.toml";
@@ -811,19 +813,23 @@ void Theme(float scale) {
     c[ImGuiCol_CheckMark] = c[ImGuiCol_NavHighlight] = {1.0f, 0.82f, 0.48f, 1};
 }
 
-bool DrawLauncher(SDL_Window *window, SDL_Renderer *renderer, float scale, fs::path &location) {
-    app::Load();
-    Graphics graphics{app::Snapshot()};
-    graphics.window = window;
-    graphics.FindResolutions(window);
+bool DrawLauncher(SDL_Window *window, SDL_Renderer *renderer, float scale, app::GameSource& source) {
     const auto preferences = PreferencesPath();
     std::string iso, remembered_iso, notice, skip_version;
-    bool error = false, check_updates = true;
+    bool error = false, check_updates = true, prefer_pal = false;
     try {
         const auto prefs = app::ReadSettingsTable(preferences);
         iso = remembered_iso = prefs["iso"].value_or(std::string{});
         check_updates = prefs["check_updates"].value_or(true);
         skip_version = prefs["skip_version"].value_or(std::string{});
+        prefer_pal = prefs["prefer_pal"].value_or(false);
+#ifdef TCNYC_PAL_SHA1
+        if (!prefs.contains("iso")) {
+            const auto pal_prefs = app::ReadSettingsTable(preferences.parent_path() / "launcher-pal.toml");
+            iso = pal_prefs["iso"].value_or(std::string{});
+            prefer_pal = !iso.empty();
+        }
+#endif
     } catch (const std::exception &) {
         notice = "Could not read the saved disc path.";
         error = true;
@@ -839,6 +845,23 @@ bool DrawLauncher(SDL_Window *window, SDL_Renderer *renderer, float scale, fs::p
             error = true;
         }
     };
+    const auto detect = [&] {
+        const auto path = fs::u8path(iso);
+        return app::DetectGameSource(path, prefer_pal);
+    };
+    auto detected = detect();
+    auto checked_path = iso;
+    bool checked_preference = prefer_pal, refresh_source = false;
+    auto editing_region = detected.region;
+    if (editing_region == app::GameRegion::Unknown && prefer_pal) editing_region = app::GameRegion::Pal;
+    toml::table defaults;
+    app::FullSettingsTable(defaults);
+    app::SelectGameSettings(editing_region);
+    app::Load();
+    Graphics graphics{app::Snapshot()};
+    graphics.window = window;
+    graphics.FindResolutions(window);
+
     Updater updater;
     updater.AdoptStaged();
     if (check_updates) updater.Check();
@@ -996,20 +1019,32 @@ bool DrawLauncher(SDL_Window *window, SDL_Renderer *renderer, float scale, fs::p
             if (ImGui::BeginTabItem("  PLAY  ")) {
                 ImGui::Spacing();
                 Headline("CASE FILE: THE DISC");
-                ImGui::TextDisabled("Point the precinct at your Xbox disc image, or drop the .iso on this window.");
+                ImGui::TextDisabled("Choose or drop an Xbox disc image or extracted game folder.");
                 ImGui::Spacing();
                 ImGui::BeginDisabled(picking);
                 ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 114 * scale);
-                if (ImGui::InputTextWithHint("##iso", "Path to your Xbox ISO", &iso)) notice.clear();
+                if (ImGui::InputTextWithHint("##iso", "Path to an Xbox ISO or extracted folder", &iso)) notice.clear();
                 ImGui::SameLine();
                 if (ImGui::Button("Browse...", {102 * scale, 0})) Browse(window, picker);
                 if (ImGui::Button("Use local assets")) {
                     iso.clear();
+                    refresh_source = true;
                     notice.clear();
                 }
+#if defined(TCNYC_PAL_SHA1) || defined(TCNYC_PAL_EU_SHA1)
+                if (iso.empty() && (PalInstalled(app::GameRegion::Pal) || PalInstalled(app::GameRegion::PalEu))) {
+                    ImGui::SameLine();
+                    ImGui::Checkbox("Prefer PAL from local assets", &prefer_pal);
+                }
+#endif
                 ImGui::EndDisabled();
-                ImGui::TextDisabled("%s", iso.empty() ? "The game will look for an ISO or extracted files in assets/."
-                                                      : "The game will mount this ISO directly.");
+                if (detected.region == app::GameRegion::Unknown)
+                    ImGui::TextDisabled("%s", iso.empty() ? "Choose a supported Xbox ISO or extracted game folder."
+                                                            : "This path has no supported Xbox disc.");
+                else if (detected.region == app::GameRegion::PalEu)
+                    ImGui::TextUnformatted("Detected: European PAL");
+                else
+                    ImGui::Text("Detected: %s", detected.region == app::GameRegion::Pal ? "European PAL (Fr/Es/It)" : "US NTSC");
                 ImGui::Spacing();
                 if (ImGui::Checkbox("Check for updates when the launcher opens", &check_updates)) {
                     save_pref("check_updates", check_updates);
@@ -1074,7 +1109,7 @@ bool DrawLauncher(SDL_Window *window, SDL_Renderer *renderer, float scale, fs::p
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, {0.92f, 0.16f, 0.20f, 1});
         ImGui::PushStyleColor(ImGuiCol_ButtonActive, {0.55f, 0.05f, 0.10f, 1});
         ImGui::PushStyleColor(ImGuiCol_Border, {1, 0.82f, 0.48f, 0.9f});
-        ImGui::BeginDisabled(picking || updating);
+        ImGui::BeginDisabled(picking || updating || detected.region == app::GameRegion::Unknown);
         if (g_button) ImGui::PushFont(g_button);
         const bool launch = ImGui::Button("HIT THE STREETS", {152 * scale, 38 * scale});
         if (g_button) ImGui::PopFont();
@@ -1082,28 +1117,49 @@ bool DrawLauncher(SDL_Window *window, SDL_Renderer *renderer, float scale, fs::p
         ImGui::PopStyleColor(4);
         ImGui::End();
 
-        if (save || launch) {
-            try {
-                auto chosen = launch && !iso.empty()
-                                  ? fs::absolute(fs::path(reinterpret_cast<const char8_t *>(iso.c_str())))
-                                  : fs::path{};
-                notice = launch && !chosen.empty() ? app::ValidateGameIso(chosen) : "";
-                error = !notice.empty();
-                if (!error) {
+        try {
+            if (launch || refresh_source || checked_path != iso || checked_preference != prefer_pal) {
+                auto next = detect();
+                if (next.region != app::GameRegion::Unknown && next.region != editing_region) {
                     graphics.Save();
-                    if (launch) {
-                        const auto selected = Utf8(chosen);
-                        if (selected != remembered_iso) save_pref("iso", selected);
-                        location = std::move(chosen);
-                        play = true;
-                    } else {
-                        notice = "Settings saved.";
+                    editing_region = next.region;
+                    app::SelectGameSettings(editing_region);
+                    app::Get() = app::Settings{};
+                    for (const auto& option : app::kGame.options) {
+                        if (option.flag) *option.flag = defaults[option.key].value_or(*option.flag);
+                        else *option.value = defaults[option.key].value_or(*option.value);
                     }
+                    input::LoadBindings(&defaults);
+                    app::Load();
+                    graphics.settings = app::Snapshot();
                 }
-            } catch (const std::exception &failure) {
-                notice = failure.what();
-                error = true;
+                detected = std::move(next);
+                refresh_source = false;
+                checked_path = iso;
+                checked_preference = prefer_pal;
             }
+            if (save || launch) {
+                graphics.Save();
+                if (launch && detected.region != app::GameRegion::Unknown) {
+#ifndef TCNYC_PAL
+                    if (app::IsPal(detected.region) && !PalInstalled(detected.region))
+                        throw std::runtime_error("The PAL executable is missing. Extract the complete release.");
+#endif
+                    if (iso != remembered_iso) save_pref("iso", iso);
+                    save_pref("prefer_pal", app::IsPal(detected.region));
+                    source = detected;
+                    play = true;
+                } else if (save) {
+                    notice = "Settings saved.";
+                    error = false;
+                } else {
+                    notice = "The selected game source is no longer available.";
+                    error = true;
+                }
+            }
+        } catch (const std::exception& failure) {
+            notice = failure.what();
+            error = true;
         }
 
         ImGui::Render();
@@ -1129,7 +1185,7 @@ bool DrawLauncher(SDL_Window *window, SDL_Renderer *renderer, float scale, fs::p
 
 } // namespace
 
-bool Run(fs::path &location) {
+bool Run(app::GameSource& source) {
     input::SetHints();
     constexpr auto subsystems = SDL_INIT_VIDEO | SDL_INIT_GAMEPAD;
     if (!SDL_InitSubSystem(subsystems)) {
@@ -1153,7 +1209,7 @@ bool Run(fs::path &location) {
         Theme(scale);
         ImGui_ImplSDL3_InitForSDLRenderer(window, renderer);
         ImGui_ImplSDLRenderer3_Init(renderer);
-        play = DrawLauncher(window, renderer, scale, location);
+        play = DrawLauncher(window, renderer, scale, source);
         ImGui_ImplSDLRenderer3_Shutdown();
         ImGui_ImplSDL3_Shutdown();
         ImGui::DestroyContext();

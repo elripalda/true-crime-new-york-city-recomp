@@ -57,7 +57,7 @@ int64_t RefillClock() {
 bool TraceAudioRefillCall(X86Func* fn, X86Context& ctx, uint8_t* base) {
     // Return addresses inside the title's streamed-audio refill loop.
     const uint32_t caller = kernel::R32(ctx.esp);
-    constexpr uint32_t pal_offset = TCNYC_PAL ? 0x6A0u : 0u;
+    constexpr uint32_t pal_offset = TCNYC_PAL_EU ? 0x5D0u : TCNYC_PAL ? 0x6A0u : 0u;
     const char* step;
     switch (caller - pal_offset) {
         case 0x2499AA: step = "poll observed free slot / check decoder"; break;
@@ -156,7 +156,7 @@ X86_FUNC(sub_002291F0) {
 #if TCNYC_DEV_TOOLS
     // Only the playback volume update for music streams, after the game's
     // volume and ducking are combined. Leave the saved table and startup check alone.
-    constexpr uint32_t kStreamVolumeUpdate = TCNYC_PAL ? 0x24AD29u : 0x24A689u;
+    constexpr uint32_t kStreamVolumeUpdate = TCNYC_PAL_EU ? 0x0024AC59u : TCNYC_PAL ? 0x24AD29u : 0x24A689u;
     if (bin == kMusicBin && caller == kStreamVolumeUpdate) {
         static const bool trace = [] {
             const char* flag = std::getenv("TCNYC_TEST_AUDIO_TRACE");
@@ -188,7 +188,7 @@ X86_EXTERN_FUNC(__imp__sub_00229120);
 X86_EXTERN_FUNC(__imp__sub_00250580);
 X86_FUNC(sub_00250580) {
     constexpr uint32_t kUpdate = 0;  // event 0 in both XBE jump tables
-    constexpr uint32_t kAudioManager = TCNYC_PAL ? 0x41F1C0 : 0x41E8F0;
+    constexpr uint32_t kAudioManager = TCNYC_PAL_EU ? 0x0041F0C0u : TCNYC_PAL ? 0x41F1C0u : 0x41E8F0u;
     const uint32_t fade = ctx.ecx;
     if (X86_MEM32(ctx.esp + 4) != kUpdate || !X86_MEM8(fade + 0x28)) {
         __imp__sub_00250580(ctx, base);
@@ -208,7 +208,7 @@ X86_FUNC(sub_00250580) {
 
     X86_PUSH32(X86_MEM32(fade + 0x3C));
     X86_PUSH32(kMusicBin);
-    X86_PUSH32(TCNYC_PAL ? 0x250D6E : 0x25069E);  // return address after the guest setter call
+    X86_PUSH32(TCNYC_PAL_EU ? 0x00250CCEu : TCNYC_PAL ? 0x250D6Eu : 0x25069Eu);  // return address after the guest setter call
     ctx.ecx = kAudioManager;
     __imp__sub_00229120(ctx, base);
     ctx.eax = 0;

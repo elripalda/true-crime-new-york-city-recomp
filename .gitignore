@@ -14,12 +14,18 @@
 # user's own game files
 /assets/
 /assets-pal/
+/assets-pal-eu/
 /build-*.log
 
 # runtime files
 settings.toml
 launcher.toml
 launcher-pal.toml
+launcher-pal-eu.toml
+settings-pal.toml
+settings-pal-eu.toml
+/hdd-pal/
+/hdd-pal-eu/
 /logs/
 /hdd/
 /CrashDumps/

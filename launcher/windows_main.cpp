@@ -31,17 +31,27 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR args, int show
         return *handled;
     }
     bool skip = false;
+    app::GameSource source;
 #if TCNYC_DEV_TOOLS
     skip = _wgetenv(L"XBE_DEV_SKIP_LAUNCHER") != nullptr;
 #endif
     for (int i = 1; i < argc; ++i) {
-        if (std::wcscmp(argv[i], L"--skip-launcher") == 0 || std::wcscmp(argv[i], L"--relaunched") == 0) skip = true;
+        if (std::wcscmp(argv[i], L"--game-source") == 0 && i + 1 < argc) source.path = argv[++i];
+        else if (std::wcscmp(argv[i], L"--skip-launcher") == 0 || std::wcscmp(argv[i], L"--relaunched") == 0) skip = true;
     }
     if (argv) LocalFree(argv);
 
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    std::filesystem::path location;
-    if (!skip && !launcher::Run(location)) return 0;
-    app::SetStartupGameLocation(std::move(location));
+    if (!skip && source.path.empty() && !launcher::Run(source)) return 0;
+#ifndef TCNYC_PAL
+    if (source.region == app::GameRegion::Unknown) {
+        const auto detected = app::DetectGameSource(source.path);
+        if (detected.region != app::GameRegion::Unknown) source = detected;
+    }
+    if (app::IsPal(source.region)) return launcher::LaunchPal(source) ? 0 : 1;
+#endif
+    const auto game_files = launcher::Updater::HoldGameFiles();
+    if (!game_files) return 1;
+    app::SetStartupGameLocation(std::move(source.path));
     return RecompMain(instance, previous, args, show);
 }

@@ -23,7 +23,13 @@ BEGIN
             VALUE "FileDescription", "True Crime: New York City - Xbox recomp"
             VALUE "FileVersion", "0.9.2.4"
             VALUE "InternalName", "TrueCrimeNYC"
+#if TCNYC_PAL_EU
+            VALUE "OriginalFilename", "TrueCrimeNYCPALEU.exe"
+#elif TCNYC_PAL
+            VALUE "OriginalFilename", "TrueCrimeNYCPAL.exe"
+#else
             VALUE "OriginalFilename", "TrueCrimeNYC.exe"
+#endif
             VALUE "ProductName", "True Crime: New York City"
             VALUE "ProductVersion", "0.9.2.4"
             VALUE "Comments", "Unofficial native port. Requires the user's own game files."

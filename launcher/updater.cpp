@@ -1,4 +1,5 @@
 #include "updater.h"
+#include "launcher.h"
 #include "release_json.h"
 
 #include <algorithm>
@@ -49,9 +50,13 @@ constexpr std::string_view kRepo = "roz1077/true-crime-new-york-city-recomp";
 #ifdef _WIN32
 constexpr char kAsset[] = "TrueCrimeNYC.zip";
 constexpr char kExecutable[] = "TrueCrimeNYC.exe";
+constexpr char kPalExecutable[] = "TrueCrimeNYCPAL.exe";
+constexpr char kPalEuExecutable[] = "TrueCrimeNYCPALEU.exe";
 #else
 constexpr char kAsset[] = "TrueCrimeNYC-linux-x86_64.tar.gz";
 constexpr char kExecutable[] = "TrueCrimeNYC";
+constexpr char kPalExecutable[] = "TrueCrimeNYCPAL";
+constexpr char kPalEuExecutable[] = "TrueCrimeNYCPALEU";
 #endif
 constexpr uint64_t kArchiveLimit = 1ull << 30;
 
@@ -84,11 +89,14 @@ fs::path ExecutablePath() {
 
 bool Protected(std::string_view name) {
     constexpr std::string_view keep[] = {"settings.toml", "settings-pal.toml", "launcher.toml",
-        "launcher-pal.toml", "assets", "assets-pal", "textures", "music", "logs", "update", "shader-cache", "crashdumps"};
-    return std::ranges::find(keep, name) != std::end(keep) ||
-           (name.starts_with("hdd") && std::ranges::all_of(name.substr(3), [](char c) {
-               return c >= '0' && c <= '9';
-           }));
+        "launcher-pal.toml", "launcher-pal-eu.toml", "settings-pal-eu.toml",
+        "assets", "assets-pal", "assets-pal-eu", "textures", "music", "logs", "update", "shader-cache", "crashdumps"};
+    if (std::ranges::find(keep, name) != std::end(keep)) return true;
+    for (std::string_view prefix : {"hdd-pal-eu", "hdd-pal", "hdd"}) {
+        if (name.starts_with(prefix))
+            return std::ranges::all_of(name.substr(prefix.size()), [](char c) { return c >= '0' && c <= '9'; });
+    }
+    return false;
 }
 
 std::string AsciiLower(std::string text) {
@@ -145,20 +153,21 @@ struct InstallLock {
 #else
     int file = -1;
 #endif
-    explicit InstallLock(const fs::path& root) {
+    explicit InstallLock(const fs::path& root, const char* name = "install.lock", bool shared = false) {
         const auto folder = root / "update";
         if (const auto status = CheckedStatus(folder); fs::exists(status) && !fs::is_directory(status))
             throw std::runtime_error("The update directory is blocked.");
         fs::create_directory(folder);
-        const auto path = folder / "install.lock";
+        const auto path = folder / name;
         CheckedStatus(path);
 #ifdef _WIN32
-        file = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS,
+        file = CreateFileW(path.c_str(), shared ? GENERIC_READ : GENERIC_READ | GENERIC_WRITE,
+                           shared ? FILE_SHARE_READ : 0, nullptr, OPEN_ALWAYS,
                            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
         if (file == INVALID_HANDLE_VALUE) throw std::runtime_error("Another launcher is using the update folder.");
 #else
         file = open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
-        if (file < 0 || flock(file, LOCK_EX | LOCK_NB) != 0) {
+        if (file < 0 || flock(file, (shared ? LOCK_SH : LOCK_EX) | LOCK_NB) != 0) {
             if (file >= 0) close(file);
             throw std::runtime_error("Another launcher is using the update folder.");
         }
@@ -536,9 +545,23 @@ struct PackageFile {
 void CheckRequiredFiles(const fs::path& staged, const std::string& release) {
 #ifdef _WIN32
     constexpr std::string_view required[] = {kExecutable, "BUILD.txt", "SHA256SUMS", "compiler/clang.exe",
-        "compiler/lld-link.exe", "compiler/xbe_recomp.exe", "compiler/TrueCrimeNYC.lib", "compiler/config/game.toml"};
+        "compiler/lld-link.exe", "compiler/xbe_recomp.exe", "compiler/TrueCrimeNYC.lib", "compiler/config/game.toml",
+#ifdef TCNYC_PAL_SHA1
+        kPalExecutable, "compiler/TrueCrimeNYCPAL.lib", "compiler/config/game-pal.toml",
+#endif
+#ifdef TCNYC_PAL_EU_SHA1
+        kPalEuExecutable, "compiler/TrueCrimeNYCPALEU.lib", "compiler/config/game-pal-eu.toml",
+#endif
+    };
 #else
-    constexpr std::string_view required[] = {kExecutable, "BUILD.txt", "lib/libshaderc.so.1"};
+    constexpr std::string_view required[] = {kExecutable, "BUILD.txt", "lib/libshaderc.so.1",
+#ifdef TCNYC_PAL_SHA1
+        kPalExecutable,
+#endif
+#ifdef TCNYC_PAL_EU_SHA1
+        kPalEuExecutable,
+#endif
+    };
 #endif
     if (ReadFile(staged / "UPDATE-PROTOCOL", 160) != "tcnyc-update-1\n" + release + "\n")
         throw std::runtime_error("This package does not match the requested update version. Install it from its release page.");
@@ -1033,15 +1056,58 @@ void Updater::DoDownload() {
     state_ = State::Ready;
 }
 
+namespace {
+fs::path PalExecutable(app::GameRegion region) {
+    return BaseDir() / (region == app::GameRegion::PalEu ? kPalEuExecutable : kPalExecutable);
+}
+}
+
+bool PalInstalled(app::GameRegion region) {
+    std::error_code ec;
+    return fs::is_regular_file(PalExecutable(region), ec);
+}
+
+bool LaunchPal(const app::GameSource& source) {
+    const auto executable = PalExecutable(source.region);
+#ifdef _WIN32
+    if (Launch(executable, {"--skip-launcher", "--game-source", Utf8(source.path)})) return true;
+#else
+    // Keep the process ID for callers such as Steam and command-line wrappers.
+    auto exe_arg = executable.native();
+    auto source_arg = source.path.native();
+    char skip[] = "--skip-launcher";
+    char option[] = "--game-source";
+    char* argv[] = {exe_arg.data(), skip, option, source_arg.data(), nullptr};
+    execv(executable.c_str(), argv);
+#endif
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "True Crime NYC", "Could not start the PAL game. Extract the complete release and try again.", nullptr);
+    return false;
+}
+
 bool Updater::Relaunch() {
     try {
         const auto root = BaseDir();
         InstallLock lock(root);
+        InstallLock game(root, "game.lock");
         if (ReadFile(root / "update" / "pending", 128) != latest()) return false;
         return StartInstaller(root, "--apply-update=");
     } catch (const std::exception& failure) {
         Fail(failure.what());
         return false;
+    }
+}
+
+std::shared_ptr<void> Updater::HoldGameFiles() {
+    try {
+        const auto root = BaseDir();
+        auto lock = std::make_shared<InstallLock>(root, "game.lock", true);
+        if (fs::exists(CheckTarget(root, "update/active")))
+            throw std::runtime_error("An interrupted update needs to be recovered.");
+        return lock;
+    } catch (const std::exception&) {
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "True Crime NYC",
+                                 "The game files are unavailable. Finish any update from the main launcher and try again.", nullptr);
+        return {};
     }
 }
 
@@ -1067,6 +1133,7 @@ std::optional<int> Updater::HandleStartup(std::string_view argument) {
                 throw std::runtime_error("The previous launcher is still running.");
             {
                 InstallLock lock(root);
+                InstallLock game(root, "game.lock");
                 if (apply) ApplyPackage(root);
                 else if (fs::exists(CheckedStatus(update / "active"))) Rollback(root);
             }
@@ -1085,6 +1152,7 @@ std::optional<int> Updater::HandleStartup(std::string_view argument) {
             // The staged executable is what would run the recovery. If it is gone,
             // restore the live files here instead of refusing to start the game.
             if (!fs::is_regular_file(CheckedStatus(update / "staged" / kExecutable))) {
+                InstallLock game(root, "game.lock");
                 Rollback(root);
             } else {
                 if (!StartInstaller(root, "--recover-update="))

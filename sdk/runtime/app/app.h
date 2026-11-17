@@ -12,6 +12,8 @@ struct Pad;
 
 #include <toml++/toml.hpp>
 
+#include "app/game_source.h"
+
 // the host side: window, settings
 namespace app {
 
@@ -78,6 +80,9 @@ void SetFrameCap(uint32_t cap);
 uint32_t MsaaSamples();
 void SetMsaaSamples(uint32_t samples);
 std::filesystem::path SettingsPath();
+const char* SettingsFile();
+void SelectGameSettings(GameRegion region);
+std::string HddName();
 void Load();
 bool Save();
 void FlushSettings();  // waits for the settings publisher (call before exit)
@@ -106,7 +111,6 @@ float RenderStretch(uint32_t guest_width, uint32_t guest_height);
 bool Widescreen();
 
 std::filesystem::path ExeDir();
-std::string ValidateGameIso(const std::filesystem::path& path);
 // the game in assets (game_files.cpp): its folder and this executable's xbe, from the extracted files or a disc
 // image (.iso), which it mounts as D:; false after telling the player what is missing, with error set for hosts
 // that show it themselves

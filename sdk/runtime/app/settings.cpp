@@ -34,7 +34,7 @@ std::recursive_mutex g_settings_lock;
 
 }  // namespace
 
-std::filesystem::path SettingsPath() { return ExeDir() / kGame.settings; }
+std::filesystem::path SettingsPath() { return ExeDir() / SettingsFile(); }
 
 uint32_t FrameCap() {
     return std::atomic_ref(Get().fps_cap).load(std::memory_order_relaxed);

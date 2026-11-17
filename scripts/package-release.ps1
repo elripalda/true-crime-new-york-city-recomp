@@ -1,5 +1,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$BuildDir,
+    [Parameter(Mandatory = $true)][string]$PalBuildDir,
+    [Parameter(Mandatory = $true)][string]$PalEuBuildDir,
     [Parameter(Mandatory = $true)][string]$SdkDir,
     [Parameter(Mandatory = $true)][string]$RuntimeDir,
     [string]$OutputPath
@@ -62,28 +64,33 @@ function Add-ReleaseFile([string]$File, [string]$Entry) {
 }
 
 $exe = Join-Path $BuildDir 'TrueCrimeNYC.exe'
-if (!(Test-Path -LiteralPath $exe -PathType Leaf)) {
-    throw "Release executable not found: $exe. Build the release target first."
-}
-# Developer debug tools (src/dev/) must never ship: refuse a build directory
-# configured with them, and an executable that contains the dev build marker.
-$cache = Join-Path $BuildDir 'CMakeCache.txt'
-if ((Test-Path -LiteralPath $cache -PathType Leaf) -and
-    (Select-String -LiteralPath $cache -Pattern '^TCNYC_DEV_TOOLS:BOOL=(ON|TRUE|1|YES)$' -Quiet)) {
-    throw "$BuildDir was configured with TCNYC_DEV_TOOLS=ON. Reconfigure it with -DTCNYC_DEV_TOOLS=OFF (or use the release preset in a clean directory) before packaging."
-}
-# Only an optimised build ships: Debug and RelWithDebInfo are slower and carry debug data.
-if (Test-Path -LiteralPath $cache -PathType Leaf) {
-    $type = Select-String -LiteralPath $cache -Pattern '^CMAKE_BUILD_TYPE:STRING=(.*)$' | Select-Object -First 1
-    if ($type -and $type.Matches[0].Groups[1].Value -ne 'Release') {
-        throw "$BuildDir is a $($type.Matches[0].Groups[1].Value) build. Package a Release build (the release preset)."
+$palExe = Join-Path $PalBuildDir 'TrueCrimeNYCPAL.exe'
+$palEuExe = Join-Path $PalEuBuildDir 'TrueCrimeNYCPALEU.exe'
+foreach ($hostExe in @($exe, $palExe, $palEuExe)) {
+    $hostBuild = Split-Path -Parent $hostExe
+    if (!(Test-Path -LiteralPath $hostExe -PathType Leaf)) {
+        throw "Release executable not found: $hostExe. Build the release target first."
     }
-}
-$marker = [Text.Encoding]::ASCII.GetBytes('TCNYC-DEV-TOOLS-BUILD')
-$exeBytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $exe).Path)
-$exeText = [Text.Encoding]::GetEncoding(28591).GetString($exeBytes)
-if ($exeText.Contains([Text.Encoding]::GetEncoding(28591).GetString($marker))) {
-    throw "$exe contains the developer debug tools (TCNYC-DEV-TOOLS-BUILD). Rebuild with TCNYC_DEV_TOOLS=OFF before packaging."
+    # Developer debug tools (src/dev/) must never ship: refuse a build directory
+    # configured with them, and an executable that contains the dev build marker.
+    $cache = Join-Path $hostBuild 'CMakeCache.txt'
+    if ((Test-Path -LiteralPath $cache -PathType Leaf) -and
+        (Select-String -LiteralPath $cache -Pattern '^TCNYC_DEV_TOOLS:BOOL=(ON|TRUE|1|YES)$' -Quiet)) {
+        throw "$hostBuild was configured with TCNYC_DEV_TOOLS=ON. Reconfigure it with -DTCNYC_DEV_TOOLS=OFF (or use the release preset in a clean directory) before packaging."
+    }
+    # Only an optimised build ships: Debug and RelWithDebInfo are slower and carry debug data.
+    if (Test-Path -LiteralPath $cache -PathType Leaf) {
+        $type = Select-String -LiteralPath $cache -Pattern '^CMAKE_BUILD_TYPE:STRING=(.*)$' | Select-Object -First 1
+        if ($type -and $type.Matches[0].Groups[1].Value -ne 'Release') {
+            throw "$hostBuild is a $($type.Matches[0].Groups[1].Value) build. Package a Release build (the release preset)."
+        }
+    }
+    $marker = [Text.Encoding]::ASCII.GetBytes('TCNYC-DEV-TOOLS-BUILD')
+    $exeBytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $hostExe).Path)
+    $exeText = [Text.Encoding]::GetEncoding(28591).GetString($exeBytes)
+    if ($exeText.Contains([Text.Encoding]::GetEncoding(28591).GetString($marker))) {
+        throw "$hostExe contains the developer debug tools (TCNYC-DEV-TOOLS-BUILD). Rebuild with TCNYC_DEV_TOOLS=OFF before packaging."
+    }
 }
 
 $compiler = Join-Path $BuildDir 'compiler'
@@ -160,7 +167,7 @@ $windows = @('kernel32.dll', 'ntdll.dll', 'user32.dll', 'gdi32.dll', 'advapi32.d
     'dwmapi.dll', 'dbghelp.dll', 'windowscodecs.dll', 'd3d12.dll', 'dxgi.dll', 'd3dcompiler_47.dll',
     'shlwapi.dll', 'uxtheme.dll', 'hid.dll', 'cfgmgr32.dll', 'bcrypt.dll', 'crypt32.dll', 'psapi.dll',
     'userenv.dll', 'rpcrt4.dll', 'xinput1_4.dll', 'iphlpapi.dll', 'secur32.dll', 'combase.dll')
-$executables = @($exe) + @('clang.exe', 'lld-link.exe', 'xbe_recomp.exe' | ForEach-Object { Join-Path $compiler $_ })
+$executables = @($exe, $palExe, $palEuExe) + @('clang.exe', 'lld-link.exe', 'xbe_recomp.exe' | ForEach-Object { Join-Path $compiler $_ })
 foreach ($binary in $executables) {
     foreach ($dll in Get-PeImports $binary) {
         $name = $dll.ToLowerInvariant()
@@ -232,6 +239,8 @@ try {
         Add-ReleaseDirectory 'LICENSES/'
         Add-ReleaseDirectory 'music/'  # the default custom music folder, empty
         Add-ReleaseFile $exe 'TrueCrimeNYC.exe'
+        Add-ReleaseFile $palExe 'TrueCrimeNYCPAL.exe'
+        Add-ReleaseFile $palEuExe 'TrueCrimeNYCPALEU.exe'
         Add-ReleaseFile (Join-Path $root 'README.md') 'README.md'
         Add-ReleaseFile (Join-Path $root 'README-LINUX.md') 'README-LINUX.md'
         Add-ReleaseFile (Join-Path $root 'CHANGELOG.md') 'CHANGELOG.md'
@@ -251,6 +260,8 @@ try {
         foreach ($name in 'clang.exe', 'lld-link.exe', 'xbe_recomp.exe', 'TrueCrimeNYC.lib', 'LLVM-LICENSE.txt') {
             Add-ReleaseFile (Join-Path $compiler $name) "compiler/$name"
         }
+        Add-ReleaseFile (Join-Path $PalBuildDir 'compiler/TrueCrimeNYCPAL.lib') 'compiler/TrueCrimeNYCPAL.lib'
+        Add-ReleaseFile (Join-Path $PalEuBuildDir 'compiler/TrueCrimeNYCPALEU.lib') 'compiler/TrueCrimeNYCPALEU.lib'
         foreach ($directory in 'config', 'include', 'xdk') {
             $path = Join-Path $compiler $directory
             if (!(Test-Path -LiteralPath $path -PathType Container)) {

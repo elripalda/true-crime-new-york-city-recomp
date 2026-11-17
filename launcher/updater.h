@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -26,13 +27,15 @@ public:
     bool Relaunch();
     // Runs the staged installer or recovers a prior update before game startup.
     static std::optional<int> HandleStartup(std::string_view argument);
+    // Keep the installed files stable until the game has exited.
+    static std::shared_ptr<void> HoldGameFiles();
 
     State state() const { return state_.load(); }
     float progress() const { return progress_.load(); }  // 0 to 1 while downloading
     std::string latest() const;                          // e.g. "0.9.3-beta.4"
     std::string error() const;
     static const char *Current();  // this build's version
-    static constexpr char kReleasesPage[] = "https://github.com/roz1077/true-crime-new-york-city-recomp/releases/latest";
+    static constexpr char kReleasesPage[] = "https://github.com/roz1077/true-crime-new-york-city-recomp/releases";
 
 private:
     void Run(void (Updater::*step)());

@@ -43,7 +43,22 @@ struct GridSite {
     uint32_t occurrences;
 };
 
-#if defined(TCNYC_PAL) && TCNYC_PAL
+#if TCNYC_PAL_EU
+inline constexpr GridSite kGridSites[] = {
+    {0x0013910D, "ecx", 1},
+    {0x00139124, "edi", 1},
+    {0x0013F752, "ecx", 1},
+    {0x0013F769, "edi", 1},
+    {0x00147270, "esi", 3},
+    {0x001472BD, "ecx", 3},
+    {0x00147593, "esi", 2},
+    {0x001475DD, "ecx", 2},
+    {0x001478B3, "edi", 2},
+    {0x001478FD, "ecx", 2},
+    {0x0014AB11, "ecx", 1},
+    {0x0014AB38, "esi", 1},
+};
+#elif defined(TCNYC_PAL) && TCNYC_PAL
 inline constexpr GridSite kGridSites[] = {
     {0x0013945D, "ecx", 1},
     {0x00139474, "edi", 1},
@@ -86,7 +101,9 @@ struct FrameSite {
     uint32_t from;
     uint32_t to;
 };
-#if defined(TCNYC_PAL) && TCNYC_PAL
+#if TCNYC_PAL_EU
+inline constexpr FrameSite kFrameSites[] = {{0x0013ED36, 0x204, 0x1004}};
+#elif defined(TCNYC_PAL) && TCNYC_PAL
 inline constexpr FrameSite kFrameSites[] = {{0x0013F086, 0x204, 0x1004}};
 #else
 inline constexpr FrameSite kFrameSites[] = {{0x0013E7F6, 0x204, 0x1004}};
@@ -98,7 +115,10 @@ inline constexpr uint32_t kFrameExpectedOccurrences = 1;
 // data, so the 17th light (reached by the 7x7 ring) lands in a foreign global and 0x61370 later reads a null
 // light. Lights are addressed only by index (each stores its own at +0x94), so every site reads the base
 // through xbe_light_table instead; the host moves the table to a larger array at a quiet point.
-#if defined(TCNYC_PAL) && TCNYC_PAL
+#if TCNYC_PAL_EU
+inline constexpr uint32_t kLightSites[] = {0x00061480, 0x00061810, 0x00061A04, 0x00061D90, 0x00063779,
+                                           0x0006379C, 0x000637AF, 0x000637BC, 0x000637D3};
+#elif defined(TCNYC_PAL) && TCNYC_PAL
 inline constexpr uint32_t kLightSites[] = {0x00061430, 0x000617C0, 0x000619B4, 0x00061D40, 0x00063729,
                                            0x0006374C, 0x0006375F, 0x0006376C, 0x00063783};
 #else
@@ -107,7 +127,12 @@ inline constexpr uint32_t kLightSites[] = {0x00061400, 0x00061790, 0x00061984, 0
 #endif
 inline constexpr uint32_t kLightSiteCount = sizeof(kLightSites) / sizeof(kLightSites[0]);
 inline const char kLightDecl[] = "extern \"C\" uint32_t xbe_light_table;";
-#if defined(TCNYC_PAL) && TCNYC_PAL
+#if TCNYC_PAL_EU
+inline const char kLightDef[] =
+    "#ifdef _WIN32\n__declspec(dllexport)\n#endif\nextern \"C\" uint32_t xbe_light_table = 0x349B40u;";
+inline const char kLightFrom[] = "0x349B40u";
+inline const char kLightFromMinus4[] = "0x349B3Cu";
+#elif defined(TCNYC_PAL) && TCNYC_PAL
 inline const char kLightDef[] =
     "#ifdef _WIN32\n__declspec(dllexport)\n#endif\nextern \"C\" uint32_t xbe_light_table = 0x349C40u;";
 inline const char kLightFrom[] = "0x349C40u";
@@ -124,7 +149,16 @@ inline const char kLightFromMinus4[] = "0x34937Cu";
 // 0x1387F0. Every site that addresses it (base +0x5AD0/+0x5AD4) or checks its 300 cap (0x12C) goes through
 // XBE_INST(city) / xbe_inst_cap, so the host can move it to a larger array for the outer ring. Until it does,
 // XBE_INST(city) is city + 0x5AD0 and the cap is 300: unchanged behaviour. USA and PAL sites.
-#if defined(TCNYC_PAL) && TCNYC_PAL
+#if TCNYC_PAL_EU
+inline constexpr uint32_t kInstSites[] = {0x00138D6F, 0x001392C0, 0x0013FE20, 0x00144AD0, 0x001490FA, 0x00149127,
+                                          0x001491A0, 0x001491AC, 0x001491E1, 0x0014AE79, 0x0014AEA6, 0x0014AFA3,
+                                          0x0014AFB5, 0x0014AFBB, 0x0014B000, 0x0014B005,
+                                          0x00148713, 0x0014872F, 0x00148746, 0x00148750, 0x0014875D, 0x00147C63,
+                                          0x00147C6F, 0x00147C94,
+                                          0x0014AFC4, 0x0014AFE8, 0x0014B01D, 0x0014B04D, 0x0014B05E, 0x0014B068,
+                                          0x0014B075, 0x00142F45, 0x00142F95};  // PAL: matched against the USA sites below
+inline constexpr uint32_t kInstSiteCount = sizeof(kInstSites) / sizeof(kInstSites[0]);
+#elif defined(TCNYC_PAL) && TCNYC_PAL
 inline constexpr uint32_t kInstSites[] = {0x001390BF, 0x00139610, 0x00140170, 0x00144C80, 0x001492AA, 0x001492D7,
                                           0x00149350, 0x0014935C, 0x00149391, 0x0014B029, 0x0014B056, 0x0014B153,
                                           0x0014B165, 0x0014B16B, 0x0014B1B0, 0x0014B1B5,
@@ -172,7 +206,12 @@ inline constexpr char kRingInstanceRadius[] =
 inline constexpr char kRingInstanceLeafRadius[] =
     " if (!cf) cf = ctx.xmm[0].f[0] < ctx.xmm[2].f[0] * (X86_MEM32(ctx.esp + 0x18u) >= 0x70000000u"
     " ? xbe_ring_instance_scale : xbe_inner_instance_scale);";
-#if defined(TCNYC_PAL) && TCNYC_PAL
+#if TCNYC_PAL_EU
+inline constexpr AppendSite kAppendSites[] = {{0x0013F2D8, " ctx.xmm[0].f[0] *= xbe_draw_radius_scale;"},
+                                               {0x0013F05B, " xbe_portal_slot_hits[ctx.edx >= 0x70000000u ? 1 : 0]++;"},
+                                               {0x00149345, kRingInstanceRadius},
+                                               {0x001490E6, kRingInstanceLeafRadius}};
+#elif defined(TCNYC_PAL) && TCNYC_PAL
 inline constexpr AppendSite kAppendSites[] = {{0x0013F628, " ctx.xmm[0].f[0] *= xbe_draw_radius_scale;"},
                                                {0x0013F3AB, " xbe_portal_slot_hits[ctx.edx >= 0x70000000u ? 1 : 0]++;"},
                                                {0x001494F5, kRingInstanceRadius},
@@ -195,7 +234,14 @@ struct ReplaceSite {
     const char* from;
     const char* to;
 };
-#if defined(TCNYC_PAL) && TCNYC_PAL
+#if TCNYC_PAL_EU
+inline constexpr ReplaceSite kReplaceSites[] = {{0x0013EF78, "0xA0u", "0xC00u"}, {0x0013EF90, "0xA0u", "0xC00u"},
+                                                {0x0013EFB0, "0xA0u", "0xC00u"}, {0x0013EFC8, "0xA0u", "0xC00u"},
+                                                {0x0013EFDF, "0xA0u", "0xC00u"},
+                                                {0x0013F445, "(uint32_t)(0x8B0u)", "(uint32_t)(XBE_NEXT_SLOT)"},
+                                                {0x0013F44A, "(uint32_t)(0x9u)", "(uint32_t)(9u + xbe_extra_slot_count)"}};  // PAL
+inline constexpr uint32_t kReplaceSiteCount = 7;
+#elif defined(TCNYC_PAL) && TCNYC_PAL
 inline constexpr ReplaceSite kReplaceSites[] = {{0x0013F2C8, "0xA0u", "0xC00u"}, {0x0013F2E0, "0xA0u", "0xC00u"},
                                                 {0x0013F300, "0xA0u", "0xC00u"}, {0x0013F318, "0xA0u", "0xC00u"},
                                                 {0x0013F32F, "0xA0u", "0xC00u"},

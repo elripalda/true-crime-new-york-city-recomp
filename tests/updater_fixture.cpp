@@ -14,7 +14,7 @@ int main(int argc, char** argv) {
     const std::string_view argument = argc > 1 ? argv[1] : "";
     if (const auto handled = Updater::HandleStartup(argument)) return *handled;
 
-    if (argument != "--exercise" && argument != "--stage") {
+    if (argument != "--exercise" && argument != "--stage" && argument != "--busy") {
 #ifdef _WIN32
         const auto* result = _wgetenv(L"TCNYC_FIXTURE_RESTARTED");
 #else
@@ -38,6 +38,10 @@ int main(int argc, char** argv) {
     if (updater.state() != State::Ready) {
         std::cerr << updater.error() << '\n';
         return 1;
+    }
+    if (argument == "--busy") {
+        const auto game = Updater::HoldGameFiles();
+        return game && !updater.Relaunch() ? 0 : 1;
     }
     return argument == "--stage" || updater.Relaunch() ? 0 : 1;
 }

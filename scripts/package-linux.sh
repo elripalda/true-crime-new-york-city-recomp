@@ -1,12 +1,14 @@
 #!/bin/bash
 # Build the native Linux/SteamOS test package from a native build directory.
-#   scripts/package-linux.sh [build-dir] [output-dir]
+#   scripts/package-linux.sh [ntsc-build-dir] [output-dir] [pal-build-dir] [pal-eu-build-dir]
 set -euo pipefail
 umask 022
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(cd "$SCRIPT_DIR/.." && pwd)
 BUILD=${1:-/root/tcnyc-linux-build}
 OUT=${2:-$REPO/dist}
+PAL_BUILD=${3:-/root/tcnyc-linux-pal-build}
+PAL_EU_BUILD=${4:-/root/tcnyc-linux-pal-eu-build}
 NAME=TrueCrimeNYC-linux-x86_64
 
 # Reproducible archive: use the commit timestamp when CI provides it, otherwise
@@ -39,6 +41,20 @@ if [ ! -f "$BUILD/TrueCrimeNYC" ]; then
     echo "Build platform/linux first, or pass the build directory as the first argument." >&2
     exit 1
 fi
+if [ ! -f "$PAL_BUILD/TrueCrimeNYC" ]; then
+    echo "Native PAL build not found. Build with -DTCNYC_PAL=ON and pass the build directory as the third argument." >&2
+    exit 1
+fi
+if [ ! -f "$PAL_EU_BUILD/TrueCrimeNYC" ] ||
+   ! grep -qx 'TCNYC_PAL_EU:BOOL=ON' "$PAL_EU_BUILD/CMakeCache.txt"; then
+    echo "Native PAL EU build not found. Build with -DTCNYC_PAL_EU=ON and pass the build directory as the fourth argument." >&2
+    exit 1
+fi
+if ! grep -qx 'TCNYC_PAL:BOOL=ON' "$PAL_BUILD/CMakeCache.txt" ||
+   ! grep -qx 'TCNYC_PAL:BOOL=OFF' "$BUILD/CMakeCache.txt"; then
+    echo "Expected separate NTSC and PAL CMake build directories." >&2
+    exit 1
+fi
 for file in README-LINUX.md README.md sdk/THIRD_PARTY.txt sdk/LICENSE; do
     if [ ! -f "$REPO/$file" ]; then
         echo "Missing package input: $REPO/$file" >&2
@@ -54,7 +70,9 @@ mkdir -p "$PKG/lib" "$PKG/assets" "$PKG/LICENSES" "$PKG/music"  # music: the def
 
 # the release binary: no debug tables, the rpath already points at $ORIGIN/lib
 install -m 0755 "$BUILD/TrueCrimeNYC" "$PKG/TrueCrimeNYC"
-strip --strip-unneeded "$PKG/TrueCrimeNYC"
+install -m 0755 "$PAL_BUILD/TrueCrimeNYC" "$PKG/TrueCrimeNYCPAL"
+install -m 0755 "$PAL_EU_BUILD/TrueCrimeNYC" "$PKG/TrueCrimeNYCPALEU"
+strip --strip-unneeded "$PKG/TrueCrimeNYC" "$PKG/TrueCrimeNYCPAL" "$PKG/TrueCrimeNYCPALEU"
 
 SHADERC=$(ldconfig -p 2>/dev/null | awk '/libshaderc\.so\.1 /{print $NF; exit}' || true)
 if [ -z "$SHADERC" ]; then
@@ -78,19 +96,21 @@ fi
 # Every dependency of the release binary must resolve with the bundled lib/
 # directory in the search path. glibc, libstdc++ and libgcc are intentionally
 # not bundled; they come from the target system.
-if ! LD_LIBRARY_PATH="$PKG/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-        ldd "$PKG/TrueCrimeNYC" > "$STAGE/ldd.txt" 2>&1; then
-    echo "ldd failed for $PKG/TrueCrimeNYC:" >&2
-    cat "$STAGE/ldd.txt" >&2
-    exit 1
-fi
-if grep -q 'not found' "$STAGE/ldd.txt"; then
-    echo "TrueCrimeNYC has unresolved shared-library dependencies:" >&2
-    grep 'not found' "$STAGE/ldd.txt" >&2
-    echo "Install the missing development/runtime packages before packaging, or bundle only the" >&2
-    echo "non-system libraries the binary needs (not glibc, libstdc++ or libgcc)." >&2
-    exit 1
-fi
+for executable in "$PKG/TrueCrimeNYC" "$PKG/TrueCrimeNYCPAL" "$PKG/TrueCrimeNYCPALEU"; do
+    if ! LD_LIBRARY_PATH="$PKG/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+            ldd "$executable" > "$STAGE/ldd.txt" 2>&1; then
+        echo "ldd failed for $executable:" >&2
+        cat "$STAGE/ldd.txt" >&2
+        exit 1
+    fi
+    if grep -q 'not found' "$STAGE/ldd.txt"; then
+        echo "$executable has unresolved shared-library dependencies:" >&2
+        grep 'not found' "$STAGE/ldd.txt" >&2
+        echo "Install the missing development/runtime packages before packaging, or bundle only the" >&2
+        echo "non-system libraries the binary needs (not glibc, libstdc++ or libgcc)." >&2
+        exit 1
+    fi
+done
 
 cp "$REPO/README-LINUX.md" "$PKG/README-LINUX.md"
 cp "$REPO/README.md" "$PKG/README.md"
@@ -136,7 +156,7 @@ The extracted files are used when both are present. No game assets are included
 in this package.
 EOF
 
-GLIBC=$(objdump -T "$PKG/TrueCrimeNYC" | grep -oE 'GLIBC_[0-9.]+' | sort -V | tail -1 || true)
+GLIBC=$(objdump -T "$PKG/TrueCrimeNYC" "$PKG/TrueCrimeNYCPAL" "$PKG/TrueCrimeNYCPALEU" | grep -oE 'GLIBC_[0-9.]+' | sort -V | tail -1 || true)
 [ -n "$GLIBC" ] || GLIBC=unknown
 {
     echo "True Crime: New York City - native Linux build"

@@ -29,7 +29,7 @@
 namespace game {
 namespace {
 
-constexpr uint32_t kDecoderVtable = TCNYC_PAL ? 0x2E016Cu : 0x2DF9BCu;
+constexpr uint32_t kDecoderVtable = TCNYC_PAL_EU ? 0x002E005Cu : TCNYC_PAL ? 0x2E016Cu : 0x2DF9BCu;
 constexpr uint32_t kDecoderSize = 0x94;  // what the factory allocates; +0x34 writes at +0x8C
 constexpr uint32_t kOk = 0;
 constexpr uint32_t kFail = 0x80004005;

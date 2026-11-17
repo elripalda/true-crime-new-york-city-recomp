@@ -123,7 +123,15 @@ fs::path CodeDll(const Image& image) { return ExeDir() / (image.exe + L".dll"); 
 // Beside the DLL, not in the compiler work folder: a release deletes that folder after the first run.
 fs::path StampFile(const Image& image) { return ExeDir() / (image.exe + L".dll.stamp"); }
 std::wstring Quote(const fs::path& path) { return L"\"" + path.wstring() + L"\""; }
-fs::path CompileLog() { return ExeDir() / "logs" / "compile.log"; }
+fs::path CompileLog() {
+#if TCNYC_PAL_EU
+    return ExeDir() / "logs" / "compile-pal-eu.log";
+#elif defined(TCNYC_PAL)
+    return ExeDir() / "logs" / "compile-pal.log";
+#else
+    return ExeDir() / "logs" / "compile.log";
+#endif
+}
 
 // keeps the failed step for the message the player sees; false, to return
 bool RecordFailure(const std::wstring& what) {
@@ -763,11 +771,21 @@ Layout Arrange(const RECT& client, int unit) {
 }
 
 // the ready page's buttons, with the controller button that presses each
+bool SharedCompiler() {
+    std::error_code ec;
+#ifdef TCNYC_PAL
+    return fs::is_regular_file(ExeDir() / "TrueCrimeNYC.exe", ec);
+#else
+    return fs::is_regular_file(ExeDir() / "TrueCrimeNYCPAL.exe", ec);
+#endif
+}
+
 void PaintChoices(HDC dc, const Layout& l, int unit) {
     FillBox(dc, l.start, kBarFull);
     DrawLine(dc, l.start, L"Start (A)", kBackground, DT_CENTER);
     FillBox(dc, l.exit, kBarEmpty);
     DrawLine(dc, l.exit, L"Exit (B)", kText, DT_CENTER);
+    if (SharedCompiler()) return;
     int middle = (l.delete_toggle.top + l.delete_toggle.bottom) / 2;
     RECT box{l.delete_toggle.left, middle - unit / 2, l.delete_toggle.left + unit, middle + unit / 2};
     FillBox(dc, box, kBarEmpty);
@@ -839,7 +857,7 @@ void DeleteCompiler() {
 
 void CloseWindowWith(HWND hwnd, bool start) {
     g_start = start;
-    if (g_progress.stage == Stage::Ready && g_delete_compiler) DeleteCompiler();
+    if (g_progress.stage == Stage::Ready && g_delete_compiler && !SharedCompiler()) DeleteCompiler();
     DeleteObject(reinterpret_cast<HFONT>(GetWindowLongPtrW(hwnd, GWLP_USERDATA)));
     DestroyWindow(hwnd);
 }
@@ -957,7 +975,7 @@ std::wstring CompileLogTail() {
 void ShowFailure() {
     std::wstring text = L"Preparing the game failed. " + g_failure;
     if (std::wstring tail = CompileLogTail(); !tail.empty()) text += L"\n\nThe last lines of the log:\n\n" + tail;
-    text += L"\n\nThe full details are in logs\\compile.log.";
+    text += L"\n\nThe full details are in " + CompileLog().filename().wstring() + L" in logs.";
     MessageBoxW(nullptr, text.c_str(), kGame.title, MB_ICONERROR);
 }
 

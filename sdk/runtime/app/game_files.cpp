@@ -12,7 +12,6 @@
 
 #include <algorithm>
 #include <cctype>
-#include <cstdlib>
 #include <fstream>
 #include <memory>
 
@@ -25,24 +24,49 @@
 extern const char kImageSha1[];  // the xbe recompiled into this executable, written by CMake
 
 namespace app {
+namespace {
+GameRegion settings_region = GameRegion::Unknown;
+}
+
+const char* SettingsFile() {
+    if (settings_region == GameRegion::PalEu) return "settings-pal-eu.toml";
+    if (settings_region == GameRegion::Pal) return "settings-pal.toml";
+    return kGame.settings;
+}
+
+void SelectGameSettings(GameRegion region) {
+    settings_region = region;
+}
+
+std::string HddName() {
+#if TCNYC_PAL_EU
+    std::string name = "hdd-pal-eu";
+#elif defined(TCNYC_PAL)
+    std::string name = "hdd-pal";
+#else
+    std::string name = "hdd";
+#endif
+    if (Instance() > 1) name += std::to_string(Instance());
+    return name;
+}
+
 
 namespace {
 
 namespace fs = std::filesystem;
 
-struct ValidatedDisc {
-    fs::path path;
-    GameFiles game;
-    std::unique_ptr<kernel::Disc> disc;
-};
-ValidatedDisc g_validated_disc;
+#ifdef TCNYC_PAL_EU
+constexpr char kPalAssets[] = "assets-pal-eu";
+#else
+constexpr char kPalAssets[] = "assets-pal";
+#endif
 
 // assets beside the exe or in any folder above it (the build output)
-fs::path FindAssets() {
+fs::path FindAssets(const char* name = "assets") {
     auto dir = ExeDir();
     std::error_code ec;
     for (int i = 0; i < 6; i++) {
-        if (fs::is_directory(dir / "assets", ec)) return dir / "assets";
+        if (fs::is_directory(dir / name, ec)) return dir / name;
         if (!dir.has_parent_path() || dir.parent_path() == dir) break;
         dir = dir.parent_path();
     }
@@ -55,15 +79,11 @@ std::string Narrow(const wchar_t* text) {
     return out;
 }
 
-// telling the player what to fix; a host without dialog boxes logs it instead
-bool Alert(const wchar_t* text, bool question = false) {
+void Alert(const wchar_t* text) {
 #ifdef _WIN32
-    const UINT flags = question ? MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2 : MB_ICONERROR;
-    return MessageBoxW(nullptr, text, kGame.short_title, flags) == IDYES;
+    MessageBoxW(nullptr, text, kGame.short_title, MB_ICONERROR);
 #else
     LOGE("game: %s", Narrow(text).c_str());
-    // no dialog on this host: an explicit opt-in is the only way to accept another release
-    return question && std::getenv("TCNYC_ALLOW_OTHER_RELEASE") != nullptr;
 #endif
 }
 
@@ -83,6 +103,33 @@ bool ReadHostFile(const fs::path& path, std::vector<uint8_t>& out) {
     return f.read(reinterpret_cast<char*>(out.data()), std::streamsize(out.size())).good();
 }
 
+bool IsIso(const fs::path& path) {
+    auto extension = PathText(path.extension());
+    std::ranges::transform(extension, extension.begin(), [](unsigned char ch) { return char(std::tolower(ch)); });
+    return extension == ".iso";
+}
+
+std::vector<fs::path> Candidates(const fs::path& source) {
+    std::error_code ec;
+    if (IsIso(source) && fs::is_regular_file(source, ec)) return {source};
+    if (!fs::is_directory(source, ec)) return {};
+    std::vector<fs::path> result{source};
+    for (fs::directory_iterator it(source, ec), end; !ec && it != end; it.increment(ec)) {
+        std::error_code status;
+        if (IsIso(it->path()) && it->is_regular_file(status)) result.push_back(it->path());
+    }
+    std::sort(result.begin() + 1, result.end());
+    return result;
+}
+
+bool ReadSource(const fs::path& name, std::vector<uint8_t>& xbe, std::unique_ptr<kernel::Disc>& disc) {
+    std::error_code ec;
+    if (fs::is_directory(name, ec)) return ReadHostFile(name / IMAGE_XBE, xbe);
+    disc = std::make_unique<kernel::Disc>();
+    std::string reason;
+    return disc->Open(name, reason) && disc->Load(IMAGE_XBE, xbe) && disc->StillAtPath();
+}
+
 }  // namespace
 
 std::string Sha1(const std::vector<uint8_t>& data) {
@@ -99,111 +146,76 @@ std::string Sha1(const std::vector<uint8_t>& data) {
     return hex;
 }
 
-std::string ValidateGameIso(const fs::path& path) {
-    g_validated_disc = {};
-    auto extension = PathText(path.extension());
-    std::ranges::transform(extension, extension.begin(), [](unsigned char ch) { return char(std::tolower(ch)); });
-    if (extension != ".iso" || !fs::is_regular_file(path)) return "Choose an existing Xbox .iso file.";
-    const auto source = fs::canonical(path);
-    auto disc = std::make_unique<kernel::Disc>();
-    std::string reason;
-    if (!disc->Open(source, reason)) return "Could not read the Xbox disc image. " + reason;
-    std::vector<uint8_t> xbe;
-    if (!disc->Load(IMAGE_XBE, xbe)) return "The disc image needs a readable " IMAGE_XBE ".";
-    if (Sha1(xbe) != kImageSha1) return "This ISO is from a different Xbox release. Choose the disc matching this build.";
-    if (!disc->StillAtPath()) return "The ISO changed while it was being read. Choose the disc again.";
-    g_validated_disc = {source, {path.parent_path(), std::move(xbe)}, std::move(disc)};
-    return {};
+GameSource DetectGameSource(const fs::path& location, bool prefer_pal) {
+    auto candidates = Candidates(location.empty() ? FindAssets() : location);
+    if (location.empty()) {
+        auto pal_candidates = Candidates(FindAssets(kPalAssets));
+        candidates.insert(candidates.end(), pal_candidates.begin(), pal_candidates.end());
+#ifndef TCNYC_PAL
+        auto eu_candidates = Candidates(FindAssets("assets-pal-eu"));
+        candidates.insert(candidates.end(), eu_candidates.begin(), eu_candidates.end());
+#endif
+    }
+    GameSource first;
+    for (const auto& candidate : candidates) {
+        std::vector<uint8_t> xbe;
+        std::unique_ptr<kernel::Disc> disc;
+        std::error_code ec;
+        const auto path = fs::canonical(candidate, ec);
+        if (ec || !ReadSource(path, xbe, disc)) continue;
+        const auto hash = Sha1(xbe);
+        GameRegion region = GameRegion::Unknown;
+#if TCNYC_PAL_EU
+        if (hash == kImageSha1) region = GameRegion::PalEu;
+#elif defined(TCNYC_PAL)
+        if (hash == kImageSha1) region = GameRegion::Pal;
+#else
+        if (hash == kImageSha1) region = GameRegion::Ntsc;
+#ifdef TCNYC_PAL_SHA1
+        if (hash == TCNYC_PAL_SHA1) region = GameRegion::Pal;
+#endif
+#ifdef TCNYC_PAL_EU_SHA1
+        if (hash == TCNYC_PAL_EU_SHA1) region = GameRegion::PalEu;
+#endif
+#endif
+        if (region == GameRegion::Unknown) continue;
+        if (first.region == GameRegion::Unknown) first = {path, region};
+        if (!location.empty() || IsPal(region) == prefer_pal) return {path, region};
+    }
+    return first;
 }
 
 bool FindGame(GameFiles& game, std::string* error, const fs::path& location) {
-    if (g_validated_disc.disc) {
-        auto validated = std::move(g_validated_disc);
-        std::error_code ec;
-        if (!location.empty() && fs::canonical(location, ec) == validated.path && !ec && validated.disc->StillAtPath()) {
-            LOGR("Game: using the disc verified by the launcher in %s", PathText(location).c_str());
-            game = std::move(validated.game);
-            kernel::MountDisc(std::move(validated.disc));
-            return true;
-        }
+    auto candidates = Candidates(location.empty() ? FindAssets() : location);
+#ifdef TCNYC_PAL
+    if (location.empty()) {
+        auto pal_candidates = Candidates(FindAssets(kPalAssets));
+        candidates.insert(candidates.end(), pal_candidates.begin(), pal_candidates.end());
     }
-    const fs::path source = location.empty() ? FindAssets() : location;
-    std::error_code ec;
-    const bool source_iso = fs::is_regular_file(source, ec) && [&] {
-        std::string ext = source.extension().string();
-        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return char(std::tolower(c)); });
-        return ext == ".iso";
-    }();
-    const fs::path dir = source_iso ? source.parent_path() : source;
-
-    std::vector<fs::path> isos;
-    if (source_iso) {
-        isos.push_back(source);
-    } else if (fs::is_directory(source, ec)) {
-        for (auto& e : fs::directory_iterator(source, ec)) {
-            std::string ext = e.path().extension().string();
-            std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return char(std::tolower(c)); });
-            if (ext == ".iso" && e.is_regular_file(ec)) isos.push_back(e.path());
+#endif
+    bool wrong_image = false;
+    for (const auto& candidate : candidates) {
+        std::vector<uint8_t> xbe;
+        std::unique_ptr<kernel::Disc> disc;
+        if (!ReadSource(candidate, xbe, disc)) continue;
+        if (Sha1(xbe) != kImageSha1) {
+            wrong_image = true;
+            continue;
         }
-    }
-    std::sort(isos.begin(), isos.end());
-
-    // the first copy with this xbe wins, the extracted files before any image; another release is kept to offer
-    GameFiles other;
-    std::unique_ptr<kernel::Disc> other_disc;
-    fs::path other_name;
-    auto consider = [&](const fs::path& name, std::vector<uint8_t> xbe, std::unique_ptr<kernel::Disc> disc) {
-        std::string sha = Sha1(xbe);
-        bool match = sha == kImageSha1;
-        LOGR("Game: %s in %s, sha1 %s%s", IMAGE_XBE, PathText(name).c_str(), sha.c_str(), match ? "" : ", another release");
-        if (match) {
-            game = {dir, std::move(xbe)};
-            kernel::MountDisc(std::move(disc));
-            return true;
-        }
-        if (other_name.empty()) {
-            other = {dir, std::move(xbe)};
-            other_disc = std::move(disc);
-            other_name = name;
-        }
-        return false;
-    };
-
-    std::vector<uint8_t> xbe;
-    if (!source_iso && !source.empty() && fs::is_directory(source, ec) &&
-        ReadHostFile(source / IMAGE_XBE, xbe) && consider(source, std::move(xbe), nullptr))
+        game = {disc ? candidate.parent_path() : candidate, std::move(xbe)};
+        kernel::MountDisc(std::move(disc));
         return true;
-    for (const fs::path& iso : isos) {
-        auto disc = std::make_unique<kernel::Disc>();
-        std::string why;
-        if (!disc->Open(iso, why)) {
-            LOGW("game: %s: %s", PathText(iso).c_str(), why.c_str());
-            continue;
-        }
-        if (!disc->Load(IMAGE_XBE, xbe)) {
-            LOGW("game: %s has no %s", PathText(iso).c_str(), IMAGE_XBE);
-            continue;
-        }
-        if (consider(iso, std::move(xbe), std::move(disc))) return true;
     }
 
-    const std::string searched = source.empty() ? std::string() : " (" + PathText(source) + ")";
-    if (other_name.empty()) {
+    if (wrong_image) {
+        constexpr wchar_t message[] = L"This Xbox release does not match the selected game executable.";
+        Alert(message);
+        if (error) *error = Narrow(message);
+    } else {
         Alert(kGame.missing);
-        if (error) *error = Narrow(kGame.missing) + searched;
-        return false;
+        if (error) *error = Narrow(kGame.missing);
     }
-    std::wstring text = other_name.filename().wstring() +
-                        L" is a different release of the game than this build was made from, and will most likely "
-                        L"crash.\n\nStart it anyway?";
-    if (!Alert(text.c_str(), true)) {
-        if (error) *error = PathText(other_name.filename()) +
-                            " is a different release of the game than this build was made from.";
-        return false;
-    }
-    game = std::move(other);
-    kernel::MountDisc(std::move(other_disc));
-    return true;
+    return false;
 }
 
 }  // namespace app

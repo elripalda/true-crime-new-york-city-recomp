@@ -44,7 +44,7 @@ int main(int argc, char** argv) {
     std::string location;  // the game's folder or its disc image; empty: assets beside the executable
     bool skip_launcher = false;
     for (int i = 1; i < argc; ++i) {
-        if ((!std::strcmp(argv[i], "--assets") || !std::strcmp(argv[i], "--iso")) && i + 1 < argc) location = argv[++i];
+        if ((!std::strcmp(argv[i], "--assets") || !std::strcmp(argv[i], "--iso") || !std::strcmp(argv[i], "--game-source")) && i + 1 < argc) location = argv[++i];
         else if (!std::strcmp(argv[i], "--instance") && i + 1 < argc) {
             setenv("INSTANCE", argv[++i], 1);
             skip_launcher = true;
@@ -52,8 +52,19 @@ int main(int argc, char** argv) {
         else if (argv[i][0] != '-') location = argv[i];
     }
 
-    std::filesystem::path source = location;
-    if (!skip_launcher && source.empty() && !launcher::Run(source)) return 0;
+    app::GameSource source;
+    source.path = location;
+    if (!skip_launcher && source.path.empty() && !launcher::Run(source)) return 0;
+#ifndef TCNYC_PAL
+    if (source.region == app::GameRegion::Unknown) {
+        const auto detected = app::DetectGameSource(source.path);
+        if (detected.region != app::GameRegion::Unknown) source = detected;
+    }
+    if (app::IsPal(source.region)) return launcher::LaunchPal(source) ? 0 : 1;
+#endif
+
+    const auto game_files = launcher::Updater::HoldGameFiles();
+    if (!game_files) return 1;
 
     // the settings decide the window, so the log and settings load come first
     std::string log_name = app::kGame.log;
@@ -77,7 +88,7 @@ int main(int argc, char** argv) {
 
     app::GameFiles game;
     std::string game_error;
-    if (!app::FindGame(game, &game_error, source)) {
+    if (!app::FindGame(game, &game_error, source.path)) {
         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "True Crime NYC", game_error.c_str(), nullptr);
         SDL_Quit();
         return 1;
@@ -132,7 +143,7 @@ int main(int argc, char** argv) {
     input::Init();
     input::RegisterMouse(window);
 
-    const std::string hdd = app::Instance() > 1 ? "hdd" + std::to_string(app::Instance()) : "hdd";
+    const auto hdd = app::HddName();
     if (!kernel::Boot(std::move(game.xbe), IMAGE_XBE, game.dir, app::ExeDir() / hdd)) {
         SDL_DestroyWindow(window);
         SDL_Quit();

@@ -49,9 +49,9 @@ std::filesystem::path SettingsPath() {
     if (const char* override = std::getenv("TCNYC_SETTINGS"); override && *override) {
         std::filesystem::path p(override);
         if (p.has_filename()) return p;
-        return p / kGame.settings;
+        return p / SettingsFile();
     }
-    return ConfigDir() / kGame.settings;
+    return ConfigDir() / SettingsFile();
 }
 
 void LogSystem() {

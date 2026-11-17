@@ -49,15 +49,23 @@ if(NOT TCNYC_DEV_TOOLS)
 endif()
 
 # The European (PAL) release is a separate XBE with its own layout. It builds
-# from assets-pal/default.xbe and config/game-pal.toml into the same target name,
-# so use a separate binary directory (the pal preset) and keep its settings and
-# logs apart from the USA build.
+# from assets-pal/default.xbe and config/game-pal.toml into its own target.
+# Use the pal preset to keep the generated code and build output separate.
 option(TCNYC_PAL "Build for the European (PAL) XBE" OFF)
-if(TCNYC_PAL)
+option(TCNYC_PAL_EU "Build for the second European PAL disc revision" OFF)
+if(TCNYC_PAL_EU)
+    set(TCNYC_PAL ON)
+    set(GAME_TARGET TrueCrimeNYCPALEU)
+    set(GAME_XBE assets-pal-eu/default.xbe)
+    set(GAME_CONFIG game-pal-eu.toml)
+    set(GAME_DIR game-pal-eu)
+elseif(TCNYC_PAL)
+    set(GAME_TARGET TrueCrimeNYCPAL)
     set(GAME_XBE assets-pal/default.xbe)
     set(GAME_CONFIG game-pal.toml)
     set(GAME_DIR game-pal)
 else()
+    set(GAME_TARGET TrueCrimeNYC)
     set(GAME_XBE default.xbe)
     set(GAME_CONFIG game.toml)
     set(GAME_DIR game)
@@ -79,13 +87,22 @@ endif()
 set(TCNYC_REPO "${CMAKE_CURRENT_SOURCE_DIR}")
 set(TCNYC_TEST_SDL SDL3::SDL3-static)
 if(NOT TCNYC_TESTS_ONLY)
-add_xbe_image(TrueCrimeNYC ${GAME_XBE} ${GAME_CONFIG} ${GAME_PARTITIONS} ${GAME_DIR} game)
+if(TCNYC_PAL_EU)
+    include(sdk/cmake/CheckPalEu.cmake)
+    tcnyc_check_pal_eu("${CMAKE_CURRENT_SOURCE_DIR}/${GAME_XBE}")
+endif()
+add_xbe_image(${GAME_TARGET} ${GAME_XBE} ${GAME_CONFIG} ${GAME_PARTITIONS} ${GAME_DIR} game)
 if(TCNYC_DEV_TOOLS)
-    target_compile_definitions(TrueCrimeNYC PRIVATE TCNYC_DEV_TOOLS=1)
+    target_compile_definitions(${GAME_TARGET} PRIVATE TCNYC_DEV_TOOLS=1)
 endif()
 if(TCNYC_PAL)
-    target_compile_definitions(TrueCrimeNYC PRIVATE TCNYC_PAL=1)
+    target_compile_definitions(${GAME_TARGET} PRIVATE TCNYC_PAL=1)
     target_compile_definitions(grid_patch PRIVATE TCNYC_PAL=1)
+    add_custom_target(recompile_TrueCrimeNYC DEPENDS recompile_${GAME_TARGET})
+    if(TCNYC_PAL_EU)
+        target_compile_definitions(${GAME_TARGET} PRIVATE TCNYC_PAL_EU=1)
+        target_compile_definitions(grid_patch PRIVATE TCNYC_PAL_EU=1)
+    endif()
 endif()
 
 # Optional NVIDIA DLSS SDK. The headers are proprietary, so they are not vendored: point this at a
@@ -95,8 +112,8 @@ set(TCNYC_DLSS_SDK "" CACHE PATH "NVIDIA DLSS SDK checkout containing include/nv
 if(TCNYC_DLSS_SDK)
     get_filename_component(TCNYC_DLSS_SDK_ABS "${TCNYC_DLSS_SDK}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
     if(EXISTS "${TCNYC_DLSS_SDK_ABS}/include/nvsdk_ngx.h")
-        target_compile_definitions(TrueCrimeNYC PRIVATE TCNYC_HAVE_DLSS=1)
-        target_include_directories(TrueCrimeNYC PRIVATE "${TCNYC_DLSS_SDK_ABS}/include")
+        target_compile_definitions(${GAME_TARGET} PRIVATE TCNYC_HAVE_DLSS=1)
+        target_include_directories(${GAME_TARGET} PRIVATE "${TCNYC_DLSS_SDK_ABS}/include")
         message(STATUS "DLSS support enabled from ${TCNYC_DLSS_SDK_ABS}")
     else()
         message(WARNING "TCNYC_DLSS_SDK does not contain include/nvsdk_ngx.h; DLSS is disabled")
@@ -107,34 +124,34 @@ endif()
 
 # The app uses the per-monitor DPI and dark-mode era APIs; current llvm-mingw still
 # defaults WINVER below Windows 10, which hides their declarations.
-target_compile_definitions(TrueCrimeNYC PRIVATE _WIN32_WINNT=0x0A00 WINVER=0x0A00 NTDDI_VERSION=0x0A000000)
+target_compile_definitions(${GAME_TARGET} PRIVATE _WIN32_WINNT=0x0A00 WINVER=0x0A00 NTDDI_VERSION=0x0A000000)
 
 # Keep the SDK startup intact and invoke it after the launcher closes.
 set_property(SOURCE "${SDK}/runtime/app/main.cpp" APPEND PROPERTY COMPILE_DEFINITIONS wWinMain=RecompMain)
 include(launcher/launcher.cmake)
-tcnyc_add_launcher(TrueCrimeNYC)
-target_sources(TrueCrimeNYC PRIVATE launcher/windows_main.cpp launcher/version.rc
+tcnyc_add_launcher(${GAME_TARGET})
+target_sources(${GAME_TARGET} PRIVATE launcher/windows_main.cpp launcher/version.rc
     "${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp")
 # Windows still uses ImGui 1.91, whose SDL3 backends refer to the SDL 3.1 names.
 set_property(SOURCE
     "${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp"
     "${imgui_SOURCE_DIR}/backends/imgui_impl_sdlrenderer3.cpp"
     APPEND PROPERTY COMPILE_DEFINITIONS SDL_ENABLE_OLD_NAMES)
-target_link_libraries(TrueCrimeNYC PRIVATE SDL3::SDL3-static)
+target_link_libraries(${GAME_TARGET} PRIVATE SDL3::SDL3-static)
 set_property(SOURCE launcher/version.rc APPEND PROPERTY OBJECT_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/launcher/TrueCrimeNYC.ico")
 # Embed the long-path manifest. lld-link only accepts /MANIFESTINPUT with /manifest:embed; a
 # MinGW-target link would hand that to mt.exe, so those builds carry it as a resource instead.
 if(MINGW)
-    target_sources(TrueCrimeNYC PRIVATE launcher/manifest.rc)
+    target_sources(${GAME_TARGET} PRIVATE launcher/manifest.rc)
     set_property(SOURCE launcher/manifest.rc APPEND PROPERTY OBJECT_DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/launcher/TrueCrimeNYC.manifest")
 else()
-    target_link_options(TrueCrimeNYC PRIVATE
+    target_link_options(${GAME_TARGET} PRIVATE
         "-Wl,/manifest:embed"
         "-Wl,/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/launcher/TrueCrimeNYC.manifest")
 endif()
-target_link_libraries(TrueCrimeNYC PRIVATE shell32 gdi32 user32)
+target_link_libraries(${GAME_TARGET} PRIVATE shell32 gdi32 user32)
 endif()  # NOT TCNYC_TESTS_ONLY
 
 include(tests/HostTests.cmake)

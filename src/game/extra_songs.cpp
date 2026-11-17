@@ -38,8 +38,8 @@ namespace fs = std::filesystem;
 namespace game {
 namespace {
 
-constexpr uint32_t kSongManager = TCNYC_PAL ? 0x373ECCu : 0x3735FCu;
-constexpr uint32_t kPlayerPointer = TCNYC_PAL ? 0x3616BCu : 0x360E00u;
+constexpr uint32_t kSongManager = TCNYC_PAL_EU ? 0x00373DCCu : TCNYC_PAL ? 0x373ECCu : 0x3735FCu;
+constexpr uint32_t kPlayerPointer = TCNYC_PAL_EU ? 0x003615BCu : TCNYC_PAL ? 0x3616BCu : 0x360E00u;
 constexpr uint32_t kFirstTrack = 6000;
 constexpr uint32_t kOriginalLastTrack = 6092;
 constexpr uint32_t kSongSlots = 128;      // the player's song table

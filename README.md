@@ -7,25 +7,25 @@
 </p>
 
 <p align="center">
-  <a href="../../releases/latest"><img alt="Latest release" src="https://img.shields.io/badge/release-v0.9.2--beta.4-blue"></a>
+  <a href="../../releases/tag/v0.9.2-beta.4"><img alt="Beta 4 release" src="https://img.shields.io/badge/release-v0.9.2--beta.4-blue"></a>
   <img alt="Windows and Linux" src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-2ea44f">
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-green"></a>
   <img alt="Beta" src="https://img.shields.io/badge/status-beta-orange">
 </p>
 
 <p align="center">
-  <a href="../../releases/latest"><strong>Download</strong></a> ·
+  <a href="../../releases/tag/v0.9.2-beta.4"><strong>Download</strong></a> ·
   <a href="README-LINUX.md">Linux / SteamOS guide</a> ·
   <a href="#building-from-source">Build from source</a> ·
   <a href="../../issues">Report an issue</a>
 </p>
 
 > [!IMPORTANT]
-> **No game assets are included.** You must provide the files from your own legally acquired copy of the Xbox game. The port checks that the game files match the release it was built from. This is an unofficial fan project, not affiliated with or endorsed by Activision or the original developers.
+> **No game assets are included.** You must provide the files from your own legally acquired copy of the Xbox game. The launcher detects the supported US NTSC and both European PAL discs (standard and French/Spanish/Italian) by checking their Xbox executable. This is an unofficial fan project, not affiliated with or endorsed by Activision or the original developers.
 
 ## What is this?
 
-True Crime: New York City (US NTSC VERSION ONLY FOR NOW) — Xbox Recomp is an unofficial native PC port of the original Xbox release. The game is statically recompiled to C++ and runs directly on **Windows (Direct3D 12)** and **Linux (Vulkan)** — no emulator and no Proton.
+True Crime: New York City (US NTSC and European PAL) — Xbox Recomp is an unofficial native PC port of the original Xbox release. The game is statically recompiled to C++ and runs directly on **Windows (Direct3D 12)** and **Linux (Vulkan)** — no emulator and no Proton.
 
 The port adds a modern graphics menu, widescreen support, controller and raw mouse input, texture replacement, save durability fixes, and a native Linux/SteamOS build. It was created with [Xbox XBE Recomp](https://github.com/TGP482/XboxXBE-Recomp).
 
@@ -33,7 +33,7 @@ The port adds a modern graphics menu, widescreen support, controller and raw mou
 
 | | Windows | Linux / SteamOS |
 |---|---|---|
-| **Download** | [TrueCrimeNYC.zip](../../releases/latest) | [TrueCrimeNYC-linux-x86_64.tar.gz](../../releases/latest) |
+| **Download** | [TrueCrimeNYC.zip](../../releases/tag/v0.9.2-beta.4) | [TrueCrimeNYC-linux-x86_64.tar.gz](../../releases/tag/v0.9.2-beta.4) |
 | **Install** | Extract, then put your game files in `assets/` | Extract, then put your game files in `assets/` |
 | **Run** | `TrueCrimeNYC.exe` | `./TrueCrimeNYC` |
 | **Renderer** | Direct3D 12 | Vulkan (leave Proton **off** in Steam) |
@@ -205,7 +205,7 @@ Delete the file to return to the defaults.
 | **Game files** | Your own matching Xbox release, as an ISO or extracted files | Same |
 | **Storage** | Space for the game and its assets | Same |
 
-The extracted game files are used when both an ISO and extracted files are present. A different Xbox release is refused, because it would run its own data under this recompiled code.
+Browse to an ISO or enter the path to an extracted game folder. The launcher shows which region it detected. For automatic discovery, use `assets/` for an extracted US copy, `assets-pal/` for European Fr/Es/It, and `assets-pal-eu/` for the other European PAL disc. You can also put the ISOs in `assets/`. Use **Prefer PAL from local assets** to switch when both are available. The PAL builds use separate settings and saves. The Fr/Es/It build uses `settings-pal.toml` and `hdd-pal/`. The other European build uses `settings-pal-eu.toml` and `hdd-pal-eu/`. To reuse saves from a separate PAL installation, copy that installation's `hdd/` into `hdd-pal/` in the new installation.
 
 ## Building from source
 

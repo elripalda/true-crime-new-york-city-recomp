@@ -30,12 +30,13 @@ Pass a folder or image on the command line to start directly. Use
 ./TrueCrimeNYC --iso "/path/to/True Crime - New York City (USA).iso"
 ```
 
-The XBE is checked against the release this binary was built from. A different
-release is refused, because it would run its own data under this recompiled code.
+The launcher detects the US NTSC and both supported European PAL discs by their XBE.
+Each region has its own saves and settings.
 
 The package also contains:
 
-- `TrueCrimeNYC`: the executable.
+- `TrueCrimeNYC`: the launcher and NTSC executable.
+- `TrueCrimeNYCPAL` and `TrueCrimeNYCPALEU`: the two PAL executables started by the launcher.
 - `lib/libshaderc.so.1`: the bundled shader compiler, loaded from beside the
   executable.
 - `README.md`, `README-LINUX.md`, `BUILD.txt` and `THIRD_PARTY.txt`.

@@ -46,7 +46,7 @@ bool KeyboardDriving() {
 bool ProfileHeaderExists() {
     std::error_code error;
     const std::filesystem::path udata =
-        std::filesystem::path(app::ExeDir()) / "hdd" / "E" / "UDATA" / "41560045";
+        std::filesystem::path(app::ExeDir()) / app::HddName() / "E" / "UDATA" / "41560045";
     for (const auto& entry : std::filesystem::directory_iterator(udata, error)) {
         if (!entry.is_directory(error)) continue;
         const std::string name = entry.path().filename().string();
@@ -145,13 +145,29 @@ void DrawUi(double fps) {
 const app::GameInfo app::kGame = {
     .title = L"True Crime: New York City", // window and splash
     .short_title = L"True Crime NYC",      // message boxes
+#if TCNYC_PAL_EU
+    .name = L"TrueCrimeNYCPALEU",
+    .log = "tcnyc-pal-eu",
+    .settings = "settings-pal-eu.toml",
+#elif TCNYC_PAL
+    .name = L"TrueCrimeNYCPAL",
+    .log = "tcnyc-pal",
+    .settings = "settings-pal.toml",
+#else
     .name = L"TrueCrimeNYC",               // window classes, crash dumps, handover event
     .log = "tcnyc",                        // log file prefix
     .settings = "settings.toml",           // settings file beside the exe
+#endif
     .splash = L"splash",                   // optional splash.png or splash.bmp beside the exe
     .missing = L"Put the game in the assets folder: its disc image (.iso), or "
                L"default.xbe with its folders beside it.",
-    .images = {{"default.xbe", "TrueCrimeNYC"}}, // image and executable for title launches
+#if TCNYC_PAL_EU
+    .images = {{"default.xbe", "TrueCrimeNYCPALEU"}},
+#elif TCNYC_PAL
+    .images = {{"default.xbe", "TrueCrimeNYCPAL"}},
+#else
+    .images = {{"default.xbe", "TrueCrimeNYC"}},
+#endif
     .options = {{"show_fps", &game::g_show_fps, nullptr}, {"fov_percent", nullptr, &game::g_fov_percent},
                 {"mouse_sensitivity_percent", nullptr, &input::g_mouse_sensitivity_percent},
                 {"mouse_vertical_sensitivity_percent", nullptr, &input::g_mouse_vertical_sensitivity_percent},

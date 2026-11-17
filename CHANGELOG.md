@@ -2,6 +2,8 @@
 
 ## 0.9.2.4 - Beta 4 (2026-11-16)
 
+- One launcher detects the supported US NTSC and both European PAL disc builds. Each has its own saves and settings.
+
 ### Controls
 - Rebind the keyboard, mouse and controller from a new Controls tab in the launcher or the Controls page
   of the in-game menu (F10). Keyboard actions take up to four keys, with separate on-foot and driving
