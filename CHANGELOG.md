@@ -3,6 +3,7 @@
 ## 0.9.2.4 - Beta 4 (2026-11-16)
 
 - One launcher detects the supported US NTSC and both European PAL disc builds. Each has its own saves and settings.
+  Both European PAL versions are experimental in this release.
 - Start `TrueCrimeNYC` (`TrueCrimeNYC.exe` on Windows) for every disc. The two PAL game executables are in the
   `regions` folder; the launcher starts the one that matches your disc, and they share the main folder's game
   files, music, logs and shader cache.

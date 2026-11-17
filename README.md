@@ -25,7 +25,7 @@
 
 ## What is this?
 
-True Crime: New York City (US NTSC and European PAL) — Xbox Recomp is an unofficial native PC port of the original Xbox release. The game is statically recompiled to C++ and runs directly on **Windows (Direct3D 12)** and **Linux (Vulkan)** — no emulator and no Proton.
+True Crime: New York City (US NTSC, with experimental European PAL support) — Xbox Recomp is an unofficial native PC port of the original Xbox release. The game is statically recompiled to C++ and runs directly on **Windows (Direct3D 12)** and **Linux (Vulkan)** — no emulator and no Proton.
 
 The port adds a modern graphics menu, widescreen support, controller and raw mouse input, texture replacement, save durability fixes, and a native Linux/SteamOS build. It was created with [Xbox XBE Recomp](https://github.com/TGP482/XboxXBE-Recomp).
 
@@ -53,6 +53,7 @@ The port adds a modern graphics menu, widescreen support, controller and raw mou
 - **HDR output** — optional HDR on Windows (scRGB or HDR10) and Linux (HDR10 or extended sRGB), with paper white, peak brightness and highlight strength settings.
 - **Widescreen** — up to 32:9 for the 3D view, with the HUD and menus kept in the middle and the intro movies stretched to fill the screen.
 - **Controller and mouse** — Xbox, PlayStation and Switch controllers with hot-plug, rumble and matching button prompts, including Steam Deck glyphs and Xbox prompts for the ROG Ally and Legion Go under Steam Input. Raw mouse aim works in precision aim and snaps onto a lock-on target; keyboard prompts switch to the pedal keys in a car.
+- **European PAL support (experimental)** — the US NTSC disc and both European PAL discs play from the same download; the launcher recognises your disc and starts the right version, with separate saves and settings for each region.
 - **Rebind everything** — keyboard, mouse and controller bindings from the launcher or the F10 menu, with button prompts that follow your choices.
 - **Smoother controller aim** — one dead zone for the whole right stick and a gentler curve, with controller and mouse sensitivity in the launcher, F10 and the game's Options > Controller tab.
 - **Custom music** — put MP3, OGG, FLAC or WAV songs in the `music` folder to replace the Music Player's songs or add new ones.
@@ -206,6 +207,10 @@ Delete the file to return to the defaults.
 | **Storage** | Space for the game and its assets | Same |
 
 Browse to an ISO or enter the path to an extracted game folder. The launcher shows which region it detected. For automatic discovery, use `assets/` for an extracted US copy, `assets-pal/` for European Fr/Es/It, and `assets-pal-eu/` for the other European PAL disc. You can also put the ISOs in `assets/`. Use **Prefer PAL from local assets** to switch when both are available. The PAL builds use separate settings and saves. The Fr/Es/It build uses `settings-pal.toml` and `hdd-pal/`. The other European build uses `settings-pal-eu.toml` and `hdd-pal-eu/`. To reuse saves from a separate PAL installation, copy that installation's `hdd/` into `hdd-pal/` in the new installation.
+
+Both European PAL versions are **experimental** in Beta 4: they have had less testing than the US version, so please report any problem with the log from `logs/`.
+
+Always start `TrueCrimeNYC.exe` (`./TrueCrimeNYC` on Linux), whichever disc you have. The two PAL game executables are in the `regions` folder; the launcher starts the one that matches your disc, so you never need to run them yourself.
 
 ## Building from source
 
