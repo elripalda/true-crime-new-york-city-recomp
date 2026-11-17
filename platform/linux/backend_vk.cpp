@@ -10685,7 +10685,7 @@ void VulkanBackend::Present(const Surface& front) {
     // TC_VK_CAP forces the read-back path so a diagnostic capture has a frame.
     // Guest memory newer than the GPU image (a CPU-decoded movie frame, a lock or
     // copy) must win: presenting the old image is the intro/legal-screen flicker.
-    const bool capture = std::getenv("TC_VK_CAP") != nullptr;
+    const bool capture = DevEnv("TC_VK_CAP") != nullptr;
     const bool stale = ft && DirtyEpoch(ft->data) != ft->epoch;
     const bool direct = ft && ft->drawn && !stale && !capture;
     if (perf_) {
@@ -10704,7 +10704,7 @@ void VulkanBackend::Present(const Surface& front) {
         if (!EnsureFrameImage(sw, sh)) return;
         if (capture) {
             static const long every = [] {
-                const char* e = std::getenv("TC_VK_CAP");
+                const char* e = DevEnv("TC_VK_CAP");
                 return e ? std::atol(e) : 0;
             }();
             if (every > 0 && frames_ % uint64_t(every) == 0) {
